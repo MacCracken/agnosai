@@ -7,6 +7,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.1] — 2026-11-12
+
+Budgets, caps and crew concurrency are enforced: the limits agnosai carried since the Rust line, and read only one of
+([ADR 033](docs/adr/033-budgets-caps-and-crew-concurrency-are-enforced.md)).
+
+### ⚠ Behaviour changes
+
+- **At most `max_concurrent_tasks` crews run at once**: the orchestrator budget's, or 10 when it sets none, as the Rust
+  line's semaphore allowed. The rest wait, `pending`, in the order they came, whether run inline or submitted, and a
+  crew's deadline starts when it runs. Through 2.4.0 the field was stored and read by nothing, so every crew ran at
+  once. A cancel ends a crew's wait: it ends `cancelled` with no events, and its channel closes. ⚠ A queued
+  `POST /api/v1/crews` holds its pool worker while it waits. **To migrate:** set `max_concurrent_tasks` to what the
+  process should run at once.
+- **A parallel crew is a sliding window**, not batches: the next task starts as soon as one ends, and a task awaiting
+  its reviewer gives its slot back first. So a `task_started` can come between two `task_completed`, and a fast task
+  ends before a slow one started ahead of it. Results stay in dispatch order.
+- **Outbound https is at most 64 exchanges at once**, process-wide (`src/tls_permit.cyr`): past that, an exchange waits
+  up to 10 s for another to end, then goes ahead without a permit, warned and counted. A burst of 100 handshakes failed
+  36 of them in sigil's lane pool.
+- **A crew can fail `reason: budget_exceeded`**, and an orchestrator with a tenant registry or a task cap refuses a crew
+  before it registers, where every crew ran.
+
+### Added
+
+- **Budgets that subdivide: tenant, crew, task.** A `BudgetTracker` may sit under another, a task's under its crew's
+  and a crew's under its tenant's; what one records, each above it records, and a check fails on the nearest that is
+  spent, naming it: `crew token budget exceeded: 4300 used, 4290 limit`. Every model call is checked first and what it
+  cost recorded after. A crew that is spent stops at its next loop head, as it does for its deadline, and keeps the
+  results it has. A task's own limit fails that task only. `agnosai_budget_tracker_limits_a`, `_new_a`,
+  `_set_limits`, `_parent`, `_scope`, `_reset`, `_breach`, `agnosai_budget_exceeded_message_a`,
+  `agnosai_budget_exceeded_to_value_a`.
+- **The orchestrator budget's `max_tokens` and `max_cost_usd` are each crew's**, as the Rust line's `BudgetTracker`
+  read them for one running crew; nothing read them before. **`agnosai_crew_with_budget`** and
+  **`agnosai_task_with_budget`** only tighten them; a crew spec's and a task's JSON carry `budget` when one is set.
+  `agnosai_crew_runner_with_budget`, `agnosai_crew_runner_budget`, `agnosai_crew_runner_budget_exceeded`, and
+  `agnosai_execute_task_budgeted_a`.
+- **Tenants.** `agnosai_orchestrator_with_tenants(o, registry)` and `agnosai_crew_with_tenant(spec, tenant)`: a crew is
+  refused for a tenant the registry does not hold, one that has spent its tokens or its cost, or one with
+  `max_concurrent_crews` admitted already. A tenant's spending is one tracker across its crews.
+  `agnosai_orchestrator_tenant_spent`, `agnosai_orchestrator_tenant_active`, `agnosai_orchestrator_reset_tenant`.
+- **A cap on tasks per crew**, `agnosai_orchestrator_with_max_tasks`, none by default.
+- **`agnosai_orchestrator_submit_crew_err`**, which says why it returned 0. A refused crew never registers, and is
+  logged and audited as `crew_refused`, the only trace it leaves.
+- **`agnosai_orchestrator_max_concurrent_crews`** and **`agnosai_orchestrator_crews_queued`**.
+- **Per-crew tool limits**: `agnosai_crew_with_tool_limits`, each only tightening what `agnosai_tool_loop_set_limits`
+  set; `agnosai_tool_loop_tighten` and `agnosai_tool_loop_max_steps`, `_max_calls`, `_result_bytes`,
+  `_transcript_bytes`.
+- **`budget` on `POST /api/v1/crews`**, on the crew and on each task: `{"max_tokens": N, "max_cost_usd": X}`, either
+  key optional. A budget that cannot be read refuses the request.
+- **`src/semaphore.cyr`**, a first-come-first-served counting semaphore, as the stdlib has none: a release hands its
+  permit to the oldest waiter, and a waiter can give up at a deadline or a cancel without losing one;
+  `agnosai_semaphore_wake_waiters` has a waiter look at its cancel at once, which `cancel_crew` calls.
+  **`src/tls_permit.cyr`**, the 64 outbound TLS permits: `agnosai_tls_permit_take`, `_take_str`, `_give`,
+  `agnosai_tls_permits_free`, `_taken`, `_went_without`.
+- **`budget_exceeded`**, a reason a crew gives and its span's `error.type`.
+- **Suites:** `tests/semaphore.tcyr`, `tests/tls_permit.tcyr`, and `tests/orch_caps.tcyr` (turns, first come first
+  served, inline waits, the deadline from the run, crew, task, orchestrator and tenant budgets, a refusal holding `429`
+  that is not retried, the task cap). `tests/orch_lifecycle.tcyr` gains the sliding window and the budget's ending.
+
+### Fixed
+
+- **A budget record no longer loses a concurrent one**: `record_tokens` and `record_cost` were a plain load and store,
+  so of two racing, one could vanish. They are `atomic_fetch_add`. Nothing called them until now.
+
+### Changed
+
+- **A crew cancelled before its turn returns its cancelled state** from `agnosai_orchestrator_run_crew_err`, as one
+  cancelled before its run always did, and is queued as ended. A cyclic one returned 0 through 2.4.0, as it reached
+  its cycle first; it now ends at the queue, never reaching it.
+- **A cancel reaches a crew waiting for its turn at once**: `agnosai_orchestrator_cancel_crew` wakes the queue.
+- **ADR 032's batches are a sliding window**, and ADR 029's process-wide tool limits may be tightened per crew; each
+  says so in a note. ADR 004's semaphore and `JoinSet` rows say what the port does now.
+
+### Performance
+
+- **The interleaved A/B against a 2.4.0 build on the same `lib/`:** four rounds of `orch`, `server`, `core`, `tools`
+  and `llm` at a mean load of 3.16, median −0.2% across 192 rows, 164 of them within 5%.
+- **The sliding window: `run_crew_10_tasks_parallel_4_traced` 687.4 → 608.1 µs (−11.5%)**, faster in all four
+  rounds. Ten tasks four at a time waited at two batch barriers. The other parallel rows read 4–8% faster by median,
+  in three rounds of four (the fourth was slow for every row of its run), and the sequential rows did not move
+  (+0.6% to +2.2%).
+- ⚠ **Not free: `orchestrator_new` 4.3 → 5.4 µs (+24.3%)**, every round: each orchestrator mints its crews'
+  semaphore and its tenant map.
+- **What a model call pays its budget:** `budget_check_and_record_3_levels` 43 ns, a check through task, crew and
+  tenant and a record into all three. A crew's turn when one is free: `semaphore_acquire_release` 111 ns.
+- **An https exchange's permit: `tls_permit_take_give_https` 1,450 → 142 ns (−90%)**, by `bench-history.sh`. A
+  free permit is taken before the clock is read, a syscall it now pays only when it has to wait. Plain http takes
+  none: `tls_permit_take_give_http` 29 ns.
+- `tool_registry_has_50_miss` −27.1% is not claimed: it was bimodal at 2.3.8, and nothing on its path changed.
+
 ## [2.4.0] — 2026-11-12
 
 The crew lifecycle is one state machine, written down and checked as an invariant: every event is numbered, every

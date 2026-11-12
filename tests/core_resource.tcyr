@@ -38,6 +38,26 @@ fn _t_devices1(d): i64 {
     return v;
 }
 
+fn _t_spend_limits(): i64 {
+    test_group("a crew's or a task's budget object (ADR 033)");
+    assert_eq(agnosai_spend_limits_to_value_a(default_alloc(), AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT), 0,
+      "no limits make no object");
+    var v = agnosai_spend_limits_to_value_a(default_alloc(), 300, AGNOSAI_NO_LIMIT);
+    assert(str_eq_cstr(bayan_json_v_build(v), "{\"max_tokens\":300}") == 1, "a key only for what is set");
+    var out: i64[2];
+    assert_eq(agnosai_spend_limits_from_value(v, &out), 1, "and it reads back");
+    assert_eq(load64(&out), 300, "tokens");
+    assert_eq(load64(&out + 8), AGNOSAI_NO_LIMIT, "and no cost");
+    assert_eq(agnosai_spend_limits_from_value(0, &out), 1, "no value is no budget");
+    assert_eq(load64(&out), AGNOSAI_NO_LIMIT, "of either");
+    assert_eq(agnosai_spend_limits_from_value(_t_parse_cstr("{\"max_cost_usd\":-1.5}"), &out), 0,
+      "a negative cost is refused");
+    assert_eq(agnosai_spend_limits_from_value(_t_parse_cstr("{\"max_cost_usd\":-2}"), &out), 0, "in whole dollars too");
+    assert_eq(agnosai_spend_limits_from_value(_t_parse_cstr("{\"max_tokens\":null,\"max_cost_usd\":null}"), &out), 1,
+      "nulls are no limits");
+    return 0;
+}
+
 fn main() {
     alloc_init();
 
@@ -548,6 +568,7 @@ fn main() {
       > agnosai_training_memory_total_bytes(lora),
       "a bigger estimate is more bytes");
 
+    _t_spend_limits();
     return assert_summary();
 }
 

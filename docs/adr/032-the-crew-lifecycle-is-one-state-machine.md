@@ -73,14 +73,15 @@ the error for it, since that caller asked to run a crew and none ran.
 ### `reason`
 
 `crew_completed` and a terminal crew state carry `reason` when the status is not `completed`: `task_failed`, `timeout`,
-`cancelled`, `invalid_dag` or `not_started`. The first four are the crew span's `error.type` vocabulary (ADR 023).
+`cancelled`, `invalid_dag` or `not_started`, and since 2.4.1 `budget_exceeded` (ADR 033). The first four are the crew
+span's `error.type` vocabulary (ADR 023), as `budget_exceeded` is.
 
 ### `task_completed` in completion order
 
 A parallel or DAG batch reports each task as its worker finishes, as the oracle's `join_next` did. Through 2.3.8 it
 joined in dispatch order, so a fast task waited behind any slower one dispatched before it (ADR 022). Each batch has a
 slot word per worker in the crew's arena; a finished worker puts its job in the next one as its last act, and the wave
-waits on the slots in turn. Every task of a batch is still reported before the next batch starts. **The results stay
+waits on the slots in turn. Every task of a batch is still reported before the next batch starts (since 2.4.1 there are no batches: a sliding window, [ADR 033](033-budgets-caps-and-crew-concurrency-are-enforced.md)). **The results stay
 in dispatch order**, so a crew's state does not depend on which task happened to finish first.
 
 ### Subscribers that attach mid-run

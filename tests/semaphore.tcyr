@@ -1,0 +1,298 @@
+# =========================================================================
+# semaphore.tcyr — src/semaphore.cyr: at most N holders, the rest waiting their turn.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/semaphore.cyr"
+include "tests/test_helpers.cyr"
+
+# What a test thread is handed.
+var _T_SEM = 0;
+var _T_DONE = 8;
+var _T_GOT = 16;
+var _T_ARG = 24;
+var _T_ORDER = 32;
+var _T_SIZE = 40;
+
+fn _t_job(s, arg): i64 {
+    var j = alloc(_T_SIZE);
+    store64(j + _T_SEM, s);
+    store64(j + _T_DONE, 0);
+    store64(j + _T_GOT, 0 - 1);
+    store64(j + _T_ARG, arg);
+    store64(j + _T_ORDER, 0 - 1);
+    return j;
+}
+
+# Wait for a permit with no deadline, note when it came, and keep it.
+fn _t_take(j): i64 {
+    store64(j + _T_GOT, agnosai_semaphore_acquire(load64(j + _T_SEM)));
+    agnosai_done_word_set(j + _T_DONE);
+    return 0;
+}
+
+# The order permits were granted in, across the FIFO test's threads.
+var _t_turn = 0;
+
+# Wait in turn, write down which turn this was, and pass the permit on.
+fn _t_take_in_turn(j): i64 {
+    var s = load64(j + _T_SEM);
+    store64(j + _T_GOT, agnosai_semaphore_acquire(s));
+    store64(j + _T_ORDER, atomic_fetch_add(&_t_turn, 1));
+    agnosai_semaphore_release(s);
+    agnosai_done_word_set(j + _T_DONE);
+    return 0;
+}
+
+# Set the word at `_T_ARG` after a short sleep: a cancel landing on a waiter.
+fn _t_cancel_later(j): i64 {
+    sleep_ms(30);
+    store64(load64(j + _T_ARG), 1);
+    agnosai_done_word_set(j + _T_DONE);
+    return 0;
+}
+
+# Set the word at `_T_ARG` once a waiter is queued, then wake the waiters: a cancel that says so.
+fn _t_cancel_and_wake(j): i64 {
+    var s = load64(j + _T_SEM);
+    var spins = 0;
+    while (agnosai_semaphore_waiting(s) < 1 && spins < 2000) {
+        sleep_ms(1);
+        spins = spins + 1;
+    }
+    sleep_ms(20);
+    store64(load64(j + _T_ARG), 1);
+    store64(j + _T_GOT, agnosai_semaphore_wake_waiters(s));
+    agnosai_done_word_set(j + _T_DONE);
+    return 0;
+}
+
+# How many hold a permit at once, and the most that ever did.
+var _t_inside = 0;
+var _t_most = 0;
+
+fn _t_note_inside(): i64 {
+    var now = atomic_fetch_add(&_t_inside, 1) + 1;
+    var seen = atomic_load(&_t_most);
+    while (now > seen) {
+        if (atomic_cas(&_t_most, seen, now) == 1) { break; }
+        seen = atomic_load(&_t_most);
+    }
+    return 0;
+}
+
+# Take and give back a permit `_T_ARG` times, counting who is inside.
+fn _t_churn(j): i64 {
+    var s = load64(j + _T_SEM);
+    var n = load64(j + _T_ARG);
+    for (var i = 0; i < n; i = i + 1) {
+        agnosai_semaphore_acquire(s);
+        _t_note_inside();
+        atomic_fetch_add(&_t_inside, 0 - 1);
+        agnosai_semaphore_release(s);
+    }
+    agnosai_done_word_set(j + _T_DONE);
+    return 0;
+}
+
+# Give up on short deadlines, over and over, while others release: a grant racing a give-up.
+# Every 1 taken is released, so whatever a give-up mishandles shows as a permit gone at the end.
+var _t_lost_race = 0;
+
+fn _t_give_up(j): i64 {
+    var s = load64(j + _T_SEM);
+    var n = load64(j + _T_ARG);
+    var got = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var deadline = clock_now_ns() + (i % 7) * 20000;
+        if (agnosai_semaphore_acquire_until(s, deadline, 0) == 1) {
+            got = got + 1;
+            _t_note_inside();
+            atomic_fetch_add(&_t_inside, 0 - 1);
+            agnosai_semaphore_release(s);
+        }
+    }
+    store64(j + _T_GOT, got);
+    agnosai_done_word_set(j + _T_DONE);
+    return 0;
+}
+
+fn _t_wait_waiting(s, n): i64 {
+    var spins = 0;
+    while (agnosai_semaphore_waiting(s) < n && spins < 2000) {
+        sleep_ms(1);
+        spins = spins + 1;
+    }
+    return agnosai_semaphore_waiting(s);
+}
+
+fn _t_counts(): i64 {
+    test_group("permits are counted, and over-release changes nothing");
+    assert_eq(agnosai_semaphore_new(0), 0, "a semaphore of no permits is refused");
+    assert_eq(agnosai_semaphore_new(0 - 3), 0, "and of fewer");
+    var s = agnosai_semaphore_new(2);
+    assert_neq(s, 0, "a semaphore of two");
+    assert_eq(agnosai_semaphore_permits(s), 2, "has two permits");
+    assert_eq(agnosai_semaphore_available(s), 2, "both free");
+    assert_eq(agnosai_semaphore_try_acquire(s), 1, "the first try takes one");
+    assert_eq(agnosai_semaphore_try_acquire(s), 1, "and the second the other");
+    assert_eq(agnosai_semaphore_available(s), 0, "leaving none");
+    assert_eq(agnosai_semaphore_try_acquire(s), 0, "so a third try is refused at once");
+    assert_eq(agnosai_semaphore_release(s), 0, "a release");
+    assert_eq(agnosai_semaphore_available(s), 1, "frees one");
+    assert_eq(agnosai_semaphore_release(s), 0, "and another");
+    assert_eq(agnosai_semaphore_release(s), 0 - 1, "a release that holds nothing is refused");
+    assert_eq(agnosai_semaphore_available(s), 2, "and leaves the count at the permits");
+    assert_eq(agnosai_semaphore_acquire(s), 1, "a blocking acquire with one free returns at once");
+    assert_eq(agnosai_semaphore_acquire_until(s, clock_now_ns() + 1000000, 0), 1, "and so does a timed one");
+    assert_eq(agnosai_semaphore_waiting(s), 0, "with nobody left waiting");
+    return 0;
+}
+
+fn _t_deadline_and_cancel(): i64 {
+    test_group("a waiter gives up at its deadline, or its cancel, and holds nothing");
+    var s = agnosai_semaphore_new(1);
+    agnosai_semaphore_try_acquire(s);
+    var t0 = clock_now_ns();
+    assert_eq(agnosai_semaphore_acquire_until(s, t0 + 40000000, 0), 0, "a wait past its deadline returns 0");
+    var waited = clock_now_ns() - t0;
+    assert(waited >= 40000000, "after the deadline");
+    assert(waited < 1000000000, "and not long after it");
+    assert_eq(agnosai_semaphore_waiting(s), 0, "and leaves the queue");
+    assert_eq(agnosai_semaphore_acquire_until(s, clock_now_ns() - 1, 0), 0, "a deadline already past returns 0");
+    assert_eq(agnosai_semaphore_waiting(s), 0, "without staying queued");
+
+    var flag: i64[1];
+    store64(&flag, 0);
+    var canceller = _t_job(s, &flag);
+    assert_neq(thread_create_detached(&_t_cancel_later, canceller), 0, "a canceller starts");
+    var c0 = clock_now_ns();
+    assert_eq(agnosai_semaphore_acquire_until(s, 0, &flag), 0, "a cancel ends a wait with no deadline");
+    var took = clock_now_ns() - c0;
+    assert(took >= 25000000, "once the word is set");
+    assert(took < 2000000000, "and within a poll of it");
+    agnosai_done_word_wait(canceller + _T_DONE);
+    assert_eq(agnosai_semaphore_waiting(s), 0, "and leaves the queue");
+    assert_eq(agnosai_semaphore_acquire_until(s, 0, &flag), 0, "a word already set refuses at once");
+
+    # Woken, a waiter looks at its word at once, rather than at its next poll a second on.
+    store64(&flag, 0);
+    var waker = _t_job(s, &flag);
+    assert_neq(thread_create_detached(&_t_cancel_and_wake, waker), 0, "a canceller that wakes starts");
+    var w0 = clock_now_ns();
+    assert_eq(agnosai_semaphore_acquire_until(s, 0, &flag), 0, "a woken waiter gives up");
+    var woke = clock_now_ns() - w0;
+    agnosai_done_word_wait(waker + _T_DONE);
+    assert(woke < 500000000, "well before its poll would have seen the word");
+    assert_eq(load64(waker + _T_GOT), 1, "and the wake reached the one waiter");
+    assert_eq(agnosai_semaphore_wake_waiters(s), 0, "with nobody queued, a wake wakes nobody");
+
+    assert_eq(agnosai_semaphore_release(s), 0, "the holder lets go");
+    assert_eq(agnosai_semaphore_acquire_until(s, 0, &flag), 1,
+      "and a free permit is taken even with the word set: nothing was waited for");
+    agnosai_semaphore_release(s);
+    assert_eq(agnosai_semaphore_available(s), 1, "nothing was lost to a give-up");
+    return 0;
+}
+
+fn _t_handoff(): i64 {
+    test_group("a release hands its permit to the oldest waiter");
+    var s = agnosai_semaphore_new(1);
+    agnosai_semaphore_try_acquire(s);
+    var j = _t_job(s, 0);
+    assert_neq(thread_create_detached(&_t_take, j), 0, "a waiter starts");
+    assert_eq(_t_wait_waiting(s, 1), 1, "and queues");
+    sleep_ms(20);
+    assert_eq(load64(j + _T_DONE), 0, "and is still waiting while the permit is held");
+    assert_eq(agnosai_semaphore_release(s), 0, "the holder lets go");
+    assert_eq(agnosai_semaphore_try_acquire(s), 0, "and a caller arriving now cannot take it");
+    agnosai_done_word_wait(j + _T_DONE);
+    assert_eq(load64(j + _T_GOT), 1, "the waiter holds it");
+    assert_eq(agnosai_semaphore_available(s), 0, "so none is free");
+    assert_eq(agnosai_semaphore_release(s), 0, "until it lets go");
+    assert_eq(agnosai_semaphore_available(s), 1, "and the count is whole again");
+    return 0;
+}
+
+fn _t_fifo(): i64 {
+    test_group("waiters are served in the order they queued");
+    var s = agnosai_semaphore_new(1);
+    agnosai_semaphore_try_acquire(s);
+    _t_turn = 0;
+    var jobs = vec_new();
+    for (var i = 0; i < 6; i = i + 1) {
+        var j = _t_job(s, i);
+        vec_push(jobs, j);
+        assert_neq(thread_create_detached(&_t_take_in_turn, j), 0, "a waiter starts");
+        assert_eq(_t_wait_waiting(s, i + 1), i + 1, "and queues behind the one before it");
+    }
+    agnosai_semaphore_release(s);
+    var in_order = 1;
+    for (var k = 0; k < 6; k = k + 1) {
+        var job = vec_get(jobs, k);
+        agnosai_done_word_wait(job + _T_DONE);
+        if (load64(job + _T_ORDER) != k) { in_order = 0; }
+    }
+    assert_eq(in_order, 1, "every waiter got its turn in the order it queued");
+    assert_eq(agnosai_semaphore_available(s), 1, "and the last gave it back");
+    return 0;
+}
+
+fn _t_contended(): i64 {
+    test_group("under contention, never more than N hold a permit");
+    var s = agnosai_semaphore_new(3);
+    _t_inside = 0;
+    _t_most = 0;
+    var jobs = vec_new();
+    for (var i = 0; i < 24; i = i + 1) {
+        var j = _t_job(s, 300);
+        vec_push(jobs, j);
+        assert_neq(thread_create_detached(&_t_churn, j), 0, "a churner starts");
+    }
+    for (var k = 0; k < 24; k = k + 1) { agnosai_done_word_wait(vec_get(jobs, k) + _T_DONE); }
+    assert(atomic_load(&_t_most) <= 3, "at most three were ever inside");
+    assert(atomic_load(&_t_most) >= 1, "and some were");
+    assert_eq(agnosai_semaphore_available(s), 3, "every permit came back");
+    assert_eq(agnosai_semaphore_waiting(s), 0, "and nobody is left queued");
+    return 0;
+}
+
+fn _t_give_up_race(): i64 {
+    test_group("a grant racing a give-up loses no permit");
+    var s = agnosai_semaphore_new(2);
+    _t_inside = 0;
+    _t_most = 0;
+    var jobs = vec_new();
+    for (var i = 0; i < 16; i = i + 1) {
+        var j = _t_job(s, 400);
+        vec_push(jobs, j);
+        assert_neq(thread_create_detached(&_t_give_up, j), 0, "a waiter that gives up starts");
+    }
+    var got = 0;
+    for (var k = 0; k < 16; k = k + 1) {
+        var job = vec_get(jobs, k);
+        agnosai_done_word_wait(job + _T_DONE);
+        got = got + load64(job + _T_GOT);
+    }
+    assert(got > 0, "some waits were granted");
+    assert(atomic_load(&_t_most) <= 2, "never more than two inside");
+    assert_eq(agnosai_semaphore_available(s), 2, "and both permits are free at the end");
+    assert_eq(agnosai_semaphore_waiting(s), 0, "with nobody queued");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    _t_counts();
+    _t_deadline_and_cancel();
+    _t_handoff();
+    _t_fifo();
+    _t_contended();
+    _t_give_up_race();
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+sys_exit_group(f);

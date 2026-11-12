@@ -898,6 +898,15 @@ fn main() {
     assert_eq(agnosai_agnos_http_transport(default_alloc(), agnosai_agnos_client(str_from("http://x.invalid"),
           str_from("p")), "GET", str_from("http://x.invalid/"), 0, &live_detail), 0,
       "the live transport reports an unresolvable host as a transport failure");
+    # An https service takes one of the 64 outbound TLS permits, and gives it back (ADR 033).
+    var tls_before = agnosai_tls_permits_taken();
+    agnosai_agnos_http_transport(default_alloc(), agnosai_agnos_client(str_from("https://127.0.0.1:1"),
+        str_from("p")), "GET", str_from("https://127.0.0.1:1/"), 0, &live_detail);
+    assert_eq(agnosai_tls_permits_taken(), tls_before + 1, "an https call takes a TLS permit");
+    assert_eq(agnosai_tls_permits_free(), AGNOSAI_TLS_MAX_IN_FLIGHT, "and gives it back as it returns");
+    agnosai_agnos_http_transport(default_alloc(), agnosai_agnos_client(str_from("http://127.0.0.1:1"),
+        str_from("p")), "GET", str_from("http://127.0.0.1:1/"), 0, &live_detail);
+    assert_eq(agnosai_tls_permits_taken(), tls_before + 1, "and a plain http one takes none");
 
     # --- the _int overload slot, pinned ---
     # Cyrius routes a call `X(a, ...)` to `X_int` when `a` is a bare

@@ -13,6 +13,7 @@ include "src/core/error.cyr"
 include "src/core/json.cyr"
 include "src/id.cyr"
 include "src/core/message.cyr"
+include "src/core/resource.cyr"
 include "src/core/task.cyr"
 include "tests/test_helpers.cyr"
 
@@ -55,6 +56,47 @@ fn _t_key_order(): i64 {
     map_set(m, str_from("Z"), bayan_json_v_int_new(3));
     assert(str_eq_cstr(bayan_json_v_build(_agnosai_map_to_value(m)), "{\"Z\":3,\"a\":2,\"b\":1}") == 1,
       "byte order: upper case first, and the values stay with their keys");
+    return 0;
+}
+
+# A task's JSON with id `id` and `budget` as given, parsed.
+fn _t_with_budget(id: Str, budget): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"id\":\"");
+    str_builder_add(sb, id);
+    str_builder_add_cstr(sb, "\",\"description\":\"d\",\"budget\":");
+    str_builder_add_cstr(sb, budget);
+    str_builder_add_cstr(sb, "}");
+    return _t_parse_cstr(str_cstr(str_builder_build(sb)));
+}
+
+fn _t_budget_wire(): i64 {
+    test_group("a task's budget on the wire (ADR 033)");
+    var plain = agnosai_task_new(str_from("p"));
+    assert_eq(agnosai_task_max_tokens(plain), AGNOSAI_NO_LIMIT, "a task has no token limit of its own");
+    assert_eq(agnosai_task_max_cost_micro_usd(plain), AGNOSAI_NO_LIMIT, "nor a cost limit");
+    assert_eq(bayan_json_v_obj_get_by_cstr(agnosai_task_to_value(plain), "budget"), 0,
+      "and its JSON has no budget key, the oracle's shape");
+    var t = agnosai_task_with_budget(agnosai_task_new(str_from("b")), 500, 250000);
+    var v = agnosai_task_to_value(t);
+    assert(str_eq_cstr(bayan_json_v_build(bayan_json_v_obj_get_by_cstr(v, "budget")),
+        "{\"max_tokens\":500,\"max_cost_usd\":0.25}") == 1, "a budget goes out, cost in dollars");
+    var back = agnosai_task_from_value(v);
+    assert_eq(agnosai_task_max_tokens(back), 500, "and reads back: tokens");
+    assert_eq(agnosai_task_max_cost_micro_usd(back), 250000, "and cost");
+    var only = agnosai_task_from_value(agnosai_task_to_value(agnosai_task_with_budget(agnosai_task_new(str_from("o")),
+          AGNOSAI_NO_LIMIT, 1000000)));
+    assert_eq(agnosai_task_max_tokens(only), AGNOSAI_NO_LIMIT, "a budget of cost alone leaves tokens unlimited");
+    assert_eq(agnosai_task_max_cost_micro_usd(only), 1000000, "and keeps the cost");
+    var id = agnosai_task_id(t);
+    assert_eq(agnosai_task_from_value(_t_with_budget(id, "{\"max_tokens\":-5}")), 0,
+      "a negative limit is refused, not dropped");
+    assert_eq(agnosai_task_from_value(_t_with_budget(id, "{\"max_tokens\":\"lots\"}")), 0,
+      "as is one that is not a number");
+    assert_eq(agnosai_task_from_value(_t_with_budget(id, "7")), 0, "and a budget that is not an object");
+    assert_neq(agnosai_task_from_value(_t_with_budget(id, "null")), 0, "a null budget is no budget");
+    assert_eq(agnosai_task_max_cost_micro_usd(agnosai_task_from_value(_t_with_budget(id, "{\"max_cost_usd\":2}"))),
+      2000000, "and whole dollars read as dollars");
     return 0;
 }
 
@@ -365,6 +407,7 @@ fn main() {
     assert_eq(agnosai_task_result_status(rr), AGNOSAI_STATUS_FAILED, "and sets its status");
     assert_eq(agnosai_task_result_with_output(rr, str_from("withheld")), rr, "with_output returns it too");
     assert(str_eq_cstr(agnosai_task_result_output(rr), "withheld") == 1, "and replaces its output");
+    _t_budget_wire();
     return assert_summary();
 }
 

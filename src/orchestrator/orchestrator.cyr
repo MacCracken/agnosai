@@ -22,15 +22,20 @@
 #
 # ## Concurrency
 #
-# The oracle bounds concurrent crews with a `Semaphore` and a per-crew
-# `RwLock`-guarded registry. This runs a crew on the calling thread, so the
-# bound is the caller's; the registry is mutex-guarded because
-# `orch_crew_runner`'s parallel and DAG modes spawn real threads and a caller
-# may drive several crews from several threads. `MAX_RETAINED_CREWS` is the
-# oracle's, and so is that eviction only takes **finished** crews: a registry full
-# of running crews grows past the cap rather than dropping live state. Which
-# finished crews go is not the oracle's since 2.2.4 (ADR 026).
+# The oracle bounds concurrent crews with a `Semaphore` of the budget's
+# `max_concurrent_tasks`, and so does this since 2.4.1 (ADR 033): a crew waits its
+# turn, PENDING, before it runs, whether a caller runs it inline or submits it.
+# Through 2.4.0 the field was stored and read by nothing, so every crew ran at once.
+# The registry is mutex-guarded because `orch_crew_runner`'s parallel and DAG modes
+# spawn real threads and a caller may drive several crews from several threads.
+# `MAX_RETAINED_CREWS` is the oracle's, and so is that eviction only takes
+# **finished** crews: a registry full of running crews grows past the cap rather
+# than dropping live state. Which finished crews go is not the oracle's since 2.2.4
+# (ADR 026).
 # =========================================================================
+
+include "src/semaphore.cyr"
+include "src/orchestrator/multi_tenant.cyr"
 
 # The oracle's `MAX_RETAINED_CREWS`, over crews that have ended (ADR 026): a submit that finds
 # this many evicts. Crews still running are not counted, and are never evicted.
@@ -42,6 +47,10 @@ var AGNOSAI_CREWS_LOW_WATER = 900;
 
 # The oracle's fallback execution timeout when the budget sets none — one hour.
 var AGNOSAI_DEFAULT_CREW_TIMEOUT_SECS = 3600;
+
+# The oracle's fallback for how many crews run at once when the budget sets none:
+# `budget.max_concurrent_tasks.unwrap_or(10)` (`orchestrator.rs:55`).
+var AGNOSAI_DEFAULT_MAX_CONCURRENT_CREWS = 10;
 
 enum AgnosaiOrchestratorOff {
     AGN_OR_CREWS = 0;
@@ -61,7 +70,33 @@ enum AgnosaiOrchestratorOff {
     # one (ADR 032).
     AGN_OR_GATE = 96;
     AGN_OR_APPROVE_MEDIUM = 104;
-    AGN_OR_SIZE = 112;
+    # The turns a crew waits for before it runs (ADR 033): one permit a crew.
+    AGN_OR_CREW_SEM = 112;
+    # The tenants a crew may run for, or 0 for none, and what each has spent and has running: a
+    # map from tenant id to a `TenantUse`, on the global heap, as it outlives every crew (ADR 033).
+    AGN_OR_TENANTS = 120;
+    AGN_OR_TENANT_USE = 128;
+    # The most tasks a crew may have, or `AGNOSAI_NO_LIMIT` (ADR 033).
+    AGN_OR_MAX_TASKS = 136;
+    AGN_OR_SIZE = 144;
+}
+
+# What a tenant has spent, through every crew it ran, and how many of its crews are admitted and
+# still to end. Under the orchestrator's lock.
+enum AgnosaiTenantUseOff {
+    AGN_TU_TRACKER = 0;
+    AGN_TU_ACTIVE = 8;
+    AGN_TU_SIZE = 16;
+}
+
+# How many crews run at once under `budget`: its `max_concurrent_tasks`, or the oracle's 10 when it
+# sets none, as `agnosai_orchestrator_timeout_secs` falls back to the oracle's hour. A budget of 0,
+# `AGNOSAI_NO_LIMIT` and anything below 1 all set none.
+fn _agnosai_orch_crew_permits(budget): i64 {
+    if (budget == 0) { return AGNOSAI_DEFAULT_MAX_CONCURRENT_CREWS; }
+    var n = agnosai_resource_budget_max_concurrent_tasks(budget);
+    if (n == AGNOSAI_NO_LIMIT || n <= 0) { return AGNOSAI_DEFAULT_MAX_CONCURRENT_CREWS; }
+    return n;
 }
 
 # Create an orchestrator over a resource budget.
@@ -87,7 +122,79 @@ fn agnosai_orchestrator_new(budget): i64 {
     # decides through this one.
     store64(o + AGN_OR_GATE, agnosai_approval_gate_new());
     store64(o + AGN_OR_APPROVE_MEDIUM, 0);
+    store64(o + AGN_OR_CREW_SEM, agnosai_semaphore_new(_agnosai_orch_crew_permits(budget)));
+    store64(o + AGN_OR_TENANTS, 0);
+    store64(o + AGN_OR_TENANT_USE, map_new_str());
+    store64(o + AGN_OR_MAX_TASKS, AGNOSAI_NO_LIMIT);
     return o;
+}
+
+# Hold every crew that names a tenant to `registry`'s budget for it (ADR 033), or 0 for none. A
+# crew whose tenant it does not hold is refused; one whose tenant has spent its tokens or its cost,
+# or has its `max_concurrent_crews` admitted already, is refused; the rest count what they spend
+# against their tenant's, as their crew's own budget does. Set it before any crew runs: it is read
+# without the lock. Returns the orchestrator.
+fn agnosai_orchestrator_with_tenants(o, registry): i64 {
+    store64(o + AGN_OR_TENANTS, registry);
+    return o;
+}
+
+# The tenant registry crews are held to, or 0.
+fn agnosai_orchestrator_tenants(o): i64 {
+    return load64(o + AGN_OR_TENANTS);
+}
+
+# Refuse a crew of more than `n` tasks (ADR 033); `AGNOSAI_NO_LIMIT`, the default, for none. A
+# refused crew never registers. Returns the orchestrator.
+fn agnosai_orchestrator_with_max_tasks(o, n): i64 {
+    store64(o + AGN_OR_MAX_TASKS, n);
+    return o;
+}
+
+# The most tasks a crew may have here, or `AGNOSAI_NO_LIMIT`.
+fn agnosai_orchestrator_max_tasks(o): i64 {
+    return load64(o + AGN_OR_MAX_TASKS);
+}
+
+# What `tenant` has spent here, a tracker, or 0 for a tenant no crew has run for.
+fn agnosai_orchestrator_tenant_spent(o, tenant: Str): i64 {
+    var mtx = load64(o + AGN_OR_MUTEX);
+    mutex_lock(mtx);
+    var tu = map_get(load64(o + AGN_OR_TENANT_USE), tenant);
+    mutex_unlock(mtx);
+    if (tu == 0) { return 0; }
+    return load64(tu + AGN_TU_TRACKER);
+}
+
+# How many of `tenant`'s crews are admitted here and still to end.
+fn agnosai_orchestrator_tenant_active(o, tenant: Str): i64 {
+    var mtx = load64(o + AGN_OR_MUTEX);
+    mutex_lock(mtx);
+    var tu = map_get(load64(o + AGN_OR_TENANT_USE), tenant);
+    var n = 0;
+    if (tu != 0) { n = load64(tu + AGN_TU_ACTIVE); }
+    mutex_unlock(mtx);
+    return n;
+}
+
+# Forget what `tenant` has spent, at the start of whatever period its operator keeps. A crew of
+# its still running goes on counting from 0. Returns 1, or 0 for a tenant no crew has run for.
+fn agnosai_orchestrator_reset_tenant(o, tenant: Str): i64 {
+    var t = agnosai_orchestrator_tenant_spent(o, tenant);
+    if (t == 0) { return 0; }
+    agnosai_budget_tracker_reset(t);
+    return 1;
+}
+
+# How many crews this orchestrator runs at once (ADR 033). A crew past that waits its turn,
+# `pending`, in the order it came.
+fn agnosai_orchestrator_max_concurrent_crews(o): i64 {
+    return agnosai_semaphore_permits(load64(o + AGN_OR_CREW_SEM));
+}
+
+# How many crews are waiting for a turn now: registered, `pending`, and still to run.
+fn agnosai_orchestrator_crews_queued(o): i64 {
+    return agnosai_semaphore_waiting(load64(o + AGN_OR_CREW_SEM));
 }
 
 # The gate this orchestrator's crews wait on for a reviewer, or 0 for none (ADR 032). Hand it to
@@ -400,6 +507,12 @@ fn _agnosai_orch_level_for(status): i64 {
 #
 # Returns the runner, fully wired (audit, llm, events).
 fn _agnosai_orch_register(o, spec): i64 {
+    return _agnosai_orch_register_under(o, spec, 0);
+}
+
+# `_agnosai_orch_register`, with the crew's spending counted against `parent`, its tenant's
+# tracker or 0 (ADR 033).
+fn _agnosai_orch_register_under(o, spec, parent): i64 {
     var crew_id = agnosai_crew_id(spec);
     var crew_name = agnosai_crew_name(spec);
     var tasks = agnosai_crew_tasks(spec);
@@ -418,6 +531,7 @@ fn _agnosai_orch_register(o, spec): i64 {
     }
 
     var runner = agnosai_crew_runner_new(spec);
+    agnosai_crew_runner_with_budget(runner, _agnosai_orch_crew_budget_a(o, a, spec, parent));
     agnosai_crew_runner_with_audit(runner, load64(o + AGN_OR_AUDIT));
     agnosai_crew_runner_with_tools(runner, load64(o + AGN_OR_TOOLS),
       load64(o + AGN_OR_TOOL_JOURNAL));
@@ -452,6 +566,139 @@ fn _agnosai_orch_register(o, spec): i64 {
     return runner;
 }
 
+# Whether this orchestrator takes `spec` (ADR 033): returns 0, with what its spending counts
+# against through `out_parent` (its tenant's tracker, or 0), or the error that refuses it.
+#
+# A crew of more tasks than the orchestrator runs is refused; then, for one naming a tenant on an
+# orchestrator with a registry, a tenant it does not hold, one that has spent its tokens or its
+# cost, and one with `max_concurrent_crews` admitted already. The count and the check share the
+# lock, so two crews cannot both take a tenant's last place. An admitted tenant crew is counted
+# until `_agnosai_orch_tenant_done`.
+#
+# ⚠ **Spent means reached, as a crew's budget does**: a tenant at exactly its limit is refused. The
+# oracle's `check_tenant_budget` passes at the limit, and admitting a crew there would only start
+# one whose first call is refused.
+fn _agnosai_orch_admit(o, spec, out_parent): i64 {
+    store64(out_parent, 0);
+    var max_tasks = load64(o + AGN_OR_MAX_TASKS);
+    var n = vec_len(agnosai_crew_tasks(spec));
+    if (max_tasks != AGNOSAI_NO_LIMIT && n > max_tasks) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "crew has ");
+        str_builder_add_int(sb, n);
+        str_builder_add_cstr(sb, " tasks, and this orchestrator runs at most ");
+        str_builder_add_int(sb, max_tasks);
+        return agnosai_error_scheduling(str_builder_build(sb));
+    }
+    var tenant = agnosai_crew_tenant(spec);
+    var reg = load64(o + AGN_OR_TENANTS);
+    if (tenant == 0 || reg == 0) { return 0; }
+    var budget = agnosai_tenant_registry_get_budget(reg, tenant);
+    if (budget == 0) {
+        return agnosai_error_scheduling(str_cat(str_cat(str_from("tenant "), tenant),
+            str_from(" is not registered")));
+    }
+
+    var mtx = load64(o + AGN_OR_MUTEX);
+    mutex_lock(mtx);
+    var uses = load64(o + AGN_OR_TENANT_USE);
+    var tu = map_get(uses, tenant);
+    if (tu == 0) {
+        tu = alloc(AGN_TU_SIZE);
+        store64(tu + AGN_TU_TRACKER, agnosai_budget_tracker_limits_a(default_alloc(),
+            agnosai_tenant_budget_max_tokens(budget), agnosai_tenant_budget_max_cost_micro_usd(budget), 0,
+            "tenant"));
+        store64(tu + AGN_TU_ACTIVE, 0);
+        map_set(uses, str_clone(tenant), tu);
+    } else {
+        # A tenant registered again has its new limits, and keeps what it spent.
+        agnosai_budget_tracker_set_limits(load64(tu + AGN_TU_TRACKER), agnosai_tenant_budget_max_tokens(budget),
+          agnosai_tenant_budget_max_cost_micro_usd(budget));
+    }
+    var tracker = load64(tu + AGN_TU_TRACKER);
+    var kind = agnosai_budget_tracker_breach(tracker, 0);
+    if (kind != AGNOSAI_BUDGET_WITHIN) {
+        mutex_unlock(mtx);
+        return agnosai_error_scheduling(agnosai_budget_exceeded_message(tracker, kind));
+    }
+    var most = agnosai_tenant_budget_max_concurrent_crews(budget);
+    if (most != AGNOSAI_NO_LIMIT && load64(tu + AGN_TU_ACTIVE) >= most) {
+        mutex_unlock(mtx);
+        var cb = str_builder_new();
+        str_builder_add_cstr(cb, "tenant ");
+        str_builder_add(cb, tenant);
+        str_builder_add_cstr(cb, " has ");
+        str_builder_add_int(cb, most);
+        str_builder_add_cstr(cb, " crews running, its most at once");
+        return agnosai_error_scheduling(str_builder_build(cb));
+    }
+    store64(tu + AGN_TU_ACTIVE, load64(tu + AGN_TU_ACTIVE) + 1);
+    mutex_unlock(mtx);
+    store64(out_parent, tracker);
+    return 0;
+}
+
+# Note that a crew `_agnosai_orch_admit` counted against its tenant has ended, on every way out.
+fn _agnosai_orch_tenant_done(o, spec): i64 {
+    var tenant = agnosai_crew_tenant(spec);
+    if (tenant == 0 || load64(o + AGN_OR_TENANTS) == 0) { return 0; }
+    var mtx = load64(o + AGN_OR_MUTEX);
+    mutex_lock(mtx);
+    var tu = map_get(load64(o + AGN_OR_TENANT_USE), tenant);
+    if (tu != 0 && load64(tu + AGN_TU_ACTIVE) > 0) {
+        store64(tu + AGN_TU_ACTIVE, load64(tu + AGN_TU_ACTIVE) - 1);
+    }
+    mutex_unlock(mtx);
+    return 0;
+}
+
+# Log and audit a crew the orchestrator refused, and why: it never registers, so this is the only
+# trace it leaves. On the global heap, owning its strings, as an audit entry outlives a crew.
+fn _agnosai_orch_refused(o, spec, err): i64 {
+    var why = agnosai_error_message(err);
+    if (sakshi_get_level() >= SK_WARN) {
+        sakshi_log_kv(SK_WARN, "crew refused", 12, "reason", 6, str_data(why), str_len(why));
+    }
+    if (load64(o + AGN_OR_AUDIT) != 0) {
+        var md = bayan_json_v_obj_new();
+        bayan_json_v_obj_set(md, str_from("crew_id"), bayan_json_v_str_new(str_clone(agnosai_crew_id(spec))));
+        bayan_json_v_obj_set(md, str_from("reason"), bayan_json_v_str_new(str_clone(why)));
+        var tenant = agnosai_crew_tenant(spec);
+        if (tenant != 0) { bayan_json_v_obj_set(md, str_from("tenant"), bayan_json_v_str_new(str_clone(tenant))); }
+        _agnosai_orch_audit(o, str_from("crew_refused"), str_from("warn"), str_clone(agnosai_crew_name(spec)), md);
+    }
+    return 0;
+}
+
+# The tighter of two limits, either of which may be `AGNOSAI_NO_LIMIT`.
+fn _agnosai_tighter_limit(x, y): i64 {
+    if (x == AGNOSAI_NO_LIMIT) { return y; }
+    if (y == AGNOSAI_NO_LIMIT) { return x; }
+    if (x < y) { return x; }
+    return y;
+}
+
+# The crew's budget tracker (ADR 033), in its allocator `a`: the tighter of what the orchestrator's
+# budget gives every crew and what the spec asks for, of tokens and of cost, under `parent` (a
+# tenant's, or 0). 0 when there is nothing to hold it to or count it against, which costs a crew
+# that has no budget nothing.
+#
+# The orchestrator's `max_tokens` and `max_cost_usd` are **per crew**, as the oracle's
+# `BudgetTracker::new(&ResourceBudget)` read them for one running crew. Through 2.4.0 nothing did.
+fn _agnosai_orch_crew_budget_a(o, a, spec, parent): i64 {
+    var b = load64(o + AGN_OR_BUDGET);
+    var tokens = AGNOSAI_NO_LIMIT;
+    var cost = AGNOSAI_NO_LIMIT;
+    if (b != 0) {
+        tokens = agnosai_resource_budget_max_tokens(b);
+        cost = agnosai_resource_budget_max_cost_micro_usd(b);
+    }
+    tokens = _agnosai_tighter_limit(tokens, agnosai_crew_max_tokens(spec));
+    cost = _agnosai_tighter_limit(cost, agnosai_crew_max_cost_micro_usd(spec));
+    if (tokens == AGNOSAI_NO_LIMIT && cost == AGNOSAI_NO_LIMIT && parent == 0) { return 0; }
+    return agnosai_budget_tracker_limits_a(a, tokens, cost, parent, "crew");
+}
+
 # Run a crew to completion and return its final state, or 0 if it never ran.
 #
 # `Orchestrator::run_crew` — `rust-old/src/orchestrator/orchestrator.rs:126`.
@@ -477,8 +724,18 @@ fn agnosai_orchestrator_run_crew(o, spec): i64 {
 # point of an A2A error field.
 #
 # `out_err` of 0 means "don't care", which is what the bare form passes.
+#
+# **A crew the orchestrator refuses never registers (ADR 033)**: too many tasks, or a tenant it
+# does not hold, has spent, or has at its limit of crews. This returns 0, with the reason.
 fn agnosai_orchestrator_run_crew_err(o, spec, out_err): i64 {
-    return _agnosai_orch_finish_err(o, _agnosai_orch_register(o, spec),
+    var parent: i64[1];
+    var refused = _agnosai_orch_admit(o, spec, &parent);
+    if (refused != 0) {
+        _agnosai_orch_refused(o, spec, refused);
+        if (out_err != 0) { store64(out_err, refused); }
+        return 0;
+    }
+    return _agnosai_orch_finish_err(o, _agnosai_orch_register_under(o, spec, load64(&parent)),
       agnosai_crew_id(spec), agnosai_crew_name(spec), out_err);
 }
 
@@ -560,6 +817,20 @@ fn _agnosai_orch_finish_err(o, runner, crew_id: Str, crew_name: Str, out_err): i
     var a = load64(runner + AGN_CR_ALLOC);
     var spec = load64(runner + AGN_CR_SPEC);
 
+    # ⚠ **A turn first (ADR 033).** At most `max_concurrent_tasks` crews run at once, as the
+    # oracle's semaphore allowed (`orchestrator.rs:129`); through 2.4.0 every crew ran at once. A
+    # crew waits here, PENDING, behind those that came before it, and its deadline starts when it
+    # runs, as the oracle's timeout wrapped only the run. A cancel ends the wait, and a permit that
+    # arrived with it goes back.
+    var sem = load64(o + AGN_OR_CREW_SEM);
+    var flag = agnosai_crew_runner_cancel_flag(runner);
+    var turn = agnosai_semaphore_acquire_until(sem, 0, flag);
+    if (turn == 1 && atomic_load(flag) != 0) {
+        agnosai_semaphore_release(sem);
+        turn = 0;
+    }
+    if (turn == 0) { return _agnosai_orch_end_queued(o, crew_id, crew_name, spec); }
+
     # Enforce the execution timeout from the budget, matching
     # `rust-old/src/orchestrator/orchestrator.rs:197-214`.
     #
@@ -626,12 +897,43 @@ fn _agnosai_orch_finish_err(o, runner, crew_id: Str, crew_name: Str, out_err): i
     mutex_unlock(mtx);
 
     if (bus != 0) { agnosai_event_bus_remove(bus, crew_id); }
+    # Its turn goes to the next crew once its final state is stored, so that crew starts after
+    # this one reads as ended.
+    agnosai_semaphore_release(sem);
+    _agnosai_orch_tenant_done(o, spec);
     if (never_ran == 1) {
         atomic_fetch_add(spec + AGN_CREW_RUNS, 0 - 1);
         return 0;
     }
     # ⚠ **The run's last touch of the crew**, on either exit. Once this lands a release may
     # scrub the spec, its id and its runner, and the caller has only pointers left to return.
+    atomic_fetch_add(spec + AGN_CREW_RUNS, 0 - 1);
+    return state;
+}
+
+# End a crew that was cancelled while it waited for a turn, and return its state.
+#
+# It never ran, so it has no events, and its channel closes (ADR 032's `pending` → `cancelled`).
+# `cancel_crew` stored CANCELLED with the flag; a flag raised on the runner alone left PENDING,
+# which ends CANCELLED here. Queued as ended and audited, as a finish would have.
+fn _agnosai_orch_end_queued(o, crew_id: Str, crew_name: Str, spec): i64 {
+    var mtx = load64(o + AGN_OR_MUTEX);
+    mutex_lock(mtx);
+    map_delete(load64(o + AGN_OR_CANCEL), crew_id);
+    var state = map_get(load64(o + AGN_OR_CREWS), crew_id);
+    if (state != 0) {
+        if (agnosai_crew_state_status(state) == AGNOSAI_CREW_PENDING) {
+            agnosai_crew_state_with_reason(state, AGNOSAI_CREW_REASON_CANCELLED);
+            atomic_fence();
+            agnosai_crew_state_with_status(state, AGNOSAI_CREW_CANCELLED);
+        }
+        _agnosai_orch_note_ended_locked(o, state);
+    }
+    mutex_unlock(mtx);
+    if (state != 0) { _agnosai_orch_audit_finished(o, crew_id, crew_name, state); }
+    var bus = load64(o + AGN_OR_EVENTS);
+    if (bus != 0) { agnosai_event_bus_remove(bus, crew_id); }
+    _agnosai_orch_tenant_done(o, spec);
     atomic_fetch_add(spec + AGN_CREW_RUNS, 0 - 1);
     return state;
 }
@@ -736,8 +1038,23 @@ fn _agnosai_orch_abandon(o, crew_id: Str): i64 {
 # and the crew's result reaches the caller through the registry rather than
 # through the thread's return value — there is nothing to join *for*.
 fn agnosai_orchestrator_submit_crew(o, spec): i64 {
+    return agnosai_orchestrator_submit_crew_err(o, spec, 0);
+}
+
+# `agnosai_orchestrator_submit_crew`, saying why when it returns 0: a crew the orchestrator refuses
+# (ADR 033, as `agnosai_orchestrator_run_crew_err` says), which never registers, or a thread that
+# would not start. `out_err` of 0 means don't care.
+fn agnosai_orchestrator_submit_crew_err(o, spec, out_err): i64 {
+    if (out_err != 0) { store64(out_err, 0); }
+    var parent: i64[1];
+    var refused = _agnosai_orch_admit(o, spec, &parent);
+    if (refused != 0) {
+        _agnosai_orch_refused(o, spec, refused);
+        if (out_err != 0) { store64(out_err, refused); }
+        return 0;
+    }
     var crew_id = agnosai_crew_id(spec);
-    var runner = _agnosai_orch_register(o, spec);
+    var runner = _agnosai_orch_register_under(o, spec, load64(&parent));
 
     var job = alloc_via(agnosai_crew_alloc(spec), AGN_OJ_SIZE);
     store64(job + AGN_OJ_ORCH, o);
@@ -747,6 +1064,8 @@ fn agnosai_orchestrator_submit_crew(o, spec): i64 {
 
     if (thread_create_detached(&_agnosai_orch_submit_thread, job) == 0) {
         _agnosai_orch_abandon(o, crew_id);
+        _agnosai_orch_tenant_done(o, spec);
+        if (out_err != 0) { store64(out_err, agnosai_error_scheduling(str_from("could not start the crew's thread"))); }
         atomic_fetch_add(spec + AGN_CREW_RUNS, 0 - 1);
         return 0;
     }
@@ -792,6 +1111,8 @@ fn agnosai_orchestrator_cancel_crew(o, crew_id: Str): i64 {
     # it could never be evicted. A crew with a flag is queued when its runner stops.
     if (flag == 0) { _agnosai_orch_note_ended_locked(o, state); }
     mutex_unlock(mtx);
+    # A crew waiting for its turn sees the flag now, not at its next poll (ADR 033).
+    if (flag != 0) { agnosai_semaphore_wake_waiters(load64(o + AGN_OR_CREW_SEM)); }
 
     if (load64(o + AGN_OR_AUDIT) != 0) {
         var md = bayan_json_v_obj_new();

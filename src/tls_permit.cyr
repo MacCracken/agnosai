@@ -1,0 +1,109 @@
+# =========================================================================
+# tls_permit — at most 64 outbound TLS exchanges in flight, process-wide (ADR 033).
+#
+# Port-local, and a stopgap. sigil verifies a server's certificate on one of 64 lanes, and a verify
+# that finds them all held is refused rather than queued, which reads as a bad signature: of 100
+# handshakes at once, 36 fail every time (sigil's
+# `2026-11-05-agnosai-lane-pool-refuses-the-overflow-of-a-burst.md`). agnosai runs 100 pool workers
+# and a thread per crew, so a burst past 64 is ordinary. Every outbound https exchange takes a
+# permit here first, so no more than 64 can be handshaking at once, and gives it back as soon as
+# sandhi returns. A plain http exchange takes none.
+#
+# ⚠ **A permit covers the whole exchange, not only the handshake**, as sandhi does both in one
+# call. So past 64 at once, an https exchange waits for another to end, which caps throughput to an
+# https gateway too. The load tester takes one only for a request that will connect (its users keep
+# their connections). Once sigil waits for a lane this module goes.
+#
+# **A wait that runs out does not fail the exchange.** After `AGNOSAI_TLS_PERMIT_WAIT_MS` it goes
+# ahead without a permit, as every exchange did through 2.4.0, and is counted: the worst the cap
+# can do is what there was before it.
+# =========================================================================
+
+include "src/semaphore.cyr"
+include "src/log_fields.cyr"
+
+# How many outbound TLS exchanges may be in flight at once: sigil's lane count.
+var AGNOSAI_TLS_MAX_IN_FLIGHT = 64;
+
+# How long an exchange waits for a permit before it goes ahead without one.
+var AGNOSAI_TLS_PERMIT_WAIT_MS = 10000;
+
+var _AGNOSAI_TLS_SEM = agnosai_semaphore_new(AGNOSAI_TLS_MAX_IN_FLIGHT);
+
+# Permits taken in all, and exchanges that went ahead without one. Counted, not locked.
+var _agnosai_tls_taken = 0;
+var _agnosai_tls_went_without = 0;
+
+# Whether the `n` bytes at `p` start `https:`, in any case. `n` below 0 reads up to a NUL.
+fn _agnosai_tls_is_https(p, n): i64 {
+    if (p == 0) { return 0; }
+    var want = "https:";
+    for (var i = 0; i < 6; i = i + 1) {
+        if (n >= 0 && i >= n) { return 0; }
+        var c = load8(p + i);
+        if (c == 0) { return 0; }
+        if (c >= 65 && c <= 90) { c = c + 32; }
+        if (c != load8(want + i)) { return 0; }
+    }
+    return 1;
+}
+
+# Take a permit for an exchange with `url`, a NUL-terminated string, when it is https. Returns 1
+# holding one, 0 for an exchange that needs none, or -1 for one that waited
+# `AGNOSAI_TLS_PERMIT_WAIT_MS` and goes ahead without. Hand the result to `agnosai_tls_permit_give`
+# as soon as sandhi returns, on every path.
+fn agnosai_tls_permit_take(url): i64 {
+    return _agnosai_tls_take(_agnosai_tls_is_https(url, 0 - 1));
+}
+
+# `agnosai_tls_permit_take` for a `Str`.
+fn agnosai_tls_permit_take_str(url: Str): i64 {
+    if (url == 0) { return 0; }
+    return _agnosai_tls_take(_agnosai_tls_is_https(str_data(url), str_len(url)));
+}
+
+fn _agnosai_tls_take(https): i64 {
+    if (https == 0) { return 0; }
+    # A free permit first, which most exchanges find, without the clock: its read is a syscall,
+    # and cost 1,450 ns a take where the permit alone costs about 110 (`benches/orch.bcyr`). A
+    # waiting queue refuses this, so the order stays first come first served.
+    if (agnosai_semaphore_try_acquire(_AGNOSAI_TLS_SEM) == 1) {
+        atomic_fetch_add(&_agnosai_tls_taken, 1);
+        return 1;
+    }
+    var deadline = clock_now_ns() + AGNOSAI_TLS_PERMIT_WAIT_MS * 1000000;
+    if (agnosai_semaphore_acquire_until(_AGNOSAI_TLS_SEM, deadline, 0) == 1) {
+        atomic_fetch_add(&_agnosai_tls_taken, 1);
+        return 1;
+    }
+    atomic_fetch_add(&_agnosai_tls_went_without, 1);
+    if (sakshi_get_level() >= SK_WARN) {
+        var f[AGNOSAI_LOG_FIELDS_BYTES];
+        var n = agnosai_log_fields_start_int(&f, AGNOSAI_TLS_MAX_IN_FLIGHT);
+        n = agnosai_log_field_int(&f, n, "waited_ms", AGNOSAI_TLS_PERMIT_WAIT_MS);
+        sakshi_log_kv(SK_WARN, "outbound TLS exchange goes ahead without a permit", 49,
+          "in_flight", 9, &f, n);
+    }
+    return 0 - 1;
+}
+
+# Give back what `agnosai_tls_permit_take` returned. Only a 1 holds anything.
+fn agnosai_tls_permit_give(taken): i64 {
+    if (taken == 1) { agnosai_semaphore_release(_AGNOSAI_TLS_SEM); }
+    return 0;
+}
+
+# Permits free now, out of `AGNOSAI_TLS_MAX_IN_FLIGHT`.
+fn agnosai_tls_permits_free(): i64 {
+    return agnosai_semaphore_available(_AGNOSAI_TLS_SEM);
+}
+
+# Permits taken since start-up.
+fn agnosai_tls_permits_taken(): i64 {
+    return atomic_load(&_agnosai_tls_taken);
+}
+
+# Exchanges that waited out `AGNOSAI_TLS_PERMIT_WAIT_MS` and went ahead without a permit.
+fn agnosai_tls_permits_went_without(): i64 {
+    return atomic_load(&_agnosai_tls_went_without);
+}

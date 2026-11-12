@@ -1640,6 +1640,80 @@ fn _b_approval_submit_decision(): i64 {
     return 0;
 }
 
+# ── caps and budgets (2.4.1, ADR 033) ──
+
+# What a crew pays for its turn when one is free: one acquire and one release, uncontended.
+fn _b_semaphore_pair(): i64 {
+    var n = 200000;
+    var s = agnosai_semaphore_new(10);
+    var b = bench_new("semaphore_acquire_release");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_semaphore_acquire_until(s, 0, 0);
+            agnosai_semaphore_release(s);
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    if (agnosai_semaphore_available(s) != 10) { syscall(60, 1); }
+    return 0;
+}
+
+fn _b_semaphore_try_pair(): i64 {
+    var n = 200000;
+    var s = agnosai_semaphore_new(10);
+    var b = bench_new("semaphore_try_acquire_release");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_semaphore_try_acquire(s);
+            agnosai_semaphore_release(s);
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    if (agnosai_semaphore_available(s) != 10) { syscall(60, 1); }
+    return 0;
+}
+
+# What an outbound exchange pays before sandhi is called: an https one a permit, an http one the
+# scheme check alone.
+fn _b_tls_permit(name, url): i64 {
+    var n = 200000;
+    var b = bench_new(name);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) { agnosai_tls_permit_give(agnosai_tls_permit_take(url)); }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    if (agnosai_tls_permits_free() != AGNOSAI_TLS_MAX_IN_FLIGHT) { syscall(60, 1); }
+    return 0;
+}
+
+# What a model call pays its budget: a check through task, crew and tenant, then a record of tokens
+# and cost into all three.
+fn _b_budget_chain(): i64 {
+    var n = 200000;
+    var tenant = agnosai_budget_tracker_limits_a(default_alloc(), AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, 0, "tenant");
+    var crew = agnosai_budget_tracker_limits_a(default_alloc(), AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, tenant, "crew");
+    var task = agnosai_budget_tracker_limits_a(default_alloc(), AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, crew, "task");
+    var b = bench_new("budget_check_and_record_3_levels");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_budget_tracker_breach(task, 0);
+            agnosai_budget_tracker_record_tokens(task, 15);
+            agnosai_budget_tracker_record_cost(task, 250);
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    if (agnosai_budget_tracker_tokens_used(tenant) != n / _BR * _BR * 15) { syscall(60, 1); }
+    return 0;
+}
+
 # ── ipc — rust-old/benches/ipc.rs ──
 
 # The socket path the establishment rows bind. `agnosai_ipc_bind` unlinks any
@@ -2623,6 +2697,12 @@ fn main(): i64 {
     _b_tool_task("task_one_tool_call_kept", 1, 5000, &_b_tool_exec_kept);
     _b_tool_task("task_four_tool_calls_kept", 4, 2000, &_b_tool_exec_kept);
 
+    # 2.4.1's rows, after every other so that they move none (ADR 033).
+    _b_semaphore_pair();
+    _b_semaphore_try_pair();
+    _b_tls_permit("tls_permit_take_give_https", "https://gateway.example/v1/chat/completions");
+    _b_tls_permit("tls_permit_take_give_http", "http://127.0.0.1:8088/v1/chat/completions");
+    _b_budget_chain();
     return 0;
 }
 

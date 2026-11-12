@@ -66,6 +66,106 @@ fn _t_v237_from_value(): i64 {
     return 0;
 }
 
+# Spending, from many threads at once, into one crew's tracker through each task's.
+var _t_rec_done = 0;
+
+fn _t_recorder(t): i64 {
+    for (var i = 0; i < 1000; i = i + 1) {
+        agnosai_budget_tracker_record_tokens(t, 1);
+        agnosai_budget_tracker_record_cost(t, 100);
+    }
+    atomic_fetch_add(&_t_rec_done, 1);
+    return 0;
+}
+
+fn _t_subdivide(): i64 {
+    test_group("budgets subdivide: tenant, crew, task (ADR 033)");
+    var tenant = agnosai_budget_tracker_limits_a(default_alloc(), 1000, AGNOSAI_NO_LIMIT, 0, "tenant");
+    var crew = agnosai_budget_tracker_limits_a(default_alloc(), 600, 500000, tenant, "crew");
+    var task = agnosai_budget_tracker_limits_a(default_alloc(), 100, AGNOSAI_NO_LIMIT, crew, "task");
+    assert_eq(agnosai_budget_tracker_parent(task), crew, "a task's tracker sits under its crew's");
+    assert_eq(agnosai_budget_tracker_parent(crew), tenant, "and a crew's under its tenant's");
+    assert(str_eq_cstr(str_from(agnosai_budget_tracker_scope(crew)), "crew") == 1, "each names its scope");
+
+    agnosai_budget_tracker_record_tokens(task, 40);
+    agnosai_budget_tracker_record_cost(task, 101);
+    assert_eq(agnosai_budget_tracker_tokens_used(task), 40, "what a task spends is its own");
+    assert_eq(agnosai_budget_tracker_tokens_used(crew), 40, "and its crew's");
+    assert_eq(agnosai_budget_tracker_tokens_used(tenant), 40, "and its tenant's");
+    assert_eq(agnosai_budget_tracker_cost_units(task), 2, "cost is ceiled once");
+    assert_eq(agnosai_budget_tracker_cost_units(crew), 2, "and the same units are charged above");
+    assert_eq(agnosai_budget_tracker_cost_units(tenant), 2, "all the way up");
+
+    var at: i64[1];
+    assert_eq(agnosai_budget_tracker_breach(task, &at), AGNOSAI_BUDGET_WITHIN, "within every limit");
+    assert_eq(load64(&at), 0, "names no tracker");
+    agnosai_budget_tracker_record_tokens(task, 60);
+    assert_eq(agnosai_budget_tracker_breach(task, &at), AGNOSAI_BUDGET_TOKENS, "a task at its own limit stops");
+    assert_eq(load64(&at), task, "and the task's tracker is the one named");
+    assert(str_eq(agnosai_budget_exceeded_message(task, AGNOSAI_BUDGET_TOKENS),
+        str_from("task token budget exceeded: 100 used, 100 limit")) == 1, "its message names its scope");
+    assert_eq(agnosai_budget_tracker_check(crew), AGNOSAI_BUDGET_WITHIN, "while its crew still has room");
+
+    # Another task of the crew, with no limit of its own, spends the crew to its limit.
+    var other = agnosai_budget_tracker_limits_a(default_alloc(), AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, crew, "task");
+    agnosai_budget_tracker_record_tokens(other, 500);
+    assert_eq(agnosai_budget_tracker_breach(other, &at), AGNOSAI_BUDGET_TOKENS,
+      "a task with no limit stops when its crew is spent");
+    assert_eq(load64(&at), crew, "naming the crew");
+    assert_eq(agnosai_budget_tracker_check(other), AGNOSAI_BUDGET_TOKENS, "and check agrees");
+    assert(str_eq(agnosai_budget_exceeded_message(load64(&at), AGNOSAI_BUDGET_TOKENS),
+        str_from("crew token budget exceeded: 600 used, 600 limit")) == 1, "in the crew's words");
+
+    # A second crew of the same tenant spends it out.
+    var crew2 = agnosai_budget_tracker_limits_a(default_alloc(), AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, tenant, "crew");
+    assert_eq(agnosai_budget_tracker_breach(crew2, &at), AGNOSAI_BUDGET_WITHIN, "another crew of the tenant has room");
+    agnosai_budget_tracker_record_tokens(crew2, 400);
+    assert_eq(agnosai_budget_tracker_breach(crew2, &at), AGNOSAI_BUDGET_TOKENS,
+      "until the two together spend the tenant");
+    assert_eq(load64(&at), tenant, "which is named");
+    assert_eq(agnosai_budget_tracker_tokens_used(tenant), 1000, "having counted both crews");
+
+    # The nearest spent tracker is named, tokens before cost at each.
+    var near = agnosai_budget_tracker_limits_a(default_alloc(), AGNOSAI_NO_LIMIT, 1, crew, "task");
+    agnosai_budget_tracker_record_cost(near, 100);
+    assert_eq(agnosai_budget_tracker_breach(near, &at), AGNOSAI_BUDGET_COST, "a task spent by cost");
+    assert_eq(load64(&at), near, "is named before its crew, which is spent by tokens");
+
+    agnosai_budget_tracker_reset(tenant);
+    assert_eq(agnosai_budget_tracker_tokens_used(tenant), 0, "a reset forgets what a tracker spent");
+    assert_eq(agnosai_budget_tracker_tokens_used(crew), 600, "and not what those below it did");
+    agnosai_budget_tracker_set_limits(tenant, 5, 1000);
+    assert_eq(agnosai_budget_tracker_max_tokens(tenant), 5, "new limits take");
+    assert_eq(agnosai_budget_tracker_max_cost_units(tenant), 10, "in cost units");
+    agnosai_budget_tracker_set_limits(tenant, AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT);
+    assert_eq(agnosai_budget_tracker_max_cost_units(tenant), AGNOSAI_NO_LIMIT, "and none is none");
+    assert_eq(agnosai_budget_tracker_breach(0, &at), AGNOSAI_BUDGET_WITHIN, "no tracker is no limit");
+
+    # The _a forms put what they build in the allocator they are given.
+    var ar = arena_allocator_growable(4096);
+    var in_arena = agnosai_budget_tracker_new_a(ar, _t_tokens(10));
+    assert_eq(agnosai_budget_tracker_max_tokens(in_arena), 10, "a tracker can be made in an arena");
+    assert_eq(agnosai_budget_tracker_parent(in_arena), 0, "with no parent");
+    agnosai_budget_tracker_record_tokens(in_arena, 12);
+    assert(str_eq(agnosai_budget_exceeded_message_a(ar, in_arena, AGNOSAI_BUDGET_TOKENS),
+        str_from("token budget exceeded: 12 used, 10 limit")) == 1, "its message, in the arena");
+    assert(str_eq(bayan_json_v_build(agnosai_budget_exceeded_to_value_a(ar, in_arena, AGNOSAI_BUDGET_TOKENS)),
+        str_from("{\"Tokens\":{\"used\":12,\"limit\":10}}")) == 1, "and its wire form");
+    assert_eq(agnosai_budget_exceeded_to_value_a(ar, in_arena, AGNOSAI_BUDGET_WITHIN), 0, "and nothing for no breach");
+
+    # Many threads at once lose nothing, as plain fields did.
+    var root = agnosai_budget_tracker_limits_a(default_alloc(), AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, 0, "crew");
+    _t_rec_done = 0;
+    for (var i = 0; i < 8; i = i + 1) {
+        var leaf = agnosai_budget_tracker_limits_a(default_alloc(), AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, root, "task");
+        assert_neq(thread_create_detached(&_t_recorder, leaf), 0, "a recorder starts");
+    }
+    while (atomic_load(&_t_rec_done) < 8) { sleep_ms(1); }
+    assert_eq(agnosai_budget_tracker_tokens_used(root), 8000, "eight threads' tokens all land");
+    assert_eq(agnosai_budget_tracker_cost_units(root), 8000, "and their cost");
+    return 0;
+}
+
 fn main() {
     alloc_init();
 
@@ -225,6 +325,7 @@ fn main() {
       "as does the cost limit");
 
     _t_v237_from_value();
+    _t_subdivide();
     return assert_summary();
 }
 

@@ -149,6 +149,34 @@ fn _t_wire_values_are_hoisted(): i64 {
     return 0;
 }
 
+fn _t_budget_wire(): i64 {
+    test_group("a crew's budget and tenant (ADR 033)");
+    var c = agnosai_crew_new(str_from("c"));
+    assert_eq(agnosai_crew_max_tokens(c), AGNOSAI_NO_LIMIT, "a crew has no token limit of its own");
+    assert_eq(agnosai_crew_max_cost_micro_usd(c), AGNOSAI_NO_LIMIT, "nor a cost limit");
+    assert_eq(agnosai_crew_tenant(c), 0, "nor a tenant");
+    assert_eq(bayan_json_v_obj_get_by_cstr(agnosai_crew_to_value(c), "budget"), 0, "and no budget key");
+    agnosai_crew_with_budget(c, 9000, 1500000);
+    agnosai_crew_with_tenant(c, str_from("acme"));
+    assert(str_eq_cstr(agnosai_crew_tenant(c), "acme") == 1, "a crew names its tenant");
+    var v = agnosai_crew_to_value(c);
+    assert_eq(bayan_json_v_obj_get_by_cstr(v, "tenant"), 0, "which is not part of its definition");
+    var back = agnosai_crew_from_value(v);
+    assert_eq(agnosai_crew_max_tokens(back), 9000, "its budget reads back: tokens");
+    assert_eq(agnosai_crew_max_cost_micro_usd(back), 1500000, "and cost");
+    var bad = agnosai_crew_to_value(agnosai_crew_new(str_from("bad")));
+    bayan_json_v_obj_set(bad, str_from("budget"), bayan_json_v_str_new(str_from("lots")));
+    assert_eq(agnosai_crew_from_value(bad), 0, "a budget that cannot be read refuses the record");
+    assert_eq(agnosai_crew_tool_limits(c), 0, "a crew has no tool limits of its own");
+    agnosai_crew_with_tool_limits(c, 4, 2, 1000, 9000);
+    var tl = agnosai_crew_tool_limits(c);
+    assert(tl != 0 && load64(tl) == 4 && load64(tl + 8) == 2 && load64(tl + 16) == 1000 && load64(tl + 24) == 9000,
+      "until it is given some, all four kept");
+    assert(str_eq_cstr(agnosai_crew_reason_from_wire(str_from("budget_exceeded")), "budget_exceeded") == 1,
+      "and budget_exceeded is a reason a crew may give");
+    return 0;
+}
+
 fn main() {
     alloc_init();
 
@@ -461,6 +489,7 @@ fn main() {
     assert(back != 0, "the crew round-trips");
     assert_eq(agnosai_crew_trace_parent(back), 0, "without its traceparent");
 
+    _t_budget_wire();
     return assert_summary();
 }
 

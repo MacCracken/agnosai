@@ -623,6 +623,19 @@ fn main(): i64 {
       "a failed task is task_failed on its own span and on the crew's");
     assert_eq(_t_count(fdoc, "\"status\":{\"code\":2}"), 2, "both ERROR");
 
+    # A crew its budget stopped is error.type budget_exceeded (ADR 033). Spent before its first task,
+    # it runs none, so its workflow span is the only one.
+    var bud_r = agnosai_crew_runner_with_budget(agnosai_crew_runner_new(_t_crew("bud-crew", 2,
+          agnosai_process_sequential())), agnosai_budget_tracker_limits_a(default_alloc(), 0, AGNOSAI_NO_LIMIT, 0,
+        "crew"));
+    agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    agnosai_crew_runner_run(bud_r, &run_err);
+    var budget_doc = agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    assert_eq(vec_len(_t_frags(budget_doc)), 1, "a crew spent before its first task records its workflow span alone");
+    assert_eq(str_contains_cstr(budget_doc,
+        "{\"key\":\"error.type\",\"value\":{\"stringValue\":\"budget_exceeded\"}}"), 1,
+      "ERROR, with error.type budget_exceeded");
+
     # --- the chat span itself, through its transport-error exit --------------
     # Port 1 refuses at once, so this reaches `agnosai_hoosh_chat_in`'s second
     # exit offline: a CLIENT `chat {model}` span under the caller's context.
@@ -877,7 +890,7 @@ fn main(): i64 {
       "a tool call costs exactly the tool's own allocations — no span, no context");
     var off_task = agnosai_task_new(str_from("off"));
     var body0 = alloc_used();
-    _agnosai_execute_task_body_a(default_alloc(), off_task, 0, 0, 0, 0, 0, 0, 0);
+    _agnosai_execute_task_body_a(default_alloc(), off_task, 0, 0, 0, 0, 0, 0, 0, 0);
     var body_cost = alloc_used() - body0;
     var task0 = alloc_used();
     agnosai_execute_task_in_crew(off_task, 0, 0, 0, 0, tp);

@@ -276,8 +276,11 @@ fn _t_abandoned(): i64 {
     return 0;
 }
 
-# A cyclic crew cancelled while its run fails: until 2.2.4 nothing queued it. The cancel saw a
-# runner, so it left the queueing to the finish, and the cancel stands (ADR 032).
+# A cyclic crew cancelled before its run: until 2.2.4 nothing queued it. The cancel saw a
+# runner, so it left the queueing to the finish, and the cancel stands (ADR 032). Since 2.4.1 the
+# finish sees the cancel as it takes its turn (ADR 033), so the crew never reaches the cycle and
+# ends at the queue with its cancelled state; a cancel that lands while the run fails is the DAG
+# arm's, in `tests/orch_lifecycle.tcyr`.
 fn _t_cancelled_while_failing(): i64 {
     var o = agnosai_orchestrator_new(_t_budget());
     var cyc = _t_cyclic();
@@ -285,8 +288,9 @@ fn _t_cancelled_while_failing(): i64 {
     var runner = _agnosai_orch_register(o, cyc);
     agnosai_orchestrator_cancel_crew(o, id);
     assert_eq(_t_queued(o), 0, "a cancel leaves a held crew to its runner");
-    assert_eq(_agnosai_orch_finish_err(o, runner, id, agnosai_crew_name(cyc), 0), 0,
-      "the run fails with no state");
+    var st = _agnosai_orch_finish_err(o, runner, id, agnosai_crew_name(cyc), 0);
+    assert(st != 0, "which ends it before its turn, with its state");
+    if (st != 0) { assert_eq(agnosai_crew_state_status(st), AGNOSAI_CREW_CANCELLED, "cancelled"); }
     assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(o, id)), AGNOSAI_CREW_CANCELLED,
       "the cancel stands: the failure does not overwrite it");
     assert_eq(_t_queued(o), 1, "and the crew is queued all the same, CANCELLED and over");

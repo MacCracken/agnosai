@@ -794,6 +794,17 @@ fn main(): i64 {
         agnosai_otlp_exporter_flush(cl);
     }
     var cl_per = (alloc_used() - cl_before) / 20;
+    # A collector over https takes one of the 64 outbound TLS permits a POST, and gives it back
+    # (ADR 033). This one is plain http, so it took none.
+    var tls_before = agnosai_tls_permits_taken();
+    var cls = agnosai_otlp_exporter_new(str_from("https://127.0.0.1:1"), str_from("agnosai"), 1000);
+    agnosai_otlp_ring_enqueue(agnosai_otlp_exporter_ring(cls), tool, _t_ctx());
+    agnosai_otlp_exporter_flush(cls);
+    assert_eq(agnosai_tls_permits_taken(), tls_before + 1, "a POST to an https collector takes a TLS permit");
+    assert_eq(agnosai_tls_permits_free(), AGNOSAI_TLS_MAX_IN_FLIGHT, "and gives it back");
+    agnosai_otlp_ring_enqueue(agnosai_otlp_exporter_ring(cl), tool, _t_ctx());
+    agnosai_otlp_exporter_flush(cl);
+    assert_eq(agnosai_tls_permits_taken(), tls_before + 1, "and one to a plain http collector takes none");
     assert(cl_per < 512,
       "a POST leaves under 512 B on the global bump (sandhi's connect path) — 2.1.5 left ~1.5 KB, and ~258 KB live");
 

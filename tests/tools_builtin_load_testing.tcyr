@@ -191,6 +191,35 @@ fn _t_http_cost(): i64 {
     return 0;
 }
 
+# A user takes a TLS permit only for a request that will connect (ADR 033): its pool empty. Held
+# for each request, 100 users would be 64 for the whole run.
+fn _t_http_tls_permit(): i64 {
+    _t_serve(_T_KEEP, 0);
+    var w = agnosai_lt_worker_new(_t_url(), clock_now_ns() + 30000000000, 20, &agnosai_lt_http_executor, 0);
+    agnosai_lt_http_executor(w);
+    var pool = load64(w + AGN_LT_POOL);
+    assert_eq(sandhi_http_pool_idle_count(pool), 1, "a user keeps its connection");
+    # The same address over https: what decides is whether the request will connect, which a kept
+    # connection says it will not.
+    var https = str_cat(str_from("https"), str_sub(_t_url(), 4, str_len(_t_url()) - 4));
+    store64(w + AGN_LT_URL, https);
+    var before = agnosai_tls_permits_taken();
+    _agnosai_lt_get(w, agnosai_lt_worker_scratch(w));
+    reset_via(agnosai_lt_worker_scratch(w));
+    assert_eq(agnosai_tls_permits_taken(), before, "a request with a kept connection takes no permit");
+    sandhi_http_pool_close(pool);
+    agnosai_lt_worker_release(w);
+
+    # A user with no connection yet: its request will connect, so it takes one.
+    var fresh = agnosai_lt_worker_new(https, clock_now_ns() + 30000000000, 20, &agnosai_lt_http_executor, 0);
+    assert_eq(load64(fresh + AGN_LT_POOL), 0, "a new user has no connection");
+    _agnosai_lt_get(fresh, agnosai_lt_worker_scratch(fresh));
+    assert_eq(agnosai_tls_permits_taken(), before + 1, "so its first request takes a permit");
+    assert_eq(agnosai_tls_permits_free(), AGNOSAI_TLS_MAX_IN_FLIGHT, "and gives it back");
+    agnosai_lt_worker_release(fresh);
+    return 0;
+}
+
 fn _t_http_suite(): i64 {
     test_group("the real executor, on a real socket");
     if (_t_server_start() == 0) {
@@ -199,7 +228,9 @@ fn _t_http_suite(): i64 {
     }
 
     _t_serve(_T_KEEP, 0);
+    var tls_before = agnosai_tls_permits_taken();
     var w = _t_http_run(50);
+    assert_eq(agnosai_tls_permits_taken(), tls_before, "a plain http target takes no TLS permit");
     assert_eq(vec_len(agnosai_lt_worker_latencies(w)), 50, "every request is measured");
     assert_eq(agnosai_lt_worker_errors(w), 0, "and none failed");
     assert_eq(_t_status(w, 200), 50, "and each is counted under the status the server sent");
@@ -322,6 +353,7 @@ fn _t_http_suite(): i64 {
     assert(agnosai_lt_result_p50_ns(r) > 0, "and a real latency, not a zero");
 
     _t_http_cost();
+    _t_http_tls_permit();
     return 0;
 }
 

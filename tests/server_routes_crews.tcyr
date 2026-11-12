@@ -482,6 +482,44 @@ fn _t_spec_carries_risk(): i64 {
     return 0;
 }
 
+# A request may give the crew and each task a budget (2.4.1, ADR 033), which reaches the spec.
+fn _t_spec_carries_budget(): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"name\":\"budgeted\",\"agents\":[{\"agent_key\":\"k\",\"name\":\"n\",");
+    str_builder_add_cstr(sb, "\"role\":\"r\",\"goal\":\"g\"}],\"budget\":{\"max_tokens\":5000,\"max_cost_usd\":0.5},");
+    str_builder_add_cstr(sb, "\"tasks\":[{\"description\":\"a\",\"budget\":{\"max_tokens\":800}},");
+    str_builder_add_cstr(sb, "{\"description\":\"b\"}]}");
+    var req = agnosai_crew_req_from_value(_t_parse(str_builder_build(sb)));
+    assert(req != 0, "a crew request with budgets parses");
+    if (req == 0) { return 0; }
+    assert_eq(agnosai_crew_req_max_tokens(req), 5000, "the request reads the crew's tokens");
+    assert_eq(agnosai_crew_req_max_cost_micro_usd(req), 500000, "and its cost");
+    var first = vec_get(agnosai_crew_req_tasks(req), 0);
+    assert_eq(agnosai_task_req_max_tokens(first), 800, "and a task's tokens");
+    assert_eq(agnosai_task_req_max_cost_micro_usd(first), AGNOSAI_NO_LIMIT, "and no cost it did not give");
+    var spec = _agnosai_route_build_spec(req);
+    assert_eq(agnosai_crew_max_tokens(spec), 5000, "the crew's token limit reaches its spec");
+    assert_eq(agnosai_crew_max_cost_micro_usd(spec), 500000, "and its cost, in micro-USD");
+    var ts = agnosai_crew_tasks(spec);
+    assert_eq(agnosai_task_max_tokens(vec_get(ts, 0)), 800, "a task's own limit reaches its task");
+    assert_eq(agnosai_task_max_cost_micro_usd(vec_get(ts, 0)), AGNOSAI_NO_LIMIT, "with no cost limit it did not give");
+    assert_eq(agnosai_task_max_tokens(vec_get(ts, 1)), AGNOSAI_NO_LIMIT, "and a task with none has none");
+    var plain = agnosai_crew_req_from_value(_t_parse(_t_valid_body()));
+    if (plain != 0) {
+        assert_eq(agnosai_crew_max_tokens(_agnosai_route_build_spec(plain)), AGNOSAI_NO_LIMIT,
+          "a request with no budget gives its crew none");
+    }
+    var neg = _t_parse(str_from("{\"description\":\"d\",\"budget\":{\"max_tokens\":-1}}"));
+    assert(agnosai_task_req_from_value(neg) == 0, "a negative limit refuses the request");
+    assert(agnosai_task_req_from_value(_t_parse(str_from("{\"description\":\"d\",\"budget\":\"lots\"}"))) == 0,
+      "as does a budget that is not an object");
+    var word = _t_parse(str_from("{\"description\":\"d\",\"budget\":{\"max_cost_usd\":\"5\"}}"));
+    assert(agnosai_task_req_from_value(word) == 0, "or a cost that is not a number");
+    assert(agnosai_task_req_from_value(_t_parse(str_from("{\"description\":\"d\",\"budget\":null}"))) != 0,
+      "and a null budget is none");
+    return 0;
+}
+
 fn _t_crew_reason_on_the_wire(): i64 {
     var o = agnosai_orchestrator_new(0);
     agnosai_orchestrator_with_llm_url(o, str_from("http://127.0.0.1:1"), str_from(""));
@@ -897,6 +935,7 @@ fn main(): i64 {
     _t_crew_id_is_case_insensitive();
     _t_crew_reason_on_the_wire();
     _t_spec_carries_risk();
+    _t_spec_carries_budget();
     _t_rejects_empty_name();
     _t_rejects_missing_tasks();
     _t_rejects_missing_agents();

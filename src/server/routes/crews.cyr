@@ -34,7 +34,10 @@ enum AgnosaiTaskReqOff {
     AGN_TREQ_DEPENDENCIES = 32;
     # The task's risk, `low` when it is not given (2.4.0, ADR 032). The Rust line's request had none.
     AGN_TREQ_RISK = 40;
-    AGN_TREQ_SIZE = 48;
+    # The task's own token and cost limits, `AGNOSAI_NO_LIMIT` when not given (2.4.1, ADR 033).
+    AGN_TREQ_MAX_TOKENS = 48;
+    AGN_TREQ_MAX_COST = 56;
+    AGN_TREQ_SIZE = 64;
 }
 
 # `description` is the only required field; the rest are `#[serde(default)]`.
@@ -48,6 +51,8 @@ fn agnosai_task_req_new_a(a, description: Str): i64 {
     store64(t + AGN_TREQ_HAS_PRIORITY, 0);
     store64(t + AGN_TREQ_DEPENDENCIES, vec_new_a(a));
     store64(t + AGN_TREQ_RISK, AGNOSAI_RISK_LOW);
+    store64(t + AGN_TREQ_MAX_TOKENS, AGNOSAI_NO_LIMIT);
+    store64(t + AGN_TREQ_MAX_COST, AGNOSAI_NO_LIMIT);
     return t;
 }
 
@@ -68,6 +73,10 @@ fn agnosai_task_req_has_priority(t): i64 { return load64(t + AGN_TREQ_HAS_PRIORI
 fn agnosai_task_req_dependencies(t): i64 { return load64(t + AGN_TREQ_DEPENDENCIES); }
 # The task's risk, an `AGNOSAI_RISK_*`, `low` when the request gave none.
 fn agnosai_task_req_risk(t): i64 { return load64(t + AGN_TREQ_RISK); }
+# The task's own token limit, or `AGNOSAI_NO_LIMIT`.
+fn agnosai_task_req_max_tokens(t): i64 { return load64(t + AGN_TREQ_MAX_TOKENS); }
+# The task's own cost limit in micro-USD, or `AGNOSAI_NO_LIMIT`.
+fn agnosai_task_req_max_cost_micro_usd(t): i64 { return load64(t + AGN_TREQ_MAX_COST); }
 
 # The fields serde accepts on `TaskRequest`, which is `deny_unknown_fields`.
 fn _agnosai_task_req_fields_a(a): i64 {
@@ -77,6 +86,7 @@ fn _agnosai_task_req_fields_a(a): i64 {
     agnosai_route_field_a(a, f, "priority");
     agnosai_route_field_a(a, f, "dependencies");
     agnosai_route_field_a(a, f, "risk");
+    agnosai_route_field_a(a, f, "budget");
     return f;
 }
 
@@ -132,6 +142,13 @@ fn agnosai_task_req_from_value_a(a, v): i64 {
         if (_agnosai_risk_is_known(rs) == 0) { return 0; }
         store64(t + AGN_TREQ_RISK, agnosai_task_risk_from_wire(rs));
     }
+
+    # `{"max_tokens":N,"max_cost_usd":X}`, either key optional (2.4.1, ADR 033). Anything that is
+    # not such a budget refuses the request, rather than run the task with no limit.
+    var lim: i64[2];
+    if (agnosai_spend_limits_from_value(bayan_json_v_obj_get_by_cstr(v, "budget"), &lim) == 0) { return 0; }
+    store64(t + AGN_TREQ_MAX_TOKENS, load64(&lim));
+    store64(t + AGN_TREQ_MAX_COST, load64(&lim + 8));
 
     var dv = bayan_json_v_obj_get_by_cstr(v, "dependencies");
     if (dv != 0 && bayan_json_v_is_null(dv) == 0) {
@@ -190,7 +207,11 @@ enum AgnosaiCrewReqOff {
     AGN_CREQ_PROCESS = 24;
     AGN_CREQ_MAX_CONCURRENCY = 32;
     AGN_CREQ_HAS_CONCURRENCY = 40;
-    AGN_CREQ_SIZE = 48;
+    # The crew's own token and cost limits, `AGNOSAI_NO_LIMIT` when not given (2.4.1, ADR 033).
+    # They only tighten what the server gives every crew.
+    AGN_CREQ_MAX_TOKENS = 48;
+    AGN_CREQ_MAX_COST = 56;
+    AGN_CREQ_SIZE = 64;
 }
 
 # A crew request with only its required name set.
@@ -202,6 +223,8 @@ fn agnosai_crew_req_new_a(a, name: Str): i64 {
     store64(r + AGN_CREQ_PROCESS, 0);
     store64(r + AGN_CREQ_MAX_CONCURRENCY, 0);
     store64(r + AGN_CREQ_HAS_CONCURRENCY, 0);
+    store64(r + AGN_CREQ_MAX_TOKENS, AGNOSAI_NO_LIMIT);
+    store64(r + AGN_CREQ_MAX_COST, AGNOSAI_NO_LIMIT);
     return r;
 }
 
@@ -222,6 +245,10 @@ fn agnosai_crew_req_process(r): i64 { return load64(r + AGN_CREQ_PROCESS); }
 fn agnosai_crew_req_max_concurrency(r): i64 { return load64(r + AGN_CREQ_MAX_CONCURRENCY); }
 # Whether a concurrency was supplied, distinguishing absent from 0.
 fn agnosai_crew_req_has_concurrency(r): i64 { return load64(r + AGN_CREQ_HAS_CONCURRENCY); }
+# The crew's own token limit, or `AGNOSAI_NO_LIMIT`.
+fn agnosai_crew_req_max_tokens(r): i64 { return load64(r + AGN_CREQ_MAX_TOKENS); }
+# The crew's own cost limit in micro-USD, or `AGNOSAI_NO_LIMIT`.
+fn agnosai_crew_req_max_cost_micro_usd(r): i64 { return load64(r + AGN_CREQ_MAX_COST); }
 
 fn _agnosai_crew_req_fields_a(a): i64 {
     var f = agnosai_route_fields_a(a);
@@ -230,6 +257,7 @@ fn _agnosai_crew_req_fields_a(a): i64 {
     agnosai_route_field_a(a, f, "tasks");
     agnosai_route_field_a(a, f, "process");
     agnosai_route_field_a(a, f, "max_concurrency");
+    agnosai_route_field_a(a, f, "budget");
     return f;
 }
 
@@ -291,6 +319,11 @@ fn agnosai_crew_req_from_value_a(a, v): i64 {
         store64(r + AGN_CREQ_MAX_CONCURRENCY, bayan_json_v_int(mc));
         store64(r + AGN_CREQ_HAS_CONCURRENCY, 1);
     }
+
+    var lim: i64[2];
+    if (agnosai_spend_limits_from_value(bayan_json_v_obj_get_by_cstr(v, "budget"), &lim) == 0) { return 0; }
+    store64(r + AGN_CREQ_MAX_TOKENS, load64(&lim));
+    store64(r + AGN_CREQ_MAX_COST, load64(&lim + 8));
     return r;
 }
 
@@ -521,6 +554,7 @@ fn _agnosai_route_build_spec(r): i64 {
             agnosai_task_with_priority(t, agnosai_task_req_priority(tr));
         }
         agnosai_task_with_risk(t, agnosai_task_req_risk(tr));
+        agnosai_task_with_budget(t, agnosai_task_req_max_tokens(tr), agnosai_task_req_max_cost_micro_usd(tr));
         vec_push(tasks, t);
     }
 
@@ -536,6 +570,7 @@ fn _agnosai_route_build_spec(r): i64 {
     }
 
     agnosai_crew_with_tasks(spec, tasks);
+    agnosai_crew_with_budget(spec, agnosai_crew_req_max_tokens(r), agnosai_crew_req_max_cost_micro_usd(r));
     return spec;
 }
 

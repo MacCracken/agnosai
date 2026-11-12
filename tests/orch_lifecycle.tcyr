@@ -382,9 +382,9 @@ fn test_modes(): i64 {
     _t_run_checked(_t_crew("lc-seq-llm", 3, agnosai_process_sequential()), &_t_stub_chat,
       "a sequential crew the model answers");
     _t_run_checked(_t_crew("lc-par", 5, agnosai_process_parallel(2)), &_t_stub_chat,
-      "a parallel crew in batches");
+      "a parallel crew, two at a time");
     _t_run_checked(_t_crew("lc-par-one", 4, agnosai_process_parallel(0)), &_t_stub_chat,
-      "a parallel crew in one batch");
+      "a parallel crew, all at once");
 
     # A diamond: a, then b and c, then d.
     var a = _t_task("a");
@@ -514,6 +514,9 @@ fn test_late_subscriber(): i64 {
     var pevs = _t_drain(_t_late_sub);
     assert(_t_count(pevs, "task_started") >= 2, "in a parallel crew, it hears the batches after it");
     assert(_t_count(pevs, "token") >= 2, "and their workers' tokens");
+    assert_eq(_t_count(pevs, "task_completed"), _t_count(pevs, "task_started"),
+      "and no task's end without its start: the one it attached during is not reported to it");
+    assert_eq(_t_count(evs, "task_completed"), _t_count(evs, "task_started"), "as in a sequential crew");
     return 0;
 }
 
@@ -994,6 +997,173 @@ fn test_tool_events(): i64 {
     return 0;
 }
 
+# ── a sliding window, not batches (ADR 033) ───────────────────────────────
+
+# How many chat calls are in flight at once, the most there ever were, and how many there have been.
+var _t_sw_inside = 0;
+var _t_sw_most = 0;
+var _t_sw_calls = 0;
+
+# A chat that takes 300 ms for a task whose request names SLOW, and none for any other.
+fn _t_stub_chat_timed(client, request, out_response, parent_sc): i64 {
+    var now = atomic_fetch_add(&_t_sw_inside, 1) + 1;
+    var seen = atomic_load(&_t_sw_most);
+    while (now > seen) {
+        if (atomic_cas(&_t_sw_most, seen, now) == 1) { break; }
+        seen = atomic_load(&_t_sw_most);
+    }
+    if (str_contains_cstr(agnosai_inference_request_to_json(request), "SLOW") == 1) { sleep_ms(300); }
+    atomic_fetch_add(&_t_sw_inside, 0 - 1);
+    atomic_fetch_add(&_t_sw_calls, 1);
+    return _t_stub_chat(client, request, out_response, parent_sc);
+}
+
+# The task ids of `evs`' `task_completed`, in the order they came.
+fn _t_completed_order(evs): i64 {
+    var v = vec_new();
+    for (var i = 0; i < vec_len(evs); i = i + 1) {
+        if (str_eq_cstr(agnosai_crew_event_event_type(vec_get(evs, i)), "task_completed") == 1) {
+            vec_push(v, _tl_task_id(vec_get(evs, i)));
+        }
+    }
+    return v;
+}
+
+# A reviewer that waits for `_t_sw_want` chat calls, at most 3 s, notes how many there were, and
+# approves what is pending.
+var _t_sw_want = 0;
+var _t_sw_calls_at_decision = 0;
+var _t_sw_gate = 0;
+var _t_sw_done = 0;
+
+fn _t_sw_reviewer(arg): i64 {
+    var until = clock_now_ns() + 3000 * AGNOSAI_NS_PER_MS;
+    while (clock_now_ns() < until && agnosai_approval_gate_pending_count(_t_sw_gate) < 1) { sleep_ms(1); }
+    while (clock_now_ns() < until && atomic_load(&_t_sw_calls) < _t_sw_want) { sleep_ms(1); }
+    _t_sw_calls_at_decision = atomic_load(&_t_sw_calls);
+    var pending = agnosai_approval_gate_pending_tasks(_t_sw_gate);
+    for (var i = 0; i < vec_len(pending); i = i + 1) {
+        agnosai_approval_submit_decision(_t_sw_gate, vec_get(pending, i), AGNOSAI_APPROVAL_APPROVED);
+    }
+    atomic_store(&_t_sw_done, 1);
+    return 0;
+}
+
+fn test_sliding_window(): i64 {
+    test_group("a parallel crew is a sliding window, not batches");
+    # Two at a time: a slow task and three fast ones. In batches the second batch waited for the
+    # slow one; in a window the fast ones go on through the second slot and finish first.
+    var slow = _t_task("SLOW one");
+    var f1 = _t_task("fast one");
+    var f2 = _t_task("fast two");
+    var f3 = _t_task("fast three");
+    var ts = vec_new();
+    vec_push(ts, slow);
+    vec_push(ts, f1);
+    vec_push(ts, f2);
+    vec_push(ts, f3);
+    _t_sw_inside = 0;
+    _t_sw_most = 0;
+    _t_sw_calls = 0;
+    var evs = _t_run_checked(_t_crew_of("lc-window", ts, agnosai_process_parallel(2)), &_t_stub_chat_timed,
+      "a parallel crew whose slow task does not hold up the others");
+    var order = _t_completed_order(evs);
+    assert_eq(vec_len(order), 4, "all four are reported");
+    if (vec_len(order) == 4) {
+        assert(str_eq(vec_get(order, 0), agnosai_task_id(f1)) == 1, "the first fast task ends first");
+        assert(str_eq(vec_get(order, 1), agnosai_task_id(f2)) == 1,
+          "and the second fast task starts in its slot and ends before the slow one");
+        assert(str_eq(vec_get(order, 2), agnosai_task_id(f3)) == 1, "as does the third");
+        assert(str_eq(vec_get(order, 3), agnosai_task_id(slow)) == 1, "and the slow one ends last");
+    }
+    assert(atomic_load(&_t_sw_most) <= 2, "never more than two at once");
+    assert_eq(atomic_load(&_t_sw_most), 2, "and two at once while the slow one ran");
+
+    # One at a time: a task awaiting its reviewer gives its slot back, so the plain ones run
+    # meanwhile. Holding the slot, the reviewer would have seen one call, not three.
+    var risky = _t_risky("risky first", AGNOSAI_RISK_HIGH);
+    var p1 = _t_task("plain one");
+    var p2 = _t_task("plain two");
+    var rts = vec_new();
+    vec_push(rts, risky);
+    vec_push(rts, p1);
+    vec_push(rts, p2);
+    _t_sw_inside = 0;
+    _t_sw_most = 0;
+    _t_sw_calls = 0;
+    _t_sw_want = 3;
+    _t_sw_calls_at_decision = 0;
+    _t_sw_gate = agnosai_approval_gate_new();
+    atomic_store(&_t_sw_done, 0);
+    assert_neq(thread_create_detached(&_t_sw_reviewer, 0), 0, "a reviewer starts");
+    var st: i64[1];
+    var revs = _t_run_gated(_t_crew_of("lc-window-review", rts, agnosai_process_parallel(1)), _t_sw_gate, 0,
+      &_t_stub_chat_timed, "a parallel crew whose reviewed task gives its slot back", &st);
+    while (atomic_load(&_t_sw_done) == 0) { sleep_ms(1); }
+    assert_eq(_t_sw_calls_at_decision, 3, "both plain tasks ran while the reviewer took its time");
+    assert(atomic_load(&_t_sw_most) <= 1, "one at a time still");
+    assert_eq(agnosai_crew_state_status(load64(&st)), AGNOSAI_CREW_COMPLETED, "and the crew completes");
+    var rorder = _t_completed_order(revs);
+    assert_eq(vec_len(rorder), 3, "with all three reported");
+    if (vec_len(rorder) == 3) {
+        assert(str_eq(vec_get(rorder, 2), agnosai_task_id(risky)) == 1, "the reviewed one last, once decided");
+    }
+    var res = agnosai_crew_state_results(load64(&st));
+    if (vec_len(res) == 3) {
+        assert(str_eq(agnosai_task_result_task_id(vec_get(res, 0)), agnosai_task_id(risky)) == 1,
+          "and the results still in dispatch order");
+    }
+
+    # A reviewed task that ends after it gave its slot back frees nothing more: decided while a slow
+    # sibling holds the one slot, it must not let a second sibling in beside it.
+    var risky2 = _t_risky("risky again", AGNOSAI_RISK_HIGH);
+    var ts2 = vec_new();
+    vec_push(ts2, risky2);
+    vec_push(ts2, _t_task("SLOW first sibling"));
+    vec_push(ts2, _t_task("SLOW second sibling"));
+    _t_sw_inside = 0;
+    _t_sw_most = 0;
+    _t_sw_calls = 0;
+    _t_sw_want = 1;
+    _t_sw_gate = agnosai_approval_gate_new();
+    atomic_store(&_t_sw_done, 0);
+    assert_neq(thread_create_detached(&_t_sw_reviewer, 0), 0, "a quick reviewer starts");
+    var st2: i64[1];
+    _t_run_gated(_t_crew_of("lc-window-once", ts2, agnosai_process_parallel(1)), _t_sw_gate, 0, &_t_stub_chat_timed,
+      "a parallel crew whose reviewed task ends while a sibling runs", &st2);
+    while (atomic_load(&_t_sw_done) == 0) { sleep_ms(1); }
+    assert_eq(atomic_load(&_t_sw_most), 1, "one slot is one task at a time, whenever the reviewed one ends");
+    assert_eq(agnosai_crew_state_status(load64(&st2)), AGNOSAI_CREW_COMPLETED, "and all three complete");
+    return 0;
+}
+
+fn test_budget_ending(): i64 {
+    test_group("a crew its budget stopped ends legally, and says why");
+    var spec = _t_crew("lc-budget", 4, agnosai_process_sequential());
+    var sub: i64[1];
+    var r = _t_runner(spec, &_t_stub_chat, &sub);
+    agnosai_crew_runner_with_budget(r, agnosai_budget_tracker_limits_a(default_alloc(), 20, AGNOSAI_NO_LIMIT, 0,
+        "crew"));
+    var err: i64[1];
+    store64(&err, 0);
+    var st = agnosai_crew_runner_run(r, &err);
+    var evs = _t_drain(load64(&sub));
+    _tl_assert_legal(evs, agnosai_crew_id(spec), "a crew its budget stopped");
+    assert_eq(_t_count(evs, "task_completed"), 2, "two tasks ran, 15 tokens each, before 20 was spent");
+    assert(str_eq_cstr(_t_str_of(_t_find(evs, "crew_completed"), "reason"), "budget_exceeded") == 1,
+      "and crew_completed says its budget ran out");
+    assert(str_eq_cstr(agnosai_crew_state_reason(st), "budget_exceeded") == 1, "as its state does");
+
+    var pspec = _t_crew("lc-budget-par", 5, agnosai_process_parallel(2));
+    var psub: i64[1];
+    var pr = _t_runner(pspec, &_t_stub_chat, &psub);
+    agnosai_crew_runner_with_budget(pr, agnosai_budget_tracker_limits_a(default_alloc(), 1, AGNOSAI_NO_LIMIT, 0,
+        "crew"));
+    agnosai_crew_runner_run(pr, &err);
+    _tl_assert_legal(_t_drain(load64(&psub)), agnosai_crew_id(pspec), "a parallel crew its budget stopped");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
@@ -1010,6 +1180,8 @@ fn main(): i64 {
     test_approvals();
     test_registry_rollup();
     test_tool_events();
+    test_sliding_window();
+    test_budget_ending();
     return assert_summary();
 }
 

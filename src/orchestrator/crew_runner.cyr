@@ -109,6 +109,7 @@
 
 include "src/done_word.cyr"
 include "src/log_fields.cyr"
+include "src/orchestrator/budget.cyr"
 
 # Pick the highest-scoring agent for a task, or 0 when the roster is empty.
 #
@@ -894,18 +895,52 @@ fn _agnosai_crew_tool_failed_result_a(a, task, why: Str, start_ns): i64 {
 #
 # An attempt `agnosai_with_retry_a` repeats is only the chat call. A tool already ran once its
 # result is in the request, and nothing here runs one again.
-fn _agnosai_crew_converse_a(ra, task_id: Str, client, request, trace, st, out_resp): i64 {
-    var err = agnosai_with_retry_a(ra, _AGNOSAI_CREW_RETRY, task_id, &_agnosai_crew_infer_fp,
-      _agnosai_crew_infer_ctx_new_a(ra, client, request, trace), out_resp);
+#
+# `budget` is the task's tracker, or 0 (ADR 033): every call is checked against it, and what each
+# costs is recorded in it, before its usage is carried onto the next.
+fn _agnosai_crew_converse_a(ra, task_id: Str, client, request, trace, st, budget, out_resp): i64 {
+    var err = _agnosai_crew_infer_within_a(ra, task_id, client, request, trace, budget, out_resp);
     if (st == 0) { return err; }
     while (err == 0) {
         var resp = load64(out_resp);
         if (agnosai_inference_response_tool_calls(resp) == 0) { return 0; }
         var stop = _agnosai_tool_turn_a(st, request, resp);
         if (stop != 0) { return stop; }
-        err = agnosai_with_retry_a(ra, _AGNOSAI_CREW_RETRY, task_id, &_agnosai_crew_infer_fp,
-          _agnosai_crew_infer_ctx_new_a(ra, client, request, trace), out_resp);
+        err = _agnosai_crew_infer_within_a(ra, task_id, client, request, trace, budget, out_resp);
         if (err == 0) { agnosai_inference_response_carry_usage(load64(out_resp), resp); }
+    }
+    return err;
+}
+
+# One chat call, with its retries, if `budget` allows it (ADR 033), and what it cost recorded in
+# `budget` and every tracker above it. Returns 0, or why not.
+#
+# ⚠ **Checked here, outside `agnosai_with_retry_a`, and that is load-bearing.** The retry wrapper
+# repeats any error whose text holds `429`, `502` or `503`, and a refusal names what was used:
+# `crew token budget exceeded: 4291 used` would be tried again three times. A failed attempt
+# records nothing, so a check between retries could not answer differently from this one.
+fn _agnosai_crew_infer_within_a(ra, task_id: Str, client, request, trace, budget, out_resp): i64 {
+    if (budget != 0) {
+        var at: i64[1];
+        var kind = agnosai_budget_tracker_breach(budget, &at);
+        if (kind != AGNOSAI_BUDGET_WITHIN) {
+            var why = agnosai_budget_exceeded_message_a(ra, load64(&at), kind);
+            if (sakshi_get_level() >= SK_WARN) {
+                var f[AGNOSAI_LOG_FIELDS_BYTES];
+                var n = agnosai_log_fields_start(&f, task_id);
+                n = agnosai_log_field_str(&f, n, "reason", why);
+                sakshi_log_kv(SK_WARN, "model call refused: a budget is spent", 37, "task_id", 7, &f, n);
+            }
+            return why;
+        }
+    }
+    var err = agnosai_with_retry_a(ra, _AGNOSAI_CREW_RETRY, task_id, &_agnosai_crew_infer_fp,
+      _agnosai_crew_infer_ctx_new_a(ra, client, request, trace), out_resp);
+    if (err == 0 && budget != 0) {
+        var resp = load64(out_resp);
+        agnosai_budget_tracker_record_tokens(budget, agnosai_inference_response_total_tokens(resp));
+        var cost = agnosai_inference_response_cost_micro_usd(resp);
+        if (cost > 0) { agnosai_budget_tracker_record_cost(budget, cost); }
     }
     return err;
 }
@@ -918,7 +953,7 @@ fn _agnosai_crew_converse_a(ra, task_id: Str, client, request, trace, st, out_re
 # the only place a copy is made: with no tools the two are one allocator, and no byte of this path
 # is any different from what it was.
 fn _agnosai_crew_answer_a(a, ra, task, agent, client, event_tx, crew_id: Str, span, self_sc,
-  model: Str, st, start_ns): i64 {
+  model: Str, st, budget, start_ns): i64 {
     var task_id = agnosai_task_id(task);
     var request = _agnosai_crew_build_request_a(ra, task, agent, model, 0);
     if (st != 0) {
@@ -927,7 +962,7 @@ fn _agnosai_crew_answer_a(a, ra, task, agent, client, event_tx, crew_id: Str, sp
 
     var resp: i64[1];
     store64(&resp, 0);
-    var err = _agnosai_crew_converse_a(ra, task_id, client, request, self_sc, st, &resp);
+    var err = _agnosai_crew_converse_a(ra, task_id, client, request, self_sc, st, budget, &resp);
 
     # A refused id, once. ⚠ Only with no answer yet, which is what says no tool has run: this builds
     # the request again, and a task that has called a tool keeps its transcript (below).
@@ -943,7 +978,7 @@ fn _agnosai_crew_answer_a(a, ra, task, agent, client, event_tx, crew_id: Str, sp
             if (st != 0) {
                 agnosai_inference_request_with_tools(request, _agnosai_tool_task_definitions(st));
             }
-            err = _agnosai_crew_converse_a(ra, task_id, client, request, self_sc, st, &resp);
+            err = _agnosai_crew_converse_a(ra, task_id, client, request, self_sc, st, budget, &resp);
         }
     }
 
@@ -1004,7 +1039,7 @@ fn _agnosai_crew_answer_a(a, ra, task, agent, client, event_tx, crew_id: Str, sp
               AGNOSAI_CREW_RETRY_TEMPERATURE_MILLI);
 
             var prior = load64(&resp);
-            err = _agnosai_crew_converse_a(ra, task_id, client, request, self_sc, st, &resp);
+            err = _agnosai_crew_converse_a(ra, task_id, client, request, self_sc, st, budget, &resp);
             attempts = attempts + 1;
             # By what it holds and not by `err`: a retry that called a tool and then failed has a
             # newer answer in `resp`, and the older calls were paid for too.
@@ -1058,7 +1093,7 @@ fn _agnosai_crew_answer_a(a, ra, task, agent, client, event_tx, crew_id: Str, sp
 # The arena is given back on the one way out. Pool empty and nothing to mint leaves `ra` the crew's
 # allocator, which costs a global-heap crew its transcript and nothing else.
 fn _agnosai_crew_answer_with_tools_a(a, task, agent, client, event_tx, crew_id: Str, span, self_sc,
-  model: Str, loop, start_ns): i64 {
+  model: Str, loop, budget, start_ns): i64 {
     var arena = _agnosai_tool_arena_acquire();
     var ra = arena;
     if (ra == 0) { ra = a; }
@@ -1073,7 +1108,7 @@ fn _agnosai_crew_answer_with_tools_a(a, task, agent, client, event_tx, crew_id: 
         result = _agnosai_crew_tool_failed_result_a(a, task, load64(&miss), start_ns);
     } else {
         result = _agnosai_crew_answer_a(a, ra, task, agent, client, event_tx, crew_id, span,
-          self_sc, model, st, start_ns);
+          self_sc, model, st, budget, start_ns);
         _agnosai_tool_task_finish_a(st, result);
     }
 
@@ -1084,7 +1119,7 @@ fn _agnosai_crew_answer_with_tools_a(a, task, agent, client, event_tx, crew_id: 
 # The body of `agnosai_execute_task_with_tools_a`. `span` is the task's
 # `invoke_agent` span and `self_sc` its context — both 0 with telemetry off.
 fn _agnosai_execute_task_body_a(a, task, agent, client, event_tx, crew_id: Str, span,
-  self_sc, loop): i64 {
+  self_sc, loop, budget): i64 {
     var start_ns = clock_now_ns();
     var task_id = agnosai_task_id(task);
 
@@ -1111,12 +1146,20 @@ fn _agnosai_execute_task_body_a(a, task, agent, client, event_tx, crew_id: Str, 
     # convention's `gen_ai.request.model` on `invoke_agent`). A no-op at span 0.
     agnosai_genai_span_set_request_model(span, model);
 
+    # The task's own tracker when it has limits, under the crew's; else the crew's (ADR 033).
+    var bt = budget;
+    if (agnosai_task_max_tokens(task) != AGNOSAI_NO_LIMIT
+      || agnosai_task_max_cost_micro_usd(task) != AGNOSAI_NO_LIMIT) {
+        bt = agnosai_budget_tracker_limits_a(a, agnosai_task_max_tokens(task),
+          agnosai_task_max_cost_micro_usd(task), budget, "task");
+    }
+
     if (_agnosai_crew_sends_tools(agent, loop) == 1) {
         return _agnosai_crew_answer_with_tools_a(a, task, agent, client, event_tx, crew_id, span,
-          self_sc, model, loop, start_ns);
+          self_sc, model, loop, bt, start_ns);
     }
     return _agnosai_crew_answer_a(a, a, task, agent, client, event_tx, crew_id, span, self_sc,
-      model, 0, start_ns);
+      model, 0, bt, start_ns);
 }
 
 # Execute one task of a crew via the LLM, or return the placeholder when there
@@ -1157,6 +1200,18 @@ fn agnosai_execute_task_in_crew_a(a, task, agent, client, event_tx, crew_id: Str
 # names, the model calls them until it answers, and each call leaves a record on the result.
 fn agnosai_execute_task_with_tools_a(a, task, agent, client, event_tx, crew_id: Str, parent_sc,
   loop): i64 {
+    return agnosai_execute_task_budgeted_a(a, task, agent, client, event_tx, crew_id, parent_sc, loop,
+      0);
+}
+
+# `agnosai_execute_task_with_tools_a`, held to `budget`, a tracker or 0 (ADR 033).
+#
+# Every model call is checked against it first, and refused once it or any tracker above it is
+# spent, which fails the task with the breach as its error. What each call costs is recorded in
+# it. A task with limits of its own gets a tracker of them under `budget`, so it stops at the
+# tighter of its own and what its crew has left.
+fn agnosai_execute_task_budgeted_a(a, task, agent, client, event_tx, crew_id: Str, parent_sc,
+  loop, budget): i64 {
     # ⚠ Built ONLY with the exporter on. Off — the common case — this costs one
     # load and a compare, no clock read, and the body is handed span 0 and
     # context 0.
@@ -1176,7 +1231,7 @@ fn agnosai_execute_task_with_tools_a(a, task, agent, client, event_tx, crew_id: 
     }
 
     var result = _agnosai_execute_task_body_a(a, task, agent, client, event_tx, crew_id, span,
-      self_sc, loop);
+      self_sc, loop, budget);
 
     # Recorded ONCE, from the result: a failed inference is a Failed result, not
     # an early return, so there is no other exit to cover.
@@ -1211,9 +1266,10 @@ fn agnosai_execute_task(task, agent, client, event_tx): i64 {
 # worker starts with an empty thread-local block (ADR 023).
 #
 # `ALLOC` is the crew's allocator (ADR 028). `DONE` turns 1 when the worker is over.
-# `SLOTS` and `TAIL` are its batch's: a worker that finishes takes the next slot and puts
-# its job there as its last act, and the wave waits on the slots in turn, so it hears of
-# each job as it finishes, in completion order (ADR 032). See `src/done_word.cyr`.
+# `SLOTS` and `TAIL` are its wave's: a worker takes the next slot for each thing it has to say,
+# its job there as the value, and the wave waits on the slots in turn, so it hears of
+# each job as it finishes, in completion order (ADR 032), and of a slot a job gave back while
+# its answer waits on a reviewer (ADR 033). See `src/done_word.cyr`.
 enum AgnosaiCrewJobOff {
     AGN_CJ_TASK = 0;
     AGN_CJ_AGENT = 8;
@@ -1231,10 +1287,26 @@ enum AgnosaiCrewJobOff {
     AGN_CJ_TAIL = 96;
     # The runner, for a worker whose task's answer needs a reviewer (ADR 032), or 0.
     AGN_CJ_RUNNER = 104;
-    AGN_CJ_SIZE = 112;
+    # 1 once the wave has heard this job give its slot back. The wave's alone to touch.
+    AGN_CJ_FREED = 112;
+    AGN_CJ_SIZE = 120;
 }
 
-# Say a job is over: `DONE`, then its batch's next slot, which is the worker's last touch of
+# What a slot in a wave says of its job, beside the job: that it gave its slot back, where the job
+# alone says it is over. A job is 8-aligned, so the two cannot be mistaken.
+var _AGNOSAI_CREW_JOB_FREED = 1;
+
+# Give a job's slot back to its wave while its answer waits on a reviewer (ADR 033), so the wave
+# can start another task. The job is not over: it still says so, later. Nothing outside a wave.
+fn _agnosai_crew_job_free_slot(job): i64 {
+    var slots = load64(job + AGN_CJ_SLOTS);
+    if (slots == 0) { return 0; }
+    var k = atomic_fetch_add(load64(job + AGN_CJ_TAIL), 1);
+    agnosai_done_word_set_value(slots + k * 8, job + _AGNOSAI_CREW_JOB_FREED);
+    return 0;
+}
+
+# Say a job is over: `DONE`, then its wave's next slot, which is the worker's last touch of
 # anything the wave holds. A job outside a wave (`SLOTS` 0) has only `DONE`.
 fn _agnosai_crew_job_done(job): i64 {
     var slots = load64(job + AGN_CJ_SLOTS);
@@ -1264,12 +1336,16 @@ fn _agnosai_crew_worker(job): i64 {
         _agnosai_crew_job_done(job);
         return 0;
     }
-    var result = agnosai_execute_task_with_tools_a(a, task,
-      load64(job + AGN_CJ_AGENT), load64(job + AGN_CJ_CLIENT), load64(job + AGN_CJ_EVENT_TX),
-      load64(job + AGN_CJ_CREW_ID), load64(job + AGN_CJ_TRACE), load64(job + AGN_CJ_LOOP));
-    # On this worker's thread, so a task waiting on its reviewer holds up no other.
     var runner = load64(job + AGN_CJ_RUNNER);
+    var result = agnosai_execute_task_budgeted_a(a, task,
+      load64(job + AGN_CJ_AGENT), load64(job + AGN_CJ_CLIENT), load64(job + AGN_CJ_EVENT_TX),
+      load64(job + AGN_CJ_CREW_ID), load64(job + AGN_CJ_TRACE), load64(job + AGN_CJ_LOOP),
+      agnosai_crew_runner_budget(runner));
+    # On this worker's thread, so a task waiting on its reviewer holds up no other. ⚠ **And it
+    # gives its slot back first (ADR 033)**: a slot is for work, and waiting is not, so a crew's
+    # other tasks go on while a reviewer takes minutes. Through 2.4.0 it held its slot.
     if (runner != 0) {
+        if (_agnosai_crew_needs_review(runner, task, result) == 1) { _agnosai_crew_job_free_slot(job); }
         result = _agnosai_crew_review_a(a, runner, task, load64(job + AGN_CJ_AGENT), result,
           load64(job + AGN_CJ_EVENT_TX));
     }
@@ -1310,7 +1386,11 @@ enum AgnosaiCrewRunnerOff {
     # outside an orchestrator. And how many of its tasks await a decision now.
     AGN_CR_STATE = 120;
     AGN_CR_AWAITING = 128;
-    AGN_CR_SIZE = 136;
+    # The crew's budget, a tracker whose parent is its tenant's, or 0 for none (ADR 033). And 1 once
+    # a loop head found it spent and stopped dispatching, as `TIMED_OUT` is for the deadline.
+    AGN_CR_BUDGET = 136;
+    AGN_CR_BUDGET_OUT = 144;
+    AGN_CR_SIZE = 152;
 }
 
 # Initial chunk for the sequential run's audit scratch.
@@ -1345,7 +1425,38 @@ fn agnosai_crew_runner_new(spec): i64 {
     store64(r + AGN_CR_APPROVE_MEDIUM, 0);
     store64(r + AGN_CR_STATE, 0);
     store64(r + AGN_CR_AWAITING, 0);
+    store64(r + AGN_CR_BUDGET, 0);
+    store64(r + AGN_CR_BUDGET_OUT, 0);
     return r;
+}
+
+# Hold the crew to `tracker` (ADR 033), from `agnosai_budget_tracker_limits_a`, or 0 for none. Every
+# model call of its tasks is checked against it and recorded in it, and the crew stops once it, or
+# a tracker above it, is spent. The orchestrator gives each crew one. Returns the runner.
+fn agnosai_crew_runner_with_budget(r, tracker): i64 {
+    store64(r + AGN_CR_BUDGET, tracker);
+    return r;
+}
+
+# The crew's budget tracker, or 0. A runner of 0 has none.
+fn agnosai_crew_runner_budget(r): i64 {
+    if (r == 0) { return 0; }
+    return load64(r + AGN_CR_BUDGET);
+}
+
+# Whether a loop head found the crew's budget spent, and stopped dispatching.
+fn agnosai_crew_runner_budget_exceeded(r): i64 {
+    return load64(r + AGN_CR_BUDGET_OUT);
+}
+
+# Whether the crew's budget, or one above it, is spent: checked at each loop head, as the deadline
+# is, so a crew with nothing left starts no more tasks. Raises `BUDGET_OUT` when it is.
+fn _agnosai_crew_budget_spent(r): i64 {
+    var t = load64(r + AGN_CR_BUDGET);
+    if (t == 0) { return 0; }
+    if (agnosai_budget_tracker_breach(t, 0) == AGNOSAI_BUDGET_WITHIN) { return 0; }
+    store64(r + AGN_CR_BUDGET_OUT, 1);
+    return 1;
 }
 
 # Give the runner the gate a task whose answer needs a reviewer waits on, and say whether a
@@ -1774,6 +1885,7 @@ fn _agnosai_crew_run_sequential(r): i64 {
     for (var i = 0; i < vec_len(tasks); i = i + 1) {
         if (agnosai_crew_runner_is_cancelled(r) == 1) { break; }
         if (_agnosai_crew_deadline_passed(r) == 1) { break; }
+        if (_agnosai_crew_budget_spent(r) == 1) { break; }
 
         # ⚠ **Asked per task, not once per run (ADR 032).** A subscriber that attached after the
         # run began got nothing until `crew_completed` through 2.3.8. The task's sender goes to it
@@ -1790,9 +1902,9 @@ fn _agnosai_crew_run_sequential(r): i64 {
         }
 
         agnosai_task_with_status(task, AGNOSAI_STATUS_RUNNING);
-        var result = agnosai_execute_task_with_tools_a(a, task, agent, client,
+        var result = agnosai_execute_task_budgeted_a(a, task, agent, client,
           task_tx, agnosai_crew_id(spec), load64(r + AGN_CR_TRACE),
-          load64(r + AGN_CR_LOOP));
+          load64(r + AGN_CR_LOOP), load64(r + AGN_CR_BUDGET));
         result = _agnosai_crew_review_a(a, r, task, agent, result, task_tx);
         agnosai_task_with_status(task, agnosai_task_result_status(result));
 
@@ -1808,25 +1920,25 @@ fn _agnosai_crew_run_sequential(r): i64 {
 
 # Run a set of tasks concurrently, at most `max_concurrency` at a time.
 #
-# One OS thread per task, in batches — a thread is the port's only concurrency
-# primitive and there is no semaphore, so the batch size IS the concurrency limit.
-# `alloc` has been thread-safe since cyrius 6.0.64, which is what makes real threads
-# viable here at all.
+# One OS thread per task, `max_concurrency` of them at a time, and the next started as
+# one ends (ADR 033). The wave is the only dispatcher, so the limit needs no semaphore:
+# it counts what it started and what it heard end. `alloc` has been thread-safe since
+# cyrius 6.0.64, which is what makes real threads viable here at all.
 #
 # ⚠ **Detached, and waited on through the job (2.2.5).** `thread_create` allocates a
 # handle and 4 KiB of TLS on the no-free bump, and `thread_join` gives back only the
 # stack, so a crew cost over 4 KiB per task for good, in any arena. A detached thread
 # keeps both in its own mapping and unmaps it, and allocates nothing, which is why
 # `agnosai_orchestrator_submit_crew` uses one too. It leaves no handle to join, so the
-# batch's slots do that work: a worker that is over puts its job in the next one.
+# wave's slots do that work: a worker that is over puts its job in the next one.
 #
-# `max_concurrency` of 0 or less runs everything in one batch, matching the
+# `max_concurrency` of 0 or less runs everything at once, matching the
 # oracle's `Semaphore::new(0)` being a caller error rather than a stall.
 #
 # ## Events say what happened, when it happened (ADR 022)
 #
 # **`task_started` is emitted as a task is dispatched to its worker**, which is
-# when its batch starts, and **`task_completed` as its worker finishes**, in
+# when a slot comes free for it, and **`task_completed` as its worker finishes**, in
 # completion order (ADR 032). A task the deadline or a cancel stopped before
 # dispatch gets neither. The oracle emits `task_started` for a whole parallel crew
 # up front (`crew_runner.rs:337-348` as of tag 2.1.4) — the port did the same and
@@ -1882,88 +1994,94 @@ fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
         store64(job + AGN_CJ_SLOTS, 0);
         store64(job + AGN_CJ_TAIL, 0);
         store64(job + AGN_CJ_RUNNER, r);
+        store64(job + AGN_CJ_FREED, 0);
         vec_push_a(a, jobs, job);
     }
 
-    # Batches of `limit`. Every spawned thread is waited for before the next batch,
-    # so no more than `limit` run at once and none outlives its wave.
+    # ⚠ **A sliding window, not batches (ADR 033).** At most `limit` tasks run at once, and a
+    # task starts as soon as one ends or gives its slot back to wait on a reviewer. Through 2.4.0
+    # the wave ran fixed batches of `limit`, each waited out before the next began, so one slow
+    # task left the others' slots idle until it ended, and a task awaiting a reviewer held up its
+    # whole batch for as long as the reviewer took. Every task the wave starts is waited for
+    # before it returns, so none outlives it.
     #
-    # ⚠ **The deadline is checked HERE, at the batch head.** The oracle's timeout
-    # is a `tokio::time::timeout` wrapping the whole `runner.run()`, so it fires
-    # in every process mode; the port replaced it with a cooperative check at
-    # loop heads and then put that check on only two of the three — sequential
-    # and DAG. A **Parallel** crew therefore never observed
-    # `AGN_CR_DEADLINE_NS`: `agnosai_crew_runner_timed_out` stayed 0, and
-    # `_agnosai_orch_finish` never substituted the Failed/empty-results state, so
-    # a crew that blew through `budget.max_duration_secs` reported its results as
-    # if it had finished in time.
+    # Every word a worker posts goes in the next of `slots`, its job as the value: the job when it
+    # is over, the job plus `_AGNOSAI_CREW_JOB_FREED` when it gave its slot back first. A job says
+    # each at most once, so a wave of `n` needs `2n` words, and they come in the order they were
+    # said, so a job's slot comes back before it is over.
     #
-    # The batch head is the right granularity: it is where the sequential loop's
-    # equivalent check sits, and a running batch is joined rather than abandoned,
-    # which is the same cooperative contract the module header documents.
-    #
-    # ⚠ **A job the deadline or a cancellation stopped is never dispatched**, so
-    # it has no result, no `task_started` and no `task_completed`: the same
-    # observable shape the sequential break has, which is a short result list.
+    # ⚠ **The deadline and a cancel are checked at each dispatch.** The oracle's timeout wraps the
+    # whole run, so it fires in every process mode; the port checks at loop heads instead, and a
+    # Parallel crew once never did (it ran out its time and reported success). A task already
+    # started is waited for rather than abandoned: the cooperative contract of the module header.
+    # A job the deadline or a cancel stopped is never dispatched, so it has no result, no
+    # `task_started` and no `task_completed`: the shape the sequential break has.
+    var n = vec_len(jobs);
+    var slots = alloc_via(a, 2 * n * 8);
+    memset(slots, 0, 2 * n * 8);
+    var tail = alloc_via(a, 8);
+    store64(tail, 0);
     var next = 0;
-    while (next < vec_len(jobs)) {
-        if (agnosai_crew_runner_is_cancelled(r) == 1) { break; }
-        if (_agnosai_crew_deadline_passed(r) == 1) { break; }
-
-        # ⚠ **Asked per batch, not once per wave (ADR 032)**, so a subscriber that attached
-        # mid-run is told about the batches after it. A worker gets the sender only then.
-        var wants_events = _agnosai_crew_wants_events(r);
-        var worker_tx = 0;
-        if (wants_events == 1) { worker_tx = load64(r + AGN_CR_EVENT_TX); }
-
-        # The batch is `first..next` of `jobs`, in dispatch order. Its slots are in the crew's
-        # arena, one for each worker it can hold, and its tail counts the workers that are over.
-        var first = next;
-        var spawned = 0;
-        var slots = alloc_via(a, limit * 8);
-        memset(slots, 0, limit * 8);
-        var tail = alloc_via(a, 8);
-        store64(tail, 0);
-        while (spawned < limit && next < vec_len(jobs)) {
+    var in_flight = 0;
+    var reported = 0;
+    var read = 0;
+    var stopped = 0;
+    while (1 == 1) {
+        while (stopped == 0 && in_flight < limit && next < n) {
+            if (agnosai_crew_runner_is_cancelled(r) == 1 || _agnosai_crew_deadline_passed(r) == 1
+              || _agnosai_crew_budget_spent(r) == 1) {
+                stopped = 1;
+                break;
+            }
+            # ⚠ **Asked per task, not once per wave (ADR 032)**, so a subscriber that attached
+            # mid-run is told about the tasks after it. A worker gets the sender only then, and its
+            # `task_completed` goes out only if its `task_started` did.
             var job = vec_get(jobs, next);
-            store64(job + AGN_CJ_EVENT_TX, worker_tx);
-            store64(job + AGN_CJ_SLOTS, slots);
-            store64(job + AGN_CJ_TAIL, tail);
-            if (wants_events == 1) {
+            var worker_tx = 0;
+            if (_agnosai_crew_wants_events(r) == 1) {
+                worker_tx = load64(r + AGN_CR_EVENT_TX);
                 _agnosai_crew_emit(r, ev_started, _agnosai_crew_started_data_a(a,
                     load64(job + AGN_CJ_TASK), load64(job + AGN_CJ_AGENT)));
             }
+            store64(job + AGN_CJ_EVENT_TX, worker_tx);
+            store64(job + AGN_CJ_SLOTS, slots);
+            store64(job + AGN_CJ_TAIL, tail);
+            next = next + 1;
+            in_flight = in_flight + 1;
             if (thread_create_detached(&_agnosai_crew_worker, job) == 0) {
                 # The thread could not be created — run it here rather than
                 # dropping the task. A missing result would silently shorten the
                 # crew's output. Its `task_started` is already out, before it runs.
                 _agnosai_crew_worker(job);
             }
-            next = next + 1;
-            spawned = spawned + 1;
         }
+        if (reported == next) { break; }
 
         # ⚠ **Each task is reported as it finishes, in completion order (ADR 032)**, as the
-        # oracle's `join_next` did. Through 2.3.8 the wave joined in dispatch order, so a fast
-        # task waited behind any slower one dispatched before it in its batch (ADR 022). Every
-        # task of a batch is still reported before the next batch starts.
-        for (var k = 0; k < spawned; k = k + 1) {
-            var jb = agnosai_done_word_wait_value(slots + k * 8);
+        # oracle's `join_next` did.
+        var said = agnosai_done_word_wait_value(slots + read * 8);
+        read = read + 1;
+        var jb = said - (said % 8);
+        if (said % 8 == _AGNOSAI_CREW_JOB_FREED) {
+            store64(jb + AGN_CJ_FREED, 1);
+            in_flight = in_flight - 1;
+        } else {
+            if (load64(jb + AGN_CJ_FREED) == 0) { in_flight = in_flight - 1; }
+            reported = reported + 1;
             var res = load64(jb + AGN_CJ_RESULT);
             if (res != 0) {
-                agnosai_task_with_status(load64(jb + AGN_CJ_TASK),
-                  agnosai_task_result_status(res));
-                if (wants_events == 1) {
+                agnosai_task_with_status(load64(jb + AGN_CJ_TASK), agnosai_task_result_status(res));
+                if (load64(jb + AGN_CJ_EVENT_TX) != 0) {
                     _agnosai_crew_emit(r, ev_completed, _agnosai_crew_completed_data_a(a, res));
                 }
             }
         }
-        # The results stay in dispatch order, so a crew's state does not depend on which of its
-        # tasks happened to finish first.
-        for (var j = first; j < next; j = j + 1) {
-            var done = load64(vec_get(jobs, j) + AGN_CJ_RESULT);
-            if (done != 0) { vec_push_a(a, results, done); }
-        }
+    }
+    # The results stay in dispatch order, so a crew's state does not depend on which of its
+    # tasks happened to finish first.
+    for (var j = 0; j < next; j = j + 1) {
+        var done = load64(vec_get(jobs, j) + AGN_CJ_RESULT);
+        if (done != 0) { vec_push_a(a, results, done); }
     }
     return results;
 }
@@ -2031,6 +2149,7 @@ fn _agnosai_crew_run_dag(r, out_err): i64 {
     while (vec_len(remaining) > 0) {
         if (agnosai_crew_runner_is_cancelled(r) == 1) { break; }
         if (_agnosai_crew_deadline_passed(r) == 1) { break; }
+        if (_agnosai_crew_budget_spent(r) == 1) { break; }
 
         # Partition into the ready front and the rest, preserving order.
         var ready = vec_new_a(a);
@@ -2307,9 +2426,15 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
     store64(r + AGN_CR_TRACE, self_sc);
 
     if (load64(r + AGN_CR_TOOLS) != 0) {
-        store64(r + AGN_CR_LOOP, agnosai_tool_loop_new_a(a, load64(r + AGN_CR_TOOLS),
-            load64(r + AGN_CR_JOURNAL), load64(r + AGN_CR_AUDIT), load64(r + AGN_CR_CANCELLED),
-            load64(r + AGN_CR_DEADLINE_NS), r + AGN_CR_TIMED_OUT, agnosai_crew_id(spec)));
+        var loop = agnosai_tool_loop_new_a(a, load64(r + AGN_CR_TOOLS),
+          load64(r + AGN_CR_JOURNAL), load64(r + AGN_CR_AUDIT), load64(r + AGN_CR_CANCELLED),
+          load64(r + AGN_CR_DEADLINE_NS), r + AGN_CR_TIMED_OUT, agnosai_crew_id(spec));
+        # The crew's own limits, which only tighten the process's (ADR 033).
+        var tl = agnosai_crew_tool_limits(spec);
+        if (tl != 0) {
+            agnosai_tool_loop_tighten(loop, load64(tl), load64(tl + 8), load64(tl + 16), load64(tl + 24));
+        }
+        store64(r + AGN_CR_LOOP, loop);
     }
 
     if (_agnosai_crew_wants_events(r) == 1) {
@@ -2393,6 +2518,11 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
         status = AGNOSAI_CREW_CANCELLED;
         reason = AGNOSAI_CREW_REASON_CANCELLED;
     } else {
+        # ⚠ **A crew whose budget ran out says so (ADR 033)**, when it is why the crew did not
+        # complete: a loop head stopped it, or its budget is spent and a task fell short, as a
+        # call the budget refused fails its task. A crew that spent its budget on its last call
+        # and completed everything completed. A task's own limit is that task's failure, and says
+        # so on its result.
         for (var i = 0; i < vec_len(results); i = i + 1) {
             if (agnosai_task_result_status(vec_get(results, i)) != AGNOSAI_STATUS_COMPLETED) {
                 status = AGNOSAI_CREW_FAILED;
@@ -2403,7 +2533,12 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
         # Counting only the results that exist is the vacuous-`all()` shape — a
         # crew reported COMPLETED for work that never ran.
         if (vec_len(results) < vec_len(tasks)) { status = AGNOSAI_CREW_FAILED; }
-        if (status == AGNOSAI_CREW_FAILED) { reason = AGNOSAI_CREW_REASON_TASK_FAILED; }
+        if (status == AGNOSAI_CREW_FAILED) {
+            reason = AGNOSAI_CREW_REASON_TASK_FAILED;
+            if (agnosai_crew_runner_budget_exceeded(r) == 1 || _agnosai_crew_budget_spent(r) == 1) {
+                reason = AGNOSAI_CREW_REASON_BUDGET_EXCEEDED;
+            }
+        }
     }
 
     # Balance the active gauge and fold this crew's tasks into the counters.
@@ -2442,6 +2577,7 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
     var err_type = 0;
     if (timed_out == 1) { err_type = "timeout"; }
     elif (status == AGNOSAI_CREW_CANCELLED) { err_type = "cancelled"; }
+    elif (reason == AGNOSAI_CREW_REASON_BUDGET_EXCEEDED) { err_type = "budget_exceeded"; }
     elif (status != AGNOSAI_CREW_COMPLETED) { err_type = "task_failed"; }
     _agnosai_crew_span_done(span, self_sc, parent_sc, span_t0, err_type);
     return state;

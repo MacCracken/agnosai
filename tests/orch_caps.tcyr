@@ -1,0 +1,707 @@
+# =========================================================================
+# orch_caps.tcyr — what an orchestrator lets a crew have (ADR 033).
+#
+# How many crews run at once, and that the rest wait their turn, in the order they came, as
+# `pending`, until a turn comes or a cancel ends the wait.
+#
+# A crew here is held running by a `high`-risk task: its placeholder answer waits for a reviewer
+# on the orchestrator's gate until the suite decides it, so a crew runs for exactly as long as
+# the suite says.
+# =========================================================================
+
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/strcase.cyr"
+include "src/telemetry/mod.cyr"
+include "src/core/error.cyr"
+include "src/core/json.cyr"
+include "src/core/message.cyr"
+include "src/core/resource.cyr"
+include "src/core/task.cyr"
+include "src/core/agent.cyr"
+include "src/core/crew.cyr"
+include "src/orchestrator/scheduler.cyr"
+include "src/orchestrator/audit.cyr"
+include "src/llm/retry.cyr"
+include "src/llm/hoosh.cyr"
+include "src/llm/router.cyr"
+include "src/orchestrator/scoring.cyr"
+include "src/orchestrator/output_validation.cyr"
+include "src/server/prompt_guard.cyr"
+include "src/server/output_filter.cyr"
+include "src/chan_lossy.cyr"
+include "src/server/sse.cyr"
+include "src/server/prometheus.cyr"
+include "src/arena_pool.cyr"
+include "src/sandbox/policy.cyr"
+include "src/sandbox/kavach_bridge.cyr"
+include "src/server/ssrf.cyr"
+include "src/tools/native.cyr"
+include "src/tools/registry.cyr"
+include "src/tool_call.cyr"
+include "src/tool_loop.cyr"
+include "src/model_catalog.cyr"
+include "src/orchestrator/approval.cyr"
+include "src/orchestrator/crew_runner.cyr"
+include "src/crew_arena.cyr"
+include "src/orchestrator/orchestrator.cyr"
+include "tests/test_helpers.cyr"
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+fn _t_budget(max_crews): i64 {
+    return agnosai_resource_budget_new(AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, max_crews);
+}
+
+# A crew of one task: `high` risk holds it running until its answer is decided.
+fn _t_crew(name, risk): i64 {
+    var t = agnosai_task_new(str_from(name));
+    agnosai_task_with_risk(t, risk);
+    var ts = vec_new();
+    vec_push(ts, t);
+    var s = agnosai_crew_new(str_from(name));
+    agnosai_crew_with_tasks(s, ts);
+    return s;
+}
+
+fn _t_task_of(spec): i64 {
+    return agnosai_task_id(vec_get(agnosai_crew_tasks(spec), 0));
+}
+
+fn _t_status(o, id: Str): i64 {
+    var st = agnosai_orchestrator_crew(o, id);
+    if (st == 0) { return 0 - 1; }
+    return agnosai_crew_state_status(st);
+}
+
+# Each wait gives up after ten seconds, so a broken cap fails its assertion rather than hang.
+fn _t_wait_pending(g, n): i64 {
+    var until = clock_now_ns() + 10000 * AGNOSAI_NS_PER_MS;
+    while (agnosai_approval_gate_pending_count(g) != n && clock_now_ns() < until) { sleep_ms(1); }
+    return agnosai_approval_gate_pending_count(g);
+}
+
+fn _t_wait_queued(o, n): i64 {
+    var until = clock_now_ns() + 10000 * AGNOSAI_NS_PER_MS;
+    while (agnosai_orchestrator_crews_queued(o) != n && clock_now_ns() < until) { sleep_ms(1); }
+    return agnosai_orchestrator_crews_queued(o);
+}
+
+fn _t_wait_status(o, id: Str, status): i64 {
+    var until = clock_now_ns() + 10000 * AGNOSAI_NS_PER_MS;
+    while (_t_status(o, id) != status && clock_now_ns() < until) { sleep_ms(1); }
+    return _t_status(o, id);
+}
+
+fn _t_free(o): i64 {
+    return agnosai_semaphore_available(load64(o + AGN_OR_CREW_SEM));
+}
+
+fn _t_drain(sub): i64 {
+    var v = vec_new();
+    var ev = agnosai_event_sub_try_recv(sub);
+    while (ev != 0) {
+        vec_push(v, ev);
+        ev = agnosai_event_sub_try_recv(sub);
+    }
+    return v;
+}
+
+# The one task id pending on `g` now, or 0.
+fn _t_only_pending(g): i64 {
+    var p = agnosai_approval_gate_pending_tasks(g);
+    if (vec_len(p) != 1) { return 0; }
+    return vec_get(p, 0);
+}
+
+# ── how many run at once ───────────────────────────────────────────────────
+
+fn test_permits(): i64 {
+    test_group("the budget says how many crews run at once");
+    assert_eq(agnosai_orchestrator_max_concurrent_crews(agnosai_orchestrator_new(0)), 10,
+      "an orchestrator with no budget runs ten, the oracle's unwrap_or(10)");
+    assert_eq(agnosai_orchestrator_max_concurrent_crews(agnosai_orchestrator_new(agnosai_resource_budget_default())),
+      10, "as does the default budget");
+    assert_eq(agnosai_orchestrator_max_concurrent_crews(agnosai_orchestrator_new(_t_budget(3))), 3,
+      "a budget of three runs three");
+    assert_eq(agnosai_orchestrator_max_concurrent_crews(agnosai_orchestrator_new(_t_budget(1))), 1,
+      "and of one, one");
+    assert_eq(agnosai_orchestrator_max_concurrent_crews(agnosai_orchestrator_new(_t_budget(AGNOSAI_NO_LIMIT))),
+      10, "a budget that sets none runs the default");
+    assert_eq(agnosai_orchestrator_max_concurrent_crews(agnosai_orchestrator_new(_t_budget(0))), 10,
+      "as does one of zero");
+    assert_eq(agnosai_orchestrator_max_concurrent_crews(agnosai_orchestrator_new(_t_budget(0 - 4))), 10,
+      "or below");
+    assert_eq(agnosai_orchestrator_crews_queued(agnosai_orchestrator_new(0)), 0, "nothing is queued at first");
+    return 0;
+}
+
+fn test_turns(): i64 {
+    test_group("a crew past the cap waits, pending, for a turn");
+    var o = agnosai_orchestrator_new(_t_budget(2));
+    var bus = agnosai_event_bus_new();
+    agnosai_orchestrator_with_events(o, bus);
+    var g = agnosai_orchestrator_approval_gate(o);
+
+    var a = _t_crew("cap-a", AGNOSAI_RISK_HIGH);
+    var b = _t_crew("cap-b", AGNOSAI_RISK_HIGH);
+    var c = _t_crew("cap-c", AGNOSAI_RISK_HIGH);
+    var d = _t_crew("cap-d", AGNOSAI_RISK_HIGH);
+    var d_sub = agnosai_event_bus_subscribe(bus, agnosai_crew_id(d));
+
+    assert_neq(agnosai_orchestrator_submit_crew(o, a), 0, "the first crew is submitted");
+    assert_neq(agnosai_orchestrator_submit_crew(o, b), 0, "and the second");
+    assert_eq(_t_wait_pending(g, 2), 2, "both run, each to its reviewer");
+    assert_eq(_t_free(o), 0, "holding both turns");
+    assert_neq(agnosai_orchestrator_submit_crew(o, c), 0, "a third is submitted");
+    assert_neq(agnosai_orchestrator_submit_crew(o, d), 0, "and a fourth");
+    assert_eq(_t_wait_queued(o, 2), 2, "and both wait");
+    sleep_ms(30);
+    assert_eq(agnosai_approval_gate_pending_count(g), 2, "neither runs while the first two hold their turns");
+    assert_eq(_t_status(o, agnosai_crew_id(c)), AGNOSAI_CREW_PENDING, "the third reads pending");
+    assert_eq(_t_status(o, agnosai_crew_id(d)), AGNOSAI_CREW_PENDING, "as does the fourth");
+    assert_eq(_t_status(o, agnosai_crew_id(a)), AGNOSAI_CREW_AWAITING_APPROVAL,
+      "while the first awaits its reviewer");
+
+    agnosai_approval_submit_decision(g, _t_task_of(a), AGNOSAI_APPROVAL_APPROVED);
+    assert_eq(_t_wait_status(o, agnosai_crew_id(a), AGNOSAI_CREW_COMPLETED), AGNOSAI_CREW_COMPLETED,
+      "the first, approved, completes");
+    assert_eq(_t_wait_queued(o, 1), 1, "and its turn goes to a waiting crew");
+    assert_eq(_t_wait_pending(g, 2), 2, "which runs");
+    assert_eq(_t_status(o, agnosai_crew_id(c)), AGNOSAI_CREW_AWAITING_APPROVAL,
+      "and it is the third, which came first");
+    assert_eq(_t_status(o, agnosai_crew_id(d)), AGNOSAI_CREW_PENDING, "the fourth still waits");
+
+    var c0 = clock_now_ns();
+    assert_eq(agnosai_orchestrator_cancel_crew(o, agnosai_crew_id(d)), 0, "the waiting fourth is cancelled");
+    assert_eq(_t_wait_queued(o, 0), 0, "and leaves the queue");
+    assert((clock_now_ns() - c0) / AGNOSAI_NS_PER_MS < 500, "at once: the cancel wakes it, it does not wait to poll");
+    assert_eq(_t_status(o, agnosai_crew_id(d)), AGNOSAI_CREW_CANCELLED, "reading cancelled");
+    assert(str_eq_cstr(agnosai_crew_state_reason(agnosai_orchestrator_crew(o, agnosai_crew_id(d))),
+        "cancelled") == 1, "because it was cancelled");
+    var until = clock_now_ns() + 5000 * AGNOSAI_NS_PER_MS;
+    while (agnosai_event_sub_closed(d_sub) == 0 && clock_now_ns() < until) { sleep_ms(1); }
+    assert_eq(agnosai_event_sub_closed(d_sub), 1, "its channel closes");
+    assert_eq(vec_len(_t_drain(d_sub)), 0, "having carried nothing: it never ran");
+    assert_eq(agnosai_orchestrator_forget_crew(o, agnosai_crew_id(d)), 0, "and it can be forgotten");
+
+    agnosai_approval_submit_decision(g, _t_task_of(b), AGNOSAI_APPROVAL_APPROVED);
+    agnosai_approval_submit_decision(g, _t_task_of(c), AGNOSAI_APPROVAL_APPROVED);
+    assert_eq(_t_wait_status(o, agnosai_crew_id(b), AGNOSAI_CREW_COMPLETED), AGNOSAI_CREW_COMPLETED,
+      "the second completes");
+    assert_eq(_t_wait_status(o, agnosai_crew_id(c), AGNOSAI_CREW_COMPLETED), AGNOSAI_CREW_COMPLETED,
+      "and the third");
+    var until2 = clock_now_ns() + 5000 * AGNOSAI_NS_PER_MS;
+    while (_t_free(o) != 2 && clock_now_ns() < until2) { sleep_ms(1); }
+    assert_eq(_t_free(o), 2, "every turn is given back");
+    return 0;
+}
+
+fn test_first_come(): i64 {
+    test_group("waiting crews run in the order they came");
+    var o = agnosai_orchestrator_new(_t_budget(1));
+    var g = agnosai_orchestrator_approval_gate(o);
+    var names = vec_new();
+    vec_push(names, "fifo-0");
+    vec_push(names, "fifo-1");
+    vec_push(names, "fifo-2");
+    vec_push(names, "fifo-3");
+    var specs = vec_new();
+    for (var i = 0; i < 4; i = i + 1) {
+        var s = _t_crew(vec_get(names, i), AGNOSAI_RISK_HIGH);
+        vec_push(specs, s);
+        agnosai_orchestrator_submit_crew(o, s);
+        # Each is in the queue before the next comes, so the order they came is known.
+        if (i == 0) { _t_wait_pending(g, 1); }
+        else { _t_wait_queued(o, i); }
+    }
+    var in_order = 1;
+    for (var k = 0; k < 4; k = k + 1) {
+        _t_wait_pending(g, 1);
+        var tid = _t_only_pending(g);
+        if (tid == 0 || str_eq(tid, _t_task_of(vec_get(specs, k))) == 0) { in_order = 0; }
+        if (tid != 0) { agnosai_approval_submit_decision(g, tid, AGNOSAI_APPROVAL_APPROVED); }
+        _t_wait_status(o, agnosai_crew_id(vec_get(specs, k)), AGNOSAI_CREW_COMPLETED);
+    }
+    assert_eq(in_order, 1, "each crew got its turn in the order it was submitted");
+    assert_eq(agnosai_orchestrator_crews_queued(o), 0, "and none is left waiting");
+    return 0;
+}
+
+# A crew run inline waits for its turn as a submitted one does.
+var _t_inline_o = 0;
+var _t_inline_spec = 0;
+var _t_inline_state = 0;
+var _t_inline_done = 0;
+
+fn _t_run_inline(arg): i64 {
+    _t_inline_state = agnosai_orchestrator_run_crew(_t_inline_o, _t_inline_spec);
+    agnosai_done_word_set(&_t_inline_done);
+    return 0;
+}
+
+fn test_inline_waits(): i64 {
+    test_group("a crew run inline waits its turn too");
+    var o = agnosai_orchestrator_new(_t_budget(1));
+    var g = agnosai_orchestrator_approval_gate(o);
+    var held = _t_crew("inline-held", AGNOSAI_RISK_HIGH);
+    agnosai_orchestrator_submit_crew(o, held);
+    assert_eq(_t_wait_pending(g, 1), 1, "a crew holds the only turn");
+    _t_inline_o = o;
+    _t_inline_spec = _t_crew("inline-plain", AGNOSAI_RISK_LOW);
+    _t_inline_state = 0;
+    _t_inline_done = 0;
+    assert_neq(thread_create_detached(&_t_run_inline, 0), 0, "a caller runs a crew inline");
+    assert_eq(_t_wait_queued(o, 1), 1, "and it waits");
+    sleep_ms(30);
+    assert_eq(atomic_load(&_t_inline_done), 0, "without returning");
+    assert_eq(_t_status(o, agnosai_crew_id(_t_inline_spec)), AGNOSAI_CREW_PENDING, "reading pending");
+    agnosai_approval_submit_decision(g, _t_task_of(held), AGNOSAI_APPROVAL_APPROVED);
+    agnosai_done_word_wait(&_t_inline_done);
+    assert_eq(agnosai_crew_state_status(_t_inline_state), AGNOSAI_CREW_COMPLETED,
+      "once the turn comes, it runs and completes");
+    return 0;
+}
+
+fn test_deadline_from_the_run(): i64 {
+    test_group("a crew's deadline starts when it runs, not when it is queued");
+    var o = agnosai_orchestrator_new(agnosai_resource_budget_new(AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, 1, 1));
+    var held = _t_crew("deadline-held", AGNOSAI_RISK_HIGH);
+    var plain = _t_crew("deadline-plain", AGNOSAI_RISK_LOW);
+    var t0 = clock_now_ns();
+    agnosai_orchestrator_submit_crew(o, held);
+    assert_eq(_t_wait_pending(agnosai_orchestrator_approval_gate(o), 1), 1, "a crew holds the only turn");
+    agnosai_orchestrator_submit_crew(o, plain);
+    assert_eq(_t_wait_status(o, agnosai_crew_id(held), AGNOSAI_CREW_FAILED), AGNOSAI_CREW_FAILED,
+      "nobody decides it, so its one second runs out");
+    assert_eq(_t_wait_status(o, agnosai_crew_id(plain), AGNOSAI_CREW_COMPLETED), AGNOSAI_CREW_COMPLETED,
+      "the crew behind it then runs and completes");
+    assert((clock_now_ns() - t0) / AGNOSAI_NS_PER_MS >= 1000,
+      "though more than its one second passed since it was queued");
+    return 0;
+}
+
+fn test_cancelled_in_the_queue(): i64 {
+    test_group("a crew cancelled before its turn never runs, and gives back what it took");
+    var o = agnosai_orchestrator_new(_t_budget(2));
+    var spec = _t_crew("flagged", AGNOSAI_RISK_LOW);
+    var id = agnosai_crew_id(spec);
+    var r = _agnosai_orch_register(o, spec);
+    agnosai_crew_runner_cancel(r);
+    var st = _agnosai_orch_finish_err(o, r, id, agnosai_crew_name(spec), 0);
+    assert_eq(agnosai_crew_state_status(st), AGNOSAI_CREW_CANCELLED,
+      "a runner cancelled before its turn ends cancelled, though a turn was free");
+    assert(str_eq_cstr(agnosai_crew_state_reason(st), "cancelled") == 1, "saying so");
+    assert_eq(vec_len(agnosai_crew_state_results(st)), 0, "with nothing run");
+    assert_eq(_t_free(o), 2, "and the turn it was handed goes back");
+    assert_eq(agnosai_orchestrator_forget_crew(o, id), 0, "and nothing holds it");
+    var trail = agnosai_audit_chain_recent(agnosai_orchestrator_audit(o), 1);
+    assert_eq(vec_len(trail), 1, "it is audited");
+    if (vec_len(trail) == 1) {
+        assert(str_eq_cstr(agnosai_audit_entry_event(vec_get(trail, 0)), "crew_finished") == 1,
+          "as a crew that finished");
+    }
+    return 0;
+}
+
+# ── budgets: crew, task, and what the orchestrator gives every crew ─────────
+
+var _t_calls = 0;
+var _t_prompt_tokens = 10;
+
+fn _t_body(content): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"model\":\"m\",\"choices\":[{\"message\":{\"content\":\"");
+    str_builder_add_cstr(sb, content);
+    str_builder_add_cstr(sb, "\"}}],\"usage\":{\"prompt_tokens\":");
+    str_builder_add_int(sb, _t_prompt_tokens);
+    str_builder_add_cstr(sb, ",\"completion_tokens\":5,\"cost_micro_usd\":250}}");
+    return str_builder_build(sb);
+}
+
+# Every call costs `_t_prompt_tokens` + 5 tokens and 250 micro-USD.
+fn _t_chat(client, request, out_response, parent_sc): i64 {
+    atomic_fetch_add(&_t_calls, 1);
+    store64(out_response, agnosai_hoosh_response_from_body(_t_body("done")));
+    return 0;
+}
+
+# Never JSON, so a task with an output schema retries until it runs out of retries or budget.
+fn _t_chat_prose(client, request, out_response, parent_sc): i64 {
+    atomic_fetch_add(&_t_calls, 1);
+    store64(out_response, agnosai_hoosh_response_from_body(_t_body("just prose")));
+    return 0;
+}
+
+fn _t_tasks(n): i64 {
+    var ts = vec_new();
+    for (var i = 0; i < n; i = i + 1) { vec_push(ts, agnosai_task_new(str_from("plain work"))); }
+    return ts;
+}
+
+fn _t_spec(name, tasks, process): i64 {
+    var s = agnosai_crew_new(str_from(name));
+    agnosai_crew_with_tasks(s, tasks);
+    agnosai_crew_with_process(s, process);
+    return s;
+}
+
+fn _t_schema_task(): i64 {
+    var t = agnosai_task_new(str_from("answer in JSON"));
+    agnosai_task_with_output_schema(t, _t_parse_cstr("{\"type\":\"object\"}"));
+    return t;
+}
+
+# Run `spec` on `o` with chat `fp`; the runner comes back through `out_runner`.
+fn _t_run(o, spec, fp, out_runner): i64 {
+    _t_calls = 0;
+    var r = _agnosai_orch_register(o, spec);
+    agnosai_crew_runner_with_llm(r, agnosai_hoosh_client_with_chat(
+        agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"), str_from("")), fp));
+    if (out_runner != 0) { store64(out_runner, r); }
+    return _agnosai_orch_finish_err(o, r, agnosai_crew_id(spec), agnosai_crew_name(spec), 0);
+}
+
+fn _t_completed(st): i64 {
+    var n = 0;
+    var rs = agnosai_crew_state_results(st);
+    for (var i = 0; i < vec_len(rs); i = i + 1) {
+        if (agnosai_task_result_status(vec_get(rs, i)) == AGNOSAI_STATUS_COMPLETED) { n = n + 1; }
+    }
+    return n;
+}
+
+fn _t_reason_is(st, word): i64 {
+    var r = agnosai_crew_state_reason(st);
+    if (r == 0) { return 0; }
+    return str_eq_cstr(r, word);
+}
+
+fn test_crew_budget(): i64 {
+    test_group("a crew stops when its budget is spent");
+    _t_prompt_tokens = 10;
+    var o = agnosai_orchestrator_new(0);
+    var r: i64[1];
+    var spec = agnosai_crew_with_budget(_t_spec("bud-tokens", _t_tasks(4), agnosai_process_sequential()),
+      40, AGNOSAI_NO_LIMIT);
+    var st = _t_run(o, spec, &_t_chat, &r);
+    assert_eq(_t_calls, 3, "15 tokens a call: the third starts at 30 of 40, and none after it");
+    assert_eq(vec_len(agnosai_crew_state_results(st)), 3, "so three tasks ran");
+    assert_eq(_t_completed(st), 3, "each to completion");
+    assert_eq(agnosai_crew_state_status(st), AGNOSAI_CREW_FAILED, "and the crew, short a task, failed");
+    assert_eq(_t_reason_is(st, "budget_exceeded"), 1, "because its budget ran out");
+    var t = agnosai_crew_runner_budget(load64(&r));
+    assert_neq(t, 0, "its runner held a tracker");
+    assert_eq(agnosai_budget_tracker_tokens_used(t), 45, "which counted every token");
+    assert_eq(agnosai_budget_tracker_cost_units(t), 9, "and the cost, 250 micro-USD a call ceiled to 3 units");
+    assert_eq(agnosai_crew_runner_budget_exceeded(load64(&r)), 1, "and a loop head stopped it");
+
+    var cspec = agnosai_crew_with_budget(_t_spec("bud-cost", _t_tasks(4), agnosai_process_sequential()),
+      AGNOSAI_NO_LIMIT, 600);
+    var cst = _t_run(o, cspec, &_t_chat, 0);
+    assert_eq(_t_calls, 2, "a cost limit of 600 micro-USD, 6 units, stops it after two calls of 3");
+    assert_eq(_t_reason_is(cst, "budget_exceeded"), 1, "saying so");
+
+    var pspec = agnosai_crew_with_budget(_t_spec("bud-par", _t_tasks(4), agnosai_process_parallel(1)),
+      20, AGNOSAI_NO_LIMIT);
+    var pst = _t_run(o, pspec, &_t_chat, 0);
+    assert_eq(_t_calls, 2, "a parallel crew stops dispatching at the same place");
+    assert_eq(vec_len(agnosai_crew_state_results(pst)), 2, "leaving the tasks after it unstarted");
+    assert_eq(_t_reason_is(pst, "budget_exceeded"), 1, "for the same reason");
+
+    # A chain, so each wave is one task and the stop is at a known place.
+    var chain = _t_tasks(3);
+    agnosai_task_with_dependency(vec_get(chain, 1), agnosai_task_id(vec_get(chain, 0)));
+    agnosai_task_with_dependency(vec_get(chain, 2), agnosai_task_id(vec_get(chain, 1)));
+    var dspec = agnosai_crew_with_budget(_t_spec("bud-dag", chain, agnosai_process_dag()), 1,
+      AGNOSAI_NO_LIMIT);
+    var dst = _t_run(o, dspec, &_t_chat, 0);
+    assert_eq(_t_calls, 1, "a DAG crew's first wave spends it, and the next wave does not start");
+    assert_eq(vec_len(agnosai_crew_state_results(dst)), 1, "leaving one result");
+    assert_eq(_t_reason_is(dst, "budget_exceeded"), 1, "and it ends for its budget too");
+
+    var free = _t_spec("bud-none", _t_tasks(3), agnosai_process_sequential());
+    var fr: i64[1];
+    var fst = _t_run(o, free, &_t_chat, &fr);
+    assert_eq(agnosai_crew_state_status(fst), AGNOSAI_CREW_COMPLETED, "a crew with no budget runs to the end");
+    assert_eq(agnosai_crew_runner_budget(load64(&fr)), 0, "and holds no tracker at all");
+
+    var exact = agnosai_crew_with_budget(_t_spec("bud-exact", _t_tasks(2), agnosai_process_sequential()),
+      30, AGNOSAI_NO_LIMIT);
+    var est = _t_run(o, exact, &_t_chat, 0);
+    assert_eq(agnosai_crew_state_status(est), AGNOSAI_CREW_COMPLETED,
+      "a crew that spends its budget on its last call has completed");
+    assert_eq(agnosai_crew_state_reason(est), 0, "with no reason to give");
+    return 0;
+}
+
+fn test_orchestrator_budget(): i64 {
+    test_group("the orchestrator's budget is each crew's, and a crew's own only tightens it");
+    _t_prompt_tokens = 10;
+    var o = agnosai_orchestrator_new(agnosai_resource_budget_new(20, AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT,
+        AGNOSAI_NO_LIMIT));
+    var a = _t_run(o, _t_spec("ob-a", _t_tasks(3), agnosai_process_sequential()), &_t_chat, 0);
+    assert_eq(_t_calls, 2, "a crew gets 20 tokens: two calls");
+    assert_eq(_t_reason_is(a, "budget_exceeded"), 1, "then it stops");
+    _t_run(o, _t_spec("ob-b", _t_tasks(3), agnosai_process_sequential()), &_t_chat, 0);
+    assert_eq(_t_calls, 2, "and the next crew gets 20 of its own");
+    var tight = agnosai_crew_with_budget(_t_spec("ob-tight", _t_tasks(3), agnosai_process_sequential()), 10,
+      AGNOSAI_NO_LIMIT);
+    _t_run(o, tight, &_t_chat, 0);
+    assert_eq(_t_calls, 1, "a crew asking for 10 gets 10");
+    var loose = agnosai_crew_with_budget(_t_spec("ob-loose", _t_tasks(3), agnosai_process_sequential()), 1000,
+      AGNOSAI_NO_LIMIT);
+    _t_run(o, loose, &_t_chat, 0);
+    assert_eq(_t_calls, 2, "and one asking for 1000 still gets 20");
+    return 0;
+}
+
+fn test_refused_call(): i64 {
+    test_group("a call the budget refuses fails its task, and is not retried");
+    _t_prompt_tokens = 10;
+    var o = agnosai_orchestrator_new(0);
+    var ts = vec_new();
+    vec_push(ts, _t_schema_task());
+    var spec = agnosai_crew_with_budget(_t_spec("rf-crew", ts, agnosai_process_sequential()), 20,
+      AGNOSAI_NO_LIMIT);
+    var st = _t_run(o, spec, &_t_chat_prose, 0);
+    assert_eq(_t_calls, 2, "an answer and a retry, and the second retry is refused at 30 of 20");
+    var res = vec_get(agnosai_crew_state_results(st), 0);
+    assert_eq(agnosai_task_result_status(res), AGNOSAI_STATUS_FAILED, "the task fails");
+    var why = str_from("crew token budget exceeded: 30 used, 20 limit");
+    assert(str_contains(agnosai_task_result_output(res), why) == 1, "saying which budget, and by how much");
+    assert_eq(_t_reason_is(st, "budget_exceeded"), 1, "and so does its crew");
+
+    # A refusal whose numbers hold `429` must not be read as a rate limit and retried.
+    _t_prompt_tokens = 4295;
+    var ts2 = vec_new();
+    vec_push(ts2, _t_schema_task());
+    var spec2 = agnosai_crew_with_budget(_t_spec("rf-429", ts2, agnosai_process_sequential()), 4290,
+      AGNOSAI_NO_LIMIT);
+    var t0 = clock_now_ns();
+    var st2 = _t_run(o, spec2, &_t_chat_prose, 0);
+    assert_eq(_t_calls, 1, "one call, and the retry it asks for is refused");
+    assert((clock_now_ns() - t0) / AGNOSAI_NS_PER_MS < 500, "at once, with no backoff");
+    var res2 = vec_get(agnosai_crew_state_results(st2), 0);
+    assert(str_contains(agnosai_task_result_output(res2), str_from("4300 used, 4290 limit")) == 1,
+      "though its message holds 429");
+    _t_prompt_tokens = 10;
+    return 0;
+}
+
+# A task run outside a crew can be held to a tracker too.
+fn _t_budgeted_alone(): i64 {
+    var spent = agnosai_budget_tracker_limits_a(default_alloc(), 0, AGNOSAI_NO_LIMIT, 0, "caller");
+    var client = agnosai_hoosh_client_with_chat(agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"), str_from("")),
+      &_t_chat);
+    _t_calls = 0;
+    var r = agnosai_execute_task_budgeted_a(default_alloc(), agnosai_task_new(str_from("alone")), 0, client, 0, 0, 0, 0,
+      spent);
+    assert_eq(_t_calls, 0, "a task alone, given a spent tracker, makes no call");
+    assert(str_contains(agnosai_task_result_output(r), str_from("caller token budget exceeded")) == 1,
+      "and fails, in the tracker's words");
+    var open_t = agnosai_budget_tracker_limits_a(default_alloc(), 100, AGNOSAI_NO_LIMIT, 0, "caller");
+    var task = agnosai_task_new(str_from("alone"));
+    var ok = agnosai_execute_task_budgeted_a(default_alloc(), task, 0, client, 0, 0, 0, 0, open_t);
+    assert_eq(agnosai_task_result_status(ok), AGNOSAI_STATUS_COMPLETED, "one with room completes");
+    assert_eq(agnosai_budget_tracker_tokens_used(open_t), 15, "and is charged its call");
+    return 0;
+}
+
+fn test_task_budget(): i64 {
+    test_group("a task's own budget fails that task, not its crew's run");
+    _t_prompt_tokens = 10;
+    var o = agnosai_orchestrator_new(0);
+    var capped = agnosai_task_with_budget(_t_schema_task(), 20, AGNOSAI_NO_LIMIT);
+    var ts = vec_new();
+    vec_push(ts, capped);
+    vec_push(ts, agnosai_task_new(str_from("plain work")));
+    var st = _t_run(o, _t_spec("tb", ts, agnosai_process_sequential()), &_t_chat_prose, 0);
+    assert_eq(_t_calls, 3, "two calls of the capped task, and the plain one after it");
+    var res = agnosai_crew_state_results(st);
+    assert_eq(vec_len(res), 2, "both tasks ran");
+    assert_eq(agnosai_task_result_status(vec_get(res, 0)), AGNOSAI_STATUS_FAILED, "the capped one failed");
+    assert(str_contains(agnosai_task_result_output(vec_get(res, 0)),
+        str_from("task token budget exceeded: 30 used, 20 limit")) == 1, "on its own budget");
+    assert_eq(agnosai_task_result_status(vec_get(res, 1)), AGNOSAI_STATUS_COMPLETED, "the other completed");
+    assert_eq(_t_reason_is(st, "task_failed"), 1, "and the crew failed because a task did");
+
+    # Under a crew with less left, the crew's limit is the one that bites.
+    var roomy = agnosai_task_with_budget(_t_schema_task(), 1000, AGNOSAI_NO_LIMIT);
+    var ts2 = vec_new();
+    vec_push(ts2, roomy);
+    var spec2 = agnosai_crew_with_budget(_t_spec("tb-under", ts2, agnosai_process_sequential()), 20,
+      AGNOSAI_NO_LIMIT);
+    var st2 = _t_run(o, spec2, &_t_chat_prose, 0);
+    assert_eq(_t_calls, 2, "a task allowed 1000 under a crew allowed 20 stops at the crew's");
+    assert(str_contains(agnosai_task_result_output(vec_get(agnosai_crew_state_results(st2), 0)),
+        str_from("crew token budget exceeded")) == 1, "and names the crew's");
+    return 0;
+}
+
+# ── tenants and the size of a crew ─────────────────────────────────────────
+
+fn _t_err_says(err, words): i64 {
+    if (err == 0) { return 0; }
+    return str_contains(agnosai_error_message(err), str_from(words));
+}
+
+fn _t_tenant_crew(name, tenant, n): i64 {
+    return agnosai_crew_with_tenant(_t_spec(name, _t_tasks(n), agnosai_process_sequential()), str_from(tenant));
+}
+
+# Run a tenant crew with the stub chat, as `_t_run` does, refused or not: the state, or 0.
+fn _t_run_admitted(o, spec, out_err): i64 {
+    _t_calls = 0;
+    var parent: i64[1];
+    var refused = _agnosai_orch_admit(o, spec, &parent);
+    store64(out_err, refused);
+    if (refused != 0) { return 0; }
+    var r = _agnosai_orch_register_under(o, spec, load64(&parent));
+    agnosai_crew_runner_with_llm(r, agnosai_hoosh_client_with_chat(
+        agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"), str_from("")), &_t_chat));
+    return _agnosai_orch_finish_err(o, r, agnosai_crew_id(spec), agnosai_crew_name(spec), 0);
+}
+
+fn test_tenants(): i64 {
+    test_group("a tenant's budget holds across its crews");
+    _t_prompt_tokens = 10;
+    var reg = agnosai_tenant_registry_new();
+    agnosai_tenant_registry_register(reg, str_from("acme"), agnosai_tenant_budget_new(30, AGNOSAI_NO_LIMIT, 2));
+    var o = agnosai_orchestrator_with_tenants(agnosai_orchestrator_new(0), reg);
+    assert_eq(agnosai_orchestrator_tenants(o), reg, "an orchestrator holds its tenants");
+
+    var err: i64[1];
+    var stranger = _t_tenant_crew("tn-stranger", "nobody", 1);
+    assert_eq(agnosai_orchestrator_run_crew_err(o, stranger, &err), 0,
+      "a crew for a tenant it does not hold is refused");
+    assert_eq(_t_err_says(load64(&err), "tenant nobody is not registered"), 1, "saying so");
+    assert_eq(agnosai_orchestrator_crew(o, agnosai_crew_id(stranger)), 0, "and it never registers");
+    var trail = agnosai_audit_chain_recent(agnosai_orchestrator_audit(o), 1);
+    assert(vec_len(trail) == 1 && str_eq_cstr(agnosai_audit_entry_event(vec_get(trail, 0)), "crew_refused") == 1,
+      "but the refusal is audited");
+
+    var first = _t_run_admitted(o, _t_tenant_crew("tn-a", "acme", 4), &err);
+    assert_eq(load64(&err), 0, "a crew for a tenant it holds is admitted");
+    assert_eq(_t_calls, 2, "and stops when the tenant's 30 tokens are spent");
+    assert_eq(_t_reason_is(first, "budget_exceeded"), 1, "for its budget");
+    var spent = agnosai_orchestrator_tenant_spent(o, str_from("acme"));
+    assert_eq(agnosai_budget_tracker_tokens_used(spent), 30, "the tenant was charged what its crew spent");
+    assert_eq(agnosai_orchestrator_tenant_active(o, str_from("acme")), 0, "and has none running now");
+
+    var second = _t_tenant_crew("tn-b", "acme", 1);
+    assert_eq(agnosai_orchestrator_submit_crew_err(o, second, &err), 0, "the next crew for a spent tenant is refused");
+    assert_eq(_t_err_says(load64(&err), "tenant token budget exceeded: 30 used, 30 limit"), 1,
+      "at its limit, saying whose and by how much");
+    assert_eq(agnosai_orchestrator_crew(o, agnosai_crew_id(second)), 0, "and is not registered either");
+
+    assert_eq(agnosai_orchestrator_reset_tenant(o, str_from("acme")), 1, "a tenant's spending can be reset");
+    assert_eq(agnosai_orchestrator_reset_tenant(o, str_from("nobody")), 0, "but not one nothing ran for");
+    _t_run_admitted(o, _t_tenant_crew("tn-c", "acme", 1), &err);
+    assert_eq(load64(&err), 0, "after which it is admitted again");
+    assert_eq(_t_calls, 1, "and runs");
+
+    agnosai_tenant_registry_register(reg, str_from("acme"), agnosai_tenant_budget_new(100, AGNOSAI_NO_LIMIT, 2));
+    _t_run_admitted(o, _t_tenant_crew("tn-d", "acme", 4), &err);
+    assert_eq(_t_calls, 4, "registered again with more, the tenant has the new limit");
+    assert_eq(agnosai_budget_tracker_tokens_used(spent), 75, "and kept what it spent: 15, then 60");
+
+    # Crews of one tenant together: two each spend 15, and the tenant has 100.
+    var own = agnosai_crew_with_budget(_t_tenant_crew("tn-own", "acme", 3), 15, AGNOSAI_NO_LIMIT);
+    _t_run_admitted(o, own, &err);
+    assert_eq(_t_calls, 1, "a crew's own budget still holds under its tenant's");
+    assert_eq(agnosai_budget_tracker_tokens_used(spent), 90, "and what it spent counts against both");
+
+    var untenanted = _t_spec("tn-none", _t_tasks(1), agnosai_process_sequential());
+    _t_run_admitted(o, untenanted, &err);
+    assert_eq(load64(&err), 0, "a crew that names no tenant is not held to one");
+
+    var o2 = agnosai_orchestrator_new(0);
+    _t_run_admitted(o2, _t_tenant_crew("tn-noreg", "anyone", 1), &err);
+    assert_eq(load64(&err), 0, "and on an orchestrator with no registry, a tenant is only a name");
+    assert_eq(agnosai_orchestrator_tenant_spent(o2, str_from("anyone")), 0, "counting nothing");
+    return 0;
+}
+
+fn test_tenant_concurrency(): i64 {
+    test_group("a tenant runs at most its max_concurrent_crews at once");
+    var reg = agnosai_tenant_registry_new();
+    agnosai_tenant_registry_register(reg, str_from("busy"), agnosai_tenant_budget_new(AGNOSAI_NO_LIMIT,
+        AGNOSAI_NO_LIMIT, 2));
+    var o = agnosai_orchestrator_with_tenants(agnosai_orchestrator_new(_t_budget(1)), reg);
+    var g = agnosai_orchestrator_approval_gate(o);
+    var a = agnosai_crew_with_tenant(_t_crew("tc-a", AGNOSAI_RISK_HIGH), str_from("busy"));
+    var b = agnosai_crew_with_tenant(_t_crew("tc-b", AGNOSAI_RISK_HIGH), str_from("busy"));
+    var c = agnosai_crew_with_tenant(_t_crew("tc-c", AGNOSAI_RISK_HIGH), str_from("busy"));
+    assert_neq(agnosai_orchestrator_submit_crew(o, a), 0, "a tenant's first crew runs");
+    assert_eq(_t_wait_pending(g, 1), 1, "and holds the only turn");
+    assert_neq(agnosai_orchestrator_submit_crew(o, b), 0, "its second is admitted");
+    assert_eq(_t_wait_queued(o, 1), 1, "and waits for a turn");
+    assert_eq(agnosai_orchestrator_tenant_active(o, str_from("busy")), 2, "both count against the tenant");
+    var err: i64[1];
+    assert_eq(agnosai_orchestrator_submit_crew_err(o, c, &err), 0, "a third is refused");
+    assert_eq(_t_err_says(load64(&err), "tenant busy has 2 crews running, its most at once"), 1, "saying why");
+
+    assert_eq(agnosai_orchestrator_cancel_crew(o, agnosai_crew_id(b)), 0, "the waiting one is cancelled");
+    assert_eq(_t_wait_queued(o, 0), 0, "and leaves the queue");
+    var until = clock_now_ns() + 5000 * AGNOSAI_NS_PER_MS;
+    while (agnosai_orchestrator_tenant_active(o, str_from("busy")) != 1 && clock_now_ns() < until) { sleep_ms(1); }
+    assert_eq(agnosai_orchestrator_tenant_active(o, str_from("busy")), 1, "giving its place back");
+    agnosai_approval_submit_decision(g, _t_task_of(a), AGNOSAI_APPROVAL_APPROVED);
+    _t_wait_status(o, agnosai_crew_id(a), AGNOSAI_CREW_COMPLETED);
+    var until2 = clock_now_ns() + 5000 * AGNOSAI_NS_PER_MS;
+    while (agnosai_orchestrator_tenant_active(o, str_from("busy")) != 0 && clock_now_ns() < until2) { sleep_ms(1); }
+    assert_eq(agnosai_orchestrator_tenant_active(o, str_from("busy")), 0, "as does the one that completed");
+    var d = agnosai_crew_with_tenant(_t_crew("tc-d", AGNOSAI_RISK_LOW), str_from("busy"));
+    assert_neq(agnosai_orchestrator_submit_crew(o, d), 0, "so another is admitted");
+    _t_wait_status(o, agnosai_crew_id(d), AGNOSAI_CREW_COMPLETED);
+    return 0;
+}
+
+fn test_max_tasks(): i64 {
+    test_group("an orchestrator can refuse a crew of too many tasks");
+    var o = agnosai_orchestrator_new(0);
+    assert_eq(agnosai_orchestrator_max_tasks(o), AGNOSAI_NO_LIMIT, "by default it takes any number");
+    agnosai_orchestrator_with_max_tasks(o, 3);
+    assert_eq(agnosai_orchestrator_max_tasks(o), 3, "told otherwise, it says so");
+    var err: i64[1];
+    var big = _t_spec("mt-big", _t_tasks(4), agnosai_process_sequential());
+    assert_eq(agnosai_orchestrator_run_crew_err(o, big, &err), 0, "a crew of four is refused");
+    assert_eq(_t_err_says(load64(&err), "crew has 4 tasks, and this orchestrator runs at most 3"), 1, "saying why");
+    assert_eq(agnosai_orchestrator_crew(o, agnosai_crew_id(big)), 0, "and never registers");
+    assert_eq(agnosai_orchestrator_submit_crew_err(o, _t_spec("mt-big2", _t_tasks(5), agnosai_process_sequential()),
+        &err), 0, "submitted, too");
+    var fits = agnosai_orchestrator_run_crew(o, _t_spec("mt-fits", _t_tasks(3), agnosai_process_sequential()));
+    assert_eq(agnosai_crew_state_status(fits), AGNOSAI_CREW_COMPLETED, "a crew of three runs");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+    agnosai_model_set_tier_override(AGNOSAI_TIER_FAST, str_from("stub-model"));
+    agnosai_model_set_tier_override(AGNOSAI_TIER_CAPABLE, str_from("stub-model"));
+    agnosai_model_set_tier_override(AGNOSAI_TIER_PREMIUM, str_from("stub-model"));
+    test_crew_budget();
+    test_orchestrator_budget();
+    test_refused_call();
+    test_task_budget();
+    _t_budgeted_alone();
+    test_tenants();
+    test_tenant_concurrency();
+    test_max_tasks();
+    test_permits();
+    test_turns();
+    test_first_come();
+    test_inline_waits();
+    test_deadline_from_the_run();
+    test_cancelled_in_the_queue();
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+sys_exit_group(f);

@@ -29,6 +29,9 @@
 # be unit-tested with no gateway running.
 # =========================================================================
 
+# The 64 outbound TLS permits (ADR 033).
+include "src/tls_permit.cyr"
+
 # Message role in an OpenAI-compatible conversation.
 #
 # This is the LLM role, not fleet's consensus `Role` (Coordinator / Follower /
@@ -1336,7 +1339,11 @@ fn _agnosai_hoosh_chat_a(a, base_url: Str, api_key: Str, request, out_response,
         return str_from_a(ra, "hoosh transport error: could not build the request");
     }
 
+    # One of the 64 outbound TLS permits when the gateway is https (ADR 033), given back as sandhi
+    # returns, so every way out below has given it back.
+    var tls = agnosai_tls_permit_take(url);
     var r = sandhi_http_post_opts_a(a, url, headers, str_data(body), str_len(body), _AGNOSAI_HOOSH_OPTS);
+    agnosai_tls_permit_give(tls);
     if (r == 0) {
         _agnosai_hoosh_span_done(_span, _self, parent_sc, _t0, 0,
           _agnosai_hoosh_error_type(_span, "no_response"));
@@ -1452,7 +1459,9 @@ fn agnosai_hoosh_get_a(a, base_url: Str, api_key: Str, path: Str, out_body): i64
     var headers = _agnosai_hoosh_headers_a(a, api_key);
     if (url == 0 || headers == 0) { return 0 - SANDHI_ERR_INTERNAL; }
 
+    var tls = agnosai_tls_permit_take(url);
     var r = sandhi_http_get_opts_a(a, url, headers, _AGNOSAI_HOOSH_GET_OPTS);
+    agnosai_tls_permit_give(tls);
     if (r == 0) { return 0 - SANDHI_ERR_INTERNAL; }
     var kind = sandhi_http_err_kind(r);
     if (kind != SANDHI_OK) {

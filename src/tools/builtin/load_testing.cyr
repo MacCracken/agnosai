@@ -45,6 +45,7 @@
 # =========================================================================
 
 include "src/done_word.cyr"
+include "src/tls_permit.cyr"
 
 # Maximum total requests across all users, preventing unbounded memory growth.
 # Mirrors the oracle's MAX_TOTAL_REQUESTS.
@@ -289,8 +290,18 @@ fn _agnosai_lt_get(w, arena): i64 {
     sandhi_http_options_read_ms(opts, AGNOSAI_LT_REQUEST_TIMEOUT_MS);
     sandhi_http_options_write_ms(opts, AGNOSAI_LT_REQUEST_TIMEOUT_MS);
     sandhi_http_options_max_response_bytes(opts, AGNOSAI_LT_MAX_RESPONSE_BYTES);
-    sandhi_http_options_pool(opts, load64(w + AGN_LT_POOL));
-    return sandhi_http_get_opts_a(arena, str_data(load64(w + AGN_LT_URL)), headers, opts);
+    var pool = load64(w + AGN_LT_POOL);
+    sandhi_http_options_pool(opts, pool);
+    # ⚠ **A TLS permit only for a request that will connect (ADR 033).** A user keeps its one
+    # connection, so a permit for every request would hold 100 users to 64 for the whole run, and
+    # what it measured would not be 100 users. Only a handshake needs one.
+    var tls = 0;
+    if (pool == 0 || sandhi_http_pool_idle_count(pool) == 0) {
+        tls = agnosai_tls_permit_take(str_data(load64(w + AGN_LT_URL)));
+    }
+    var r = sandhi_http_get_opts_a(arena, str_data(load64(w + AGN_LT_URL)), headers, opts);
+    agnosai_tls_permit_give(tls);
+    return r;
 }
 
 # A response's status code, or 0 for a transport error.

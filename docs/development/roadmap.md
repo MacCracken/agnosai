@@ -6,7 +6,7 @@
 > [`cyrius-port-plan.md`](cyrius-port-plan.md) is the port's reasoning archive, and
 > [`known-unreachable.md`](known-unreachable.md) records code kept for oracle shape.
 
-**Status as of 2.4.0 (2026-11-12).**
+**Status as of 2.4.1 (2026-11-12).**
 
 **How releases are ordered.** A release holds only work that can ship now. Work that waits on another project is not
 given a number: it is listed under [*Waiting on another project*](#waiting-on-another-project), with its filed issue,
@@ -50,7 +50,6 @@ Carried from the Rust line as *goals*, not as comparisons: the Cyrius baseline s
 
 | Release | What it does |
 |---|---|
-| **2.4.1** | Budgets, caps and crew concurrency enforced |
 | **2.4.2** | Hand a downstream task a summary, not a transcript |
 | **2.4.3** | Hierarchical crews: a manager and its workers |
 | **2.5.0** | Durable execution: a crew log that resumes from its last finished task |
@@ -85,22 +84,9 @@ them.
 2.4.0 wrote the crew lifecycle down as one state machine and numbered its events, wired the approval gate, and gave a
 crew that cannot run a terminal state, a task's tool calls their events, and a batch's completions their own order
 ([ADR 032](../adr/032-the-crew-lifecycle-is-one-state-machine.md)). Its rules for a model judge, should one be added,
-are written there.
-
-#### 2.4.1 — budgets, caps and crew concurrency enforced
-
-**Enforce budgets and caps.** `budget.cyr` and `multi_tenant.cyr` have no callers outside their own files; only
-`max_duration_secs` is read. Enforce token and cost per crew and per tenant, plus max tasks per crew. Multi-agent runs
-about 15× chat tokens (Anthropic 2025), and Claude Code caps subagents at 20 concurrent and depth 3. agnostic removed
-`max_concurrent_tasks` because nothing enforced it, and gets it back on this. **Budgets subdivide** down the tree: crew,
-then task, then delegated worker (2.4.3). The tool loop's step limit and transcript budget are process-wide until this
-lands (ADR 029).
-
-**Crew concurrency.** No cap on concurrent crews: `submit_crew` spawns a thread per call, where the Rust tree held a
-semaphore of `max_concurrent_tasks` (default 10). Parallel mode runs fixed batches, so one slow task idles the other
-slots until its batch ends, and since 2.4.0 a task waiting on a reviewer holds its slot for as long as it waits. Both want a counting semaphore, which the stdlib does not have, so build one here. **The
-same semaphore caps outbound TLS at 64**, which stops a burst of 100 tripping sigil's lane pool (*Waiting on another
-project*) before sigil fixes it.
+are written there. 2.4.1 enforced budgets and caps: crews at once, outbound TLS at 64, a parallel crew as a sliding
+window, and token and cost per tenant, crew and task, each under the one above it
+([ADR 033](../adr/033-budgets-caps-and-crew-concurrency-are-enforced.md)).
 
 #### 2.4.2 — hand a downstream task a summary, not a transcript
 
@@ -118,7 +104,8 @@ amplification of 17.2× for independent agents against 4.4× centralized. Worker
 `agnosai_explain_selection_a` is exact only while selection is a pure function of roster and task, so a manager's
 choice must be recorded. **Authority only narrows:** a worker holds at most its manager's tools and budget, and a need
 beyond them goes up to a human. Today a delegated crew's agents hold whatever their own definitions name, however
-little the delegating agent holds, and that is the gap this closes.
+little the delegating agent holds, and that is the gap this closes. The budget half is a tracker under the manager's
+task's, which 2.4.1 built (ADR 033): a worker can then never spend what its manager has not got.
 
 ### 2.5.x — durable execution
 
@@ -248,7 +235,7 @@ The *Issue* column says where each stands.
 |---|---|---|---|
 | **Port `personality`, then delete `rust-old/`** | bhava has no Cyrius port yet, and the user plans to start one soon | None needed: the user's own plan | `personality`, `with_personality`, `mood_adjusted_temperature`, the personality score and the system-prompt block. Then the deletion checklist below |
 | **Verify JWT keys over 4096 bits** | sigil: `_rsa_recover_em` refuses `n_len > 512`; the Rust line took 8192 | sigil `docs/development/issues/2026-11-05-agnosai-rsa-over-4096-bits-cannot-verify.md`, ⚠ **written, not committed** | Raise `AGNOSAI_JWT_MAX_MODULUS` from 512 to 1024 bytes, and the buffers it sizes in `src/server/auth.cyr` |
-| **A burst of TLS handshakes all succeeds** | sigil: of 100 threads, 64 verify and 36 are refused by its lane pool | sigil `docs/development/issues/2026-11-05-agnosai-lane-pool-refuses-the-overflow-of-a-burst.md`, ⚠ **written, not committed** | 2.4.1 caps outbound TLS at 64 meanwhile. `tests/server_auth_lane_race.tcyr` pins the RSA verify's lane-freedom |
+| **A burst of TLS handshakes all succeeds** | sigil: of 100 threads, 64 verify and 36 are refused by its lane pool | sigil `docs/development/issues/2026-11-05-agnosai-lane-pool-refuses-the-overflow-of-a-burst.md`, ⚠ **written, not committed** | Since 2.4.1 outbound https is capped at 64 exchanges (ADR 033), which also caps throughput to an https gateway. Delete `src/tls_permit.cyr` and its six call sites. `tests/server_auth_lane_race.tcyr` pins the RSA verify's lane-freedom |
 | **An HTTP exchange leaves nothing behind** | sandhi keeps 408–480 B a request on the global heap: about 40 B a response header, and 120 B for the host header | sandhi `docs/development/issues/2026-11-05-agnostic-outbound-calls-keep-bytes-on-the-global-heap.md` (agnostic's, with agnosai's addendum), ⚠ **written, not committed** | Tighten the per-exchange bounds to 0: `tests/orch_crew_arena.tcyr`, `tools_agnos`, `tools_gate`, `telemetry_otlp`, `llm_hoosh` |
 | **Accept a chunked request body** | sandhi answers 501 (`sandhi_server_request_has_unsupported_te`) | sandhi `docs/development/issues/2026-11-05-agnosai-server-cannot-receive-a-chunked-request-body.md`, ⚠ **written, not committed** | Nothing: out of scope until it lands |
 | **Offer a model the tools of a remote MCP server** | bote has no MCP client, **and its roadmap lists one as a non-goal**, so this needs a decision first (*Decisions for the user*) | bote `docs/development/issues/2026-11-07-agnosai-no-mcp-client-to-call-a-hosts-tools.md`, ⚠ **written 2026-11-07, not committed** | Register each remote tool with `agnosai_tool_new`: the registry and the loop need nothing else (ADR 029, rule 4) |
@@ -283,6 +270,7 @@ The ~650 comment lines citing a `rust-old/` path stay as historical pointers. No
 | **Who owns the MCP client: bote, or agnosai and agnostic?** | Before remote MCP tools | bote's roadmap lists an MCP client as a non-goal (`docs/development/roadmap.md:206`), its own consumer audit lists it as a gap daimon and thoth want (G10), and agnosai and agnostic settled on 2026-10-07 that it is bote's. The bote filing above states all three |
 | **Require hoosh 2.10.2 or newer?** | Any time | It would drop three workarounds for older gateways. `_agnosai_hoosh_detail_a`'s raw scan of an error body that is not JSON. `_AGN_CAT_REREAD_MS`'s ration on re-reading the catalog, which 2.3.3 also applies to a task with tools on a list where nothing takes them: hoosh 2.10.2 holds the catalog's body, so a GET no longer grows its heap. And `_agnosai_model_is_chat`'s twelve words, which on 2.10.2 only repeat what hoosh already did (ADR 030's addendum). ADR 030's price rule stays either way, for models hoosh has no row for. **Since 2.3.8 the floor would be 2.10.3**: a chat call sends `traceparent`, and a gateway before 2.10.3 takes its parent-id as its own span id, repeating the chat span's in one trace (ADR 023's 2.3.8 addendum) |
 | **Make CI's Lockfile step fail on a drifted lock (`cyrius deps --locked`)?** | Any time | `CLAUDE.md` has CI resolve the lock rather than audit a committed one. Since cyrius 6.7.6 a plain local `cyrius deps` writes the same 8-pin lock CI does, so `--locked` would now catch a tag that moved upstream. Adopting it changes the policy that file states |
+| **Should the server run crews for tenants?** | Before the server takes requests for more than one party | 2.4.1 gave the orchestrator tenants (ADR 033), and agnostic, which has its own, can name one per crew. The server has none: who a request runs for would have to come from its JWT, which says nothing of a tenant today, and a tenant registry would need configuring. Until then, each server's crews share its per-crew budget and its turns |
 | **Note the 2.1.5 exception in the CHANGELOG, or change its policy line?** | Any time | `CHANGELOG.md:6` claims Semantic Versioning, but 2.1.5 shipped a `### Breaking` section under a patch number (*Settled decisions*) and neither says so |
 
 ## Settled decisions
@@ -413,7 +401,7 @@ and log fields at 2.3.6.
 | Code | Now |
 |---|---|
 | B5 | `personality` (*Waiting on another project*) |
-| B6 | 2.4.1, crew concurrency |
+| B6 | shipped in 2.4.1, budgets and caps (ADR 033) |
 | B7 | 2.6.2, the tracing export (its item 8 and 9 shipped in 2.3.0) |
 | B8 | 2.6.1, server edges; RSA over 4096 bits is *Waiting on another project* |
 | B9, B32 | shipped in 2.3.5, WASM tools (ADR 019's 2.3.5 addendum) |
@@ -436,6 +424,6 @@ and log fields at 2.3.6.
 | F2 | 2.4.3, hierarchical crews |
 | F3 | shipped in 2.4.0, the crew lifecycle (ADR 032); its resync snapshot at 2.5.0 |
 | F4 | 2.5.0, durable execution |
-| F5 | 2.4.1, budgets and caps |
+| F5 | shipped in 2.4.1, budgets and caps (ADR 033); the delegated worker's level at 2.4.3 |
 | F8 | 2.6.0, MCP 2026-07-28 and A2A 1.0 |
 | F9 | 2.4.2, the summary hand-off |

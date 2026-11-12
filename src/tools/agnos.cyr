@@ -32,6 +32,9 @@
 # the same reason.
 # =========================================================================
 
+# The 64 outbound TLS permits (ADR 033).
+include "src/tls_permit.cyr"
+
 # The oracle's per-service defaults, one `DEFAULT_BASE_URL` each.
 var AGNOSAI_SYNAPSE_BASE_URL = "http://localhost:8420";
 var AGNOSAI_MNEME_BASE_URL = "http://localhost:8400";
@@ -366,8 +369,10 @@ fn agnosai_agnos_http_transport(a, c, method, url: Str, body, detail_out): i64 {
 
     # ⚠ Not `str_cstr`, which copies onto the global heap whatever it is given. A clone is
     # NUL-terminated, and this one goes back with the exchange.
+    var tls = agnosai_tls_permit_take_str(url);
     var r = sandhi_http_request_auto_a(arena, method, str_data(str_clone_a(arena, url)), headers, payload,
       payload_len, opts);
+    agnosai_tls_permit_give(tls);
     if (r == 0) {
         agnosai_arena_pool_release(_AGNOSAI_AGNOS_POOL, arena);
         return 0;

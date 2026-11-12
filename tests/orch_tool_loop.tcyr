@@ -592,6 +592,30 @@ fn _t_loop_suite(): i64 {
     assert_eq(str_contains_cstr(agnosai_task_result_output(forever), "LLM error"), 0, "not as a gateway error");
     assert_eq(bayan_json_v_arr_len(_t_records(forever)), 3, "keeping what ran");
     assert(map_get(agnosai_task_result_metadata(forever), str_from("tokens")) != 0, "and what it cost");
+
+    # A crew's own limits tighten the process's, and cannot loosen them (ADR 033).
+    var tight = agnosai_tool_loop_tighten(_t_loop(load64(loop + AGN_TL_REGISTRY), 0, 0), 2, 1, 1000, 5000);
+    assert_eq(agnosai_tool_loop_max_steps(tight), 2, "a crew may take fewer turns than the process allows");
+    assert_eq(agnosai_tool_loop_max_calls(tight), 1, "and fewer calls a turn");
+    assert_eq(agnosai_tool_loop_result_bytes(tight), 1000, "and read less of a result");
+    assert_eq(agnosai_tool_loop_transcript_bytes(tight), 5000, "and less in all");
+    _t_reset();
+    _t_runs = 0;
+    _t_asks(_t_calls(_t_call("c1", "double", "\"{\\\"x\\\":1}\""), 0, 0));
+    var short = _t_run(agent, tight);
+    assert_eq(_t_runs, 2, "so its model that never stops is stopped after two turns");
+    assert(str_contains_cstr(agnosai_task_result_output(short), "after 2 turns") == 1, "saying so");
+    agnosai_tool_loop_tighten(tight, 5, 0, 0, 0);
+    assert_eq(agnosai_tool_loop_max_steps(tight), 2, "and tightening again never loosens it");
+    var loose = agnosai_tool_loop_tighten(_t_loop(load64(loop + AGN_TL_REGISTRY), 0, 0), 500, 99, 1 << 30, 1 << 30);
+    assert_eq(agnosai_tool_loop_max_steps(loose), AGNOSAI_TOOL_MAX_STEPS, "a crew asking for more gets the process's");
+    assert_eq(agnosai_tool_loop_max_calls(loose), AGNOSAI_TOOL_MAX_CALLS_PER_TURN, "of calls too");
+    assert_eq(agnosai_tool_loop_result_bytes(loose), AGNOSAI_TOOL_RESULT_MAX_BYTES, "and of a result");
+    assert_eq(agnosai_tool_loop_transcript_bytes(loose), AGNOSAI_TOOL_TRANSCRIPT_MAX_BYTES, "and in all");
+    var none = _t_loop(load64(loop + AGN_TL_REGISTRY), 0, 0);
+    agnosai_tool_loop_set_limits(4, 8, 32768, 262144);
+    assert_eq(agnosai_tool_loop_max_steps(none), 4, "a loop with none of its own follows the process's, as it moves");
+    agnosai_tool_loop_set_limits(16, 8, 32768, 262144);
     return 0;
 }
 
@@ -1463,6 +1487,25 @@ fn _t_mode(process, label): i64 {
     return 0;
 }
 
+# A crew's own tool limits reach the loop its run builds (ADR 033).
+fn _t_crew_tool_limits(): i64 {
+    var spec = agnosai_crew_with_tool_limits(_t_spec(agnosai_process_sequential(), 1), 3, 2, 0, 0);
+    var r = _t_runner_with(spec, _t_registry(), 0);
+    var err: i64[1];
+    agnosai_crew_runner_run(r, &err);
+    var loop = load64(r + AGN_CR_LOOP);
+    assert_neq(loop, 0, "a run with tools builds its loop");
+    assert_eq(agnosai_tool_loop_max_steps(loop), 3, "held to the crew's turns");
+    assert_eq(agnosai_tool_loop_max_calls(loop), 2, "and calls");
+    assert_eq(agnosai_tool_loop_result_bytes(loop), AGNOSAI_TOOL_RESULT_MAX_BYTES,
+      "and the process's for what it left 0");
+    var plain = _t_runner_with(_t_spec(agnosai_process_sequential(), 1), _t_registry(), 0);
+    agnosai_crew_runner_run(plain, &err);
+    assert_eq(agnosai_tool_loop_max_steps(load64(plain + AGN_CR_LOOP)), AGNOSAI_TOOL_MAX_STEPS,
+      "a crew with none of its own runs at the process's");
+    return 0;
+}
+
 # ── what a tool answers goes back with its turn ───────────────────────────
 
 # Builds all it answers in its call's allocator, as a tool should.
@@ -1700,6 +1743,7 @@ fn _t_runner_suite(): i64 {
     _t_mode(agnosai_process_sequential(), "a sequential crew runs its tools");
     _t_mode(agnosai_process_parallel(2), "a parallel crew runs its tools");
     _t_mode(agnosai_process_dag(), "a dag crew runs its tools");
+    _t_crew_tool_limits();
 
     # No registry, no loop: the tools are words, and the gateway is asked once.
     var err: i64[1];

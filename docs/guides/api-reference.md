@@ -271,6 +271,7 @@ Create and execute a crew. The server assembles the crew from the provided agent
 | `agents` | array | yes | Agent definitions (see Agent Definition below) |
 | `tasks` | array | yes | Task specifications |
 | `process` | string | no | Execution mode: `"sequential"` (default), `"parallel"`, `"dag"`, or `"hierarchical"` |
+| `budget` | object | no | `{"max_tokens": N, "max_cost_usd": X}`, either key optional: the most of the model the crew may use across its tasks. It only tightens what the server gives every crew. A crew that reaches it stops, `failed` with `reason: budget_exceeded` (2.4.1) |
 
 **Task fields:**
 
@@ -281,6 +282,7 @@ Create and execute a crew. The server assembles the crew from the provided agent
 | `priority` | string | no | `"background"`, `"low"`, `"normal"` (default), `"high"`, or `"critical"` |
 | `dependencies` | array of int | no | Indices into the tasks array indicating which tasks must complete first |
 | `risk` | string | no | `"low"` (default), `"medium"` or `"high"`. A `high` task's answer waits for a reviewer on `/api/v1/approvals` (2.4.0; the Rust line had no such field) |
+| `budget` | object | no | The task's own, in the crew's shape. Reaching it fails this task, and its crew runs on (2.4.1) |
 
 **Agent definition fields:**
 
@@ -342,8 +344,14 @@ with no results and no profile. A `dag` crew whose failed task stranded the task
 the results it has (2.1.6). ([ADR 022](../adr/022-crew-events-and-status-say-what-happened.md))
 
 **`reason`** says why a crew that did not complete ended, and is left out when it did: `task_failed`, `timeout`,
-`cancelled`, `invalid_dag` (its tasks form a cycle, or depend on one the spec does not hold) or `not_started` (a
-submitted crew whose thread would not start). `POST /api/v1/crews` and this route both carry it (2.4.0).
+`cancelled`, `invalid_dag` (its tasks form a cycle, or depend on one the spec does not hold), `not_started` (a
+submitted crew whose thread would not start) or `budget_exceeded` (its budget, or its tenant's, ran out, 2.4.1).
+`POST /api/v1/crews` and this route both carry it (2.4.0).
+
+**A crew waits for a turn** (2.4.1): the server runs `max_concurrent_tasks` crews at once (10 by default), and the rest
+read `pending` until one ends, in the order they came. ⚠ A waiting `POST /api/v1/crews` holds its connection, and a
+pool worker. **A budget is checked before every model call**, and a call it refuses fails its task with the breach as
+the task's output: `crew token budget exceeded: 4300 used, 4290 limit` ([ADR 033](../adr/033-budgets-caps-and-crew-concurrency-are-enforced.md)).
 
 **No edge runs backwards since 2.4.0.** Through 2.3.8 a DAG crew that could not run went `running` → `pending` and
 stayed there; it now ends `failed` with `reason: invalid_dag` and sends `crew_completed`. `POST /api/v1/crews` cannot
@@ -417,9 +425,11 @@ had reached. The stream's own `connected` and `error` frames have no `seq` and n
 - For a parallel or DAG crew, events of different tasks interleave (`s0 s1 c1 c0 s2 …`): do not assume every
   `task_started` precedes every `task_completed`.
 - **`task_completed` arrives in completion order** (2.4.0): a task that finishes early is reported before a slower one
-  dispatched before it. Every task of a batch is reported before the next batch starts, and a DAG wave is one batch.
-  The crew's `results` stay in dispatch order.
-- A task stopped before dispatch, by a cancel or the deadline, gets neither `task_started` nor `task_completed`.
+  dispatched before it. Since 2.4.1 a parallel crew is a sliding window, not batches: a task starts as soon as a slot
+  frees, so a `task_started` can come between two `task_completed`. Every task of a DAG wave is reported before the
+  next wave starts. The crew's `results` stay in dispatch order.
+- A task stopped before dispatch, by a cancel, the deadline or its crew's budget, gets neither `task_started` nor
+  `task_completed`.
 - `crew_completed`'s `status` and `reason` match the state `GET /api/v1/crews/:id` stores: a timed-out crew says
   `failed`, `reason: timeout`, with `task_count: 0`. A crew that cannot run sends `crew_started` and `crew_completed`
   (`failed`, `invalid_dag`) and nothing between.

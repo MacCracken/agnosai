@@ -144,7 +144,7 @@ one, and writes a stray 0xFF as it finds it, which no provider takes as JSON. Ei
 the task, as each one carries the transcript, so one binary page could cost it. Control bytes (but tab, CR and LF), DEL
 and anything that is not UTF-8 become `?`, in what the model reads. That leaves JSON at twice the text at worst, so 256
 KiB fits hoosh's 1 MiB beside the prompts. `agnosai_tool_loop_set_limits` sets all four, process-wide, and refuses what
-would pass 240 messages or 400 KiB. F5 makes them per crew. A model that writes more than the budget by itself ends on
+would pass 240 messages or 400 KiB. Since 2.4.1 a crew may tighten each (`agnosai_crew_with_tool_limits`, [ADR 033](033-budgets-caps-and-crew-concurrency-are-enforced.md)). A model that writes more than the budget by itself ends on
 hoosh's 413, as a named failure.
 
 ### A failed schema keeps the transcript

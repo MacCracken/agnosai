@@ -1,0 +1,229 @@
+# =========================================================================
+# semaphore — a counting semaphore: at most N holders at once, and the rest wait their turn.
+#
+# Port-local: `rust-old/` had tokio's `Semaphore`, and the cyrius stdlib has none. It caps the
+# crews an orchestrator runs at once (`max_concurrent_tasks`, which the Rust line enforced and the
+# port did not until 2.4.1) and the outbound TLS exchanges in flight (`src/guarded_fetch.cyr`).
+#
+# **First come, first served.** A waiter joins a queue, and a release hands its permit straight to
+# the oldest waiter rather than putting it back for anyone to take. So a caller that arrives while
+# others wait queues behind them even if a permit has just come free, and no waiter can be passed
+# over for good, however busy the semaphore is. A crew submitted earlier runs earlier.
+#
+# **A waiter may give up**, at a deadline or when a word it names turns nonzero, and gives up
+# nothing it did not hold: it leaves the queue under the lock, so a permit cannot be handed to a
+# waiter that has gone. A waiter that a release reached first holds the permit, and is told so.
+#
+# A waiter's place in the queue is a node on its own stack. ⚠ **A release's grant is its last
+# touch of that node** (`agnosai_done_word_set_value`): once the waiter reads it, it may return and
+# its frame may be reused. The wake reads nothing through the address, so a late one is spurious.
+#
+# Linux only, as `src/done_word.cyr` is: it parks on `SYS_FUTEX` directly.
+# =========================================================================
+
+include "src/done_word.cyr"
+
+enum AgnosaiSemaphoreOff {
+    AGN_SEM_MUTEX = 0;
+    # Permits nobody holds. A release with a waiter queued hands its permit over and leaves this.
+    AGN_SEM_FREE = 8;
+    AGN_SEM_PERMITS = 16;
+    # The queue, oldest first, and how long it is.
+    AGN_SEM_HEAD = 24;
+    AGN_SEM_TAIL = 32;
+    AGN_SEM_WAITING = 40;
+    AGN_SEM_SIZE = 48;
+}
+
+# A waiter's node, on its stack: the word a release grants through, and the next waiter.
+enum AgnosaiSemaphoreWaiterOff {
+    AGN_SEMW_GRANTED = 0;
+    AGN_SEMW_NEXT = 8;
+    AGN_SEMW_SIZE = 16;
+}
+
+# How long a waiter with a word to watch sleeps before it looks at the word again, when nothing
+# wakes it: whoever sets the word calls `agnosai_semaphore_wake_waiters`, and this is only the
+# fallback for one that does not. A waiter with no word sleeps until its deadline, or its grant.
+var _AGNOSAI_SEM_POLL_NS = 1000000000;
+
+# A semaphore of `permits`, on the global heap, or 0 for fewer than one: a semaphore nobody can
+# ever hold is a caller's mistake, not a queue to wait in.
+fn agnosai_semaphore_new(permits): i64 {
+    if (permits < 1) { return 0; }
+    var s = alloc(AGN_SEM_SIZE);
+    store64(s + AGN_SEM_MUTEX, mutex_new());
+    store64(s + AGN_SEM_FREE, permits);
+    store64(s + AGN_SEM_PERMITS, permits);
+    store64(s + AGN_SEM_HEAD, 0);
+    store64(s + AGN_SEM_TAIL, 0);
+    store64(s + AGN_SEM_WAITING, 0);
+    return s;
+}
+
+# How many permits there are in all.
+fn agnosai_semaphore_permits(s): i64 {
+    return load64(s + AGN_SEM_PERMITS);
+}
+
+# How many permits nobody holds, now.
+fn agnosai_semaphore_available(s): i64 {
+    var mtx = load64(s + AGN_SEM_MUTEX);
+    mutex_lock(mtx);
+    var n = load64(s + AGN_SEM_FREE);
+    mutex_unlock(mtx);
+    return n;
+}
+
+# How many callers are waiting for a permit, now.
+fn agnosai_semaphore_waiting(s): i64 {
+    var mtx = load64(s + AGN_SEM_MUTEX);
+    mutex_lock(mtx);
+    var n = load64(s + AGN_SEM_WAITING);
+    mutex_unlock(mtx);
+    return n;
+}
+
+# Take a permit if one is free and nobody is waiting for it, and return 1, or return 0 at once.
+fn agnosai_semaphore_try_acquire(s): i64 {
+    var mtx = load64(s + AGN_SEM_MUTEX);
+    mutex_lock(mtx);
+    var got = 0;
+    if (load64(s + AGN_SEM_FREE) > 0 && load64(s + AGN_SEM_HEAD) == 0) {
+        store64(s + AGN_SEM_FREE, load64(s + AGN_SEM_FREE) - 1);
+        got = 1;
+    }
+    mutex_unlock(mtx);
+    return got;
+}
+
+# Take `node` out of the queue, under the lock. 1 if it was there.
+fn _agnosai_semaphore_unlink_locked(s, node): i64 {
+    var prev = 0;
+    var cur = load64(s + AGN_SEM_HEAD);
+    while (cur != 0) {
+        if (cur == node) {
+            var next = load64(cur + AGN_SEMW_NEXT);
+            if (prev == 0) { store64(s + AGN_SEM_HEAD, next); }
+            else { store64(prev + AGN_SEMW_NEXT, next); }
+            if (load64(s + AGN_SEM_TAIL) == node) { store64(s + AGN_SEM_TAIL, prev); }
+            store64(s + AGN_SEM_WAITING, load64(s + AGN_SEM_WAITING) - 1);
+            return 1;
+        }
+        prev = cur;
+        cur = load64(cur + AGN_SEMW_NEXT);
+    }
+    return 0;
+}
+
+# Take a permit, waiting in turn for one, until `deadline_ns` (`clock_now_ns`, 0 for none) or
+# until the word at `cancel` (0 for none) is nonzero. Returns 1 holding a permit, or 0 holding
+# none.
+#
+# ⚠ **A 1 means a permit is held even if `cancel` is set by then**: a release may have handed it
+# over as the cancel landed. The caller that sees its cancel after a 1 releases what it holds.
+fn agnosai_semaphore_acquire_until(s, deadline_ns, cancel): i64 {
+    var mtx = load64(s + AGN_SEM_MUTEX);
+    mutex_lock(mtx);
+    if (load64(s + AGN_SEM_FREE) > 0 && load64(s + AGN_SEM_HEAD) == 0) {
+        store64(s + AGN_SEM_FREE, load64(s + AGN_SEM_FREE) - 1);
+        mutex_unlock(mtx);
+        return 1;
+    }
+    var node: i64[2];
+    store64(&node + AGN_SEMW_GRANTED, 0);
+    store64(&node + AGN_SEMW_NEXT, 0);
+    var tail = load64(s + AGN_SEM_TAIL);
+    if (tail == 0) { store64(s + AGN_SEM_HEAD, &node); }
+    else { store64(tail + AGN_SEMW_NEXT, &node); }
+    store64(s + AGN_SEM_TAIL, &node);
+    store64(s + AGN_SEM_WAITING, load64(s + AGN_SEM_WAITING) + 1);
+    mutex_unlock(mtx);
+
+    var ts: i64[2];
+    while (1 == 1) {
+        if (atomic_load(&node + AGN_SEMW_GRANTED) != 0) {
+            atomic_fence();
+            return 1;
+        }
+        if (cancel != 0) { if (atomic_load(cancel) != 0) { break; } }
+        var wait_ns = 0;
+        if (deadline_ns != 0) {
+            wait_ns = deadline_ns - clock_now_ns();
+            if (wait_ns <= 0) { break; }
+        }
+        if (cancel != 0) {
+            if (wait_ns == 0 || wait_ns > _AGNOSAI_SEM_POLL_NS) { wait_ns = _AGNOSAI_SEM_POLL_NS; }
+        }
+        # The kernel compares the word to 0 as it parks, so a grant that lands before the park
+        # reads as EAGAIN and the loop sees it.
+        if (wait_ns == 0) {
+            syscall(SYS_FUTEX, &node + AGN_SEMW_GRANTED, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 0, 0, 0, 0);
+        } else {
+            store64(&ts, wait_ns / 1000000000);
+            store64(&ts + 8, wait_ns % 1000000000);
+            syscall(SYS_FUTEX, &node + AGN_SEMW_GRANTED, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 0, &ts, 0, 0);
+        }
+    }
+
+    # Giving up, under the lock, so no release can grant to a node that has left. One that got here
+    # first has granted already, and the permit is this caller's.
+    mutex_lock(mtx);
+    if (load64(&node + AGN_SEMW_GRANTED) != 0) {
+        mutex_unlock(mtx);
+        return 1;
+    }
+    _agnosai_semaphore_unlink_locked(s, &node);
+    mutex_unlock(mtx);
+    return 0;
+}
+
+# Wake every waiter to look at its word again, without granting anything: call it after setting
+# a word a waiter watches, so the waiter gives up at once rather than at its next poll. A waiter
+# whose word is not set goes back to sleep in its place. Returns how many were woken.
+#
+# Under the lock, so every node it touches is still queued, and so still on its waiter's stack.
+fn agnosai_semaphore_wake_waiters(s): i64 {
+    var mtx = load64(s + AGN_SEM_MUTEX);
+    mutex_lock(mtx);
+    var n = 0;
+    var cur = load64(s + AGN_SEM_HEAD);
+    while (cur != 0) {
+        syscall(SYS_FUTEX, cur + AGN_SEMW_GRANTED, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0);
+        n = n + 1;
+        cur = load64(cur + AGN_SEMW_NEXT);
+    }
+    mutex_unlock(mtx);
+    return n;
+}
+
+# Take a permit, waiting in turn for as long as it takes. Returns 1.
+fn agnosai_semaphore_acquire(s): i64 {
+    return agnosai_semaphore_acquire_until(s, 0, 0);
+}
+
+# Give back a permit: to the oldest waiter if there is one, or to the free count. Returns 0, or -1
+# for a release that holds nothing, which would raise the count past the permits and changes
+# nothing.
+fn agnosai_semaphore_release(s): i64 {
+    var mtx = load64(s + AGN_SEM_MUTEX);
+    mutex_lock(mtx);
+    var head = load64(s + AGN_SEM_HEAD);
+    if (head != 0) {
+        var next = load64(head + AGN_SEMW_NEXT);
+        store64(s + AGN_SEM_HEAD, next);
+        if (next == 0) { store64(s + AGN_SEM_TAIL, 0); }
+        store64(s + AGN_SEM_WAITING, load64(s + AGN_SEM_WAITING) - 1);
+        # The grant is the last touch of the waiter's node (the module header).
+        agnosai_done_word_set_value(head + AGN_SEMW_GRANTED, 1);
+        mutex_unlock(mtx);
+        return 0;
+    }
+    if (load64(s + AGN_SEM_FREE) >= load64(s + AGN_SEM_PERMITS)) {
+        mutex_unlock(mtx);
+        return 0 - 1;
+    }
+    store64(s + AGN_SEM_FREE, load64(s + AGN_SEM_FREE) + 1);
+    mutex_unlock(mtx);
+    return 0;
+}

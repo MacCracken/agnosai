@@ -47,11 +47,11 @@ Row by row, verified against the tree:
 
 | Rust-era row | What the port does | Where |
 |---|---|---|
-| `Arc<RwLock<OrchestratorState>>` | Registry behind one plain mutex (`AGN_OR_MUTEX`); a crew runs on the **calling** thread, so the concurrency bound is the caller's, not a semaphore's | `src/orchestrator/orchestrator.cyr` |
+| `Arc<RwLock<OrchestratorState>>` | Registry behind one plain mutex (`AGN_OR_MUTEX`). A crew runs on the calling thread, or a submitted one on its own, and since 2.4.1 waits first for one of `max_concurrent_tasks` turns ([ADR 033](033-budgets-caps-and-crew-concurrency-are-enforced.md)) | `src/orchestrator/orchestrator.cyr` |
 | `tokio::sync::broadcast` | `agnosai_chan_push_lossy` — evict-oldest on a full ring, built on `chan_try_send`. A pattern maps to a **vec of per-subscriber channels**, because Cyrius channels are single-consumer FIFOs | `src/chan_lossy.cyr`, `src/orchestrator/pubsub.cyr`, `src/server/sse.cyr` |
 | `DashMap` | Hashmap behind a futex mutex. **The lock is mandatory, not optional** — every pooled worker is its own OS thread, so an unguarded `map_set` during a concurrent `map_get` is a live data race | `src/tools/registry.cyr` |
-| `tokio::Semaphore` | No semaphore exists. Parallel crew execution bounds itself by **batch size**; inbound HTTP rate limiting is a majra token bucket (and is not mounted by default) | `src/orchestrator/crew_runner.cyr`, `src/server/rate_limit.cyr` |
-| `tokio::task::JoinSet` | `thread_create` in batches of `max_concurrency`, every thread `thread_join`ed before the next batch — so nothing is left detached and the batch size *is* the limit | `_agnosai_crew_run_wave`, `src/orchestrator/crew_runner.cyr` |
+| `tokio::Semaphore` | Since 2.4.1 a first-come-first-served counting semaphore of agnosai's own, which caps crews at once and outbound TLS at 64 (ADR 033). Inbound HTTP rate limiting is a majra token bucket | `src/semaphore.cyr`, `src/tls_permit.cyr`, `src/server/rate_limit.cyr` |
+| `tokio::task::JoinSet` | Detached threads, `max_concurrency` at a time, each waited on through its job's slot words; since 2.4.1 the next starts as one ends, a sliding window rather than batches (ADR 033) | `_agnosai_crew_run_wave`, `src/orchestrator/crew_runner.cyr` |
 | Priority `VecDeque` per level | Five vecs indexed by priority (`AGNOSAI_SCHED_TIERS = 5`) for the task scheduler; majra's `cpq_*` for the LLM inference queue | `src/orchestrator/scheduler.cyr`, `src/llm/inference_queue.cyr` |
 
 Two things the original table had no row for, because tokio made them invisible:

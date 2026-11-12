@@ -1,0 +1,120 @@
+# =========================================================================
+# tls_permit.tcyr — src/tls_permit.cyr: at most 64 outbound TLS exchanges at once (ADR 033).
+#
+# The cap itself, and that each outbound exchange takes a permit for https and none for http,
+# and has given it back once it returns, failed or not.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/id.cyr"
+include "src/telemetry/mod.cyr"
+include "src/core/error.cyr"
+include "src/core/json.cyr"
+include "src/strcase.cyr"
+include "src/llm/retry.cyr"
+include "src/arena_pool.cyr"
+include "src/llm/hoosh.cyr"
+include "src/server/ssrf.cyr"
+include "src/guarded_fetch.cyr"
+include "src/tls_permit.cyr"
+include "tests/test_helpers.cyr"
+
+fn _t_scheme(): i64 {
+    test_group("only https takes a permit");
+    var free = agnosai_tls_permits_free();
+    assert_eq(free, AGNOSAI_TLS_MAX_IN_FLIGHT, "every permit is free at first");
+    assert_eq(AGNOSAI_TLS_MAX_IN_FLIGHT, 64, "and there are 64, sigil's lanes");
+    assert_eq(agnosai_tls_permit_take("http://127.0.0.1:1/"), 0, "plain http takes none");
+    assert_eq(agnosai_tls_permits_free(), free, "and holds none");
+    var taken = agnosai_tls_permits_taken();
+    assert_eq(agnosai_tls_permit_take("https://example.invalid/"), 1, "https takes one");
+    assert_eq(agnosai_tls_permits_free(), free - 1, "and holds it");
+    assert_eq(agnosai_tls_permits_taken(), taken + 1, "counted");
+    agnosai_tls_permit_give(1);
+    assert_eq(agnosai_tls_permits_free(), free, "until it is given back");
+    assert_eq(agnosai_tls_permit_take("HTTPS://EXAMPLE.INVALID/"), 1, "the scheme in any case");
+    agnosai_tls_permit_give(1);
+    assert_eq(agnosai_tls_permit_take("https"), 0, "a bare word is not a URL");
+    assert_eq(agnosai_tls_permit_take("httpx://a"), 0, "nor another scheme");
+    assert_eq(agnosai_tls_permit_take(""), 0, "nor nothing");
+    assert_eq(agnosai_tls_permit_take(0), 0, "nor no string at all");
+    assert_eq(agnosai_tls_permit_take_str(str_from("https://a.invalid")), 1, "a Str too");
+    agnosai_tls_permit_give(1);
+    assert_eq(agnosai_tls_permit_take_str(str_new("https://a", 5)), 0,
+      "read only to its length, which here is `https`");
+    assert_eq(agnosai_tls_permit_take_str(0), 0, "and no Str is none");
+    agnosai_tls_permit_give(0);
+    agnosai_tls_permit_give(0 - 1);
+    assert_eq(agnosai_tls_permits_free(), free, "giving back a 0 or a -1 gives back nothing");
+    return 0;
+}
+
+fn _t_cap(): i64 {
+    test_group("past 64, an exchange waits, and goes ahead without one if none comes");
+    var held = 0;
+    for (var i = 0; i < AGNOSAI_TLS_MAX_IN_FLIGHT; i = i + 1) {
+        if (agnosai_tls_permit_take("https://a.invalid/") == 1) { held = held + 1; }
+    }
+    assert_eq(held, 64, "64 are taken");
+    assert_eq(agnosai_tls_permits_free(), 0, "leaving none");
+    var wait = AGNOSAI_TLS_PERMIT_WAIT_MS;
+    AGNOSAI_TLS_PERMIT_WAIT_MS = 60;
+    var without = agnosai_tls_permits_went_without();
+    var t0 = clock_now_ns();
+    assert_eq(agnosai_tls_permit_take("https://a.invalid/"), 0 - 1, "the 65th waits and goes ahead without");
+    assert((clock_now_ns() - t0) / 1000000 >= 55, "after waiting");
+    assert_eq(agnosai_tls_permits_went_without(), without + 1, "and is counted");
+    agnosai_tls_permit_give(0 - 1);
+    assert_eq(agnosai_tls_permits_free(), 0, "holding nothing to give back");
+    AGNOSAI_TLS_PERMIT_WAIT_MS = wait;
+    for (var k = 0; k < held; k = k + 1) { agnosai_tls_permit_give(1); }
+    assert_eq(agnosai_tls_permits_free(), 64, "all 64 come back");
+    return 0;
+}
+
+# Each outbound exchange to an https address nothing answers takes a permit, and has given it
+# back once it returns.
+fn _t_call_sites(): i64 {
+    test_group("each outbound exchange takes one for https, and gives it back");
+    var taken = agnosai_tls_permits_taken();
+    var req = agnosai_inference_request_new(str_from("m"));
+    agnosai_inference_request_say(req, AGNOSAI_ROLE_USER, str_from("hi"));
+    var resp: i64[1];
+    store64(&resp, 0);
+    assert(agnosai_hoosh_chat(str_from("https://127.0.0.1:1"), str_from(""), req, &resp) != 0,
+      "a chat to an https gateway that is not there fails");
+    assert_eq(agnosai_tls_permits_taken(), taken + 1, "having taken a permit");
+    assert_eq(agnosai_tls_permits_free(), 64, "and given it back");
+    assert(agnosai_hoosh_chat(str_from("http://127.0.0.1:1"), str_from(""), req, &resp) != 0,
+      "a chat to a plain http one fails too");
+    assert_eq(agnosai_tls_permits_taken(), taken + 1, "taking none");
+
+    var a = arena_allocator_growable(4096);
+    var body: i64[1];
+    assert(agnosai_hoosh_get_a(a, str_from("https://127.0.0.1:1"), str_from(""), str_from("/v1/models"), &body) < 0,
+      "a GET to an https gateway that is not there fails");
+    assert_eq(agnosai_tls_permits_taken(), taken + 2, "having taken a permit");
+    assert_eq(agnosai_tls_permits_free(), 64, "and given it back");
+
+    var opts = sandhi_http_options_new_a(a);
+    sandhi_http_options_connect_ms(opts, 500);
+    agnosai_guarded_fetch(a, "GET", str_from("https://127.0.0.1:1/pkg"), sandhi_headers_new_a(a), opts, 1000);
+    assert_eq(agnosai_tls_permits_taken(), taken + 3, "a guarded fetch over https takes one");
+    assert_eq(agnosai_tls_permits_free(), 64, "and gives it back");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+    _t_scheme();
+    _t_cap();
+    _t_call_sites();
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+sys_exit_group(f);

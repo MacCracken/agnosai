@@ -69,7 +69,11 @@ enum AgnosaiTaskOff {
     AGN_TASK_CONTEXT = 56;
     AGN_TASK_RISK = 64;
     AGN_TASK_OUTPUT_SCHEMA = 72;
-    AGN_TASK_SIZE = 80;
+    # The task's own token and cost limits (ADR 033), each `AGNOSAI_NO_LIMIT` when unset. They
+    # only tighten: a task never spends past what its crew has left.
+    AGN_TASK_MAX_TOKENS = 80;
+    AGN_TASK_MAX_COST = 88;
+    AGN_TASK_SIZE = 96;
 }
 
 # TaskResult heap layout — 32 bytes.
@@ -359,7 +363,28 @@ fn agnosai_task_new_a(a, description: Str): i64 {
     store64(t + AGN_TASK_CONTEXT, map_new_str_a(a));
     store64(t + AGN_TASK_RISK, AGNOSAI_RISK_LOW);
     store64(t + AGN_TASK_OUTPUT_SCHEMA, 0);
+    store64(t + AGN_TASK_MAX_TOKENS, AGNOSAI_NO_LIMIT);
+    store64(t + AGN_TASK_MAX_COST, AGNOSAI_NO_LIMIT);
     return t;
+}
+
+# Give the task its own limits (ADR 033): at most `max_tokens` and `max_cost_micro_usd` of the
+# model's, across every call it makes, either `AGNOSAI_NO_LIMIT`. A task under a crew with less
+# left stops when the crew does. Returns the task.
+fn agnosai_task_with_budget(t, max_tokens, max_cost_micro_usd): i64 {
+    store64(t + AGN_TASK_MAX_TOKENS, max_tokens);
+    store64(t + AGN_TASK_MAX_COST, max_cost_micro_usd);
+    return t;
+}
+
+# The task's own token limit, or `AGNOSAI_NO_LIMIT`.
+fn agnosai_task_max_tokens(t): i64 {
+    return load64(t + AGN_TASK_MAX_TOKENS);
+}
+
+# The task's own cost limit in micro-USD, or `AGNOSAI_NO_LIMIT`.
+fn agnosai_task_max_cost_micro_usd(t): i64 {
+    return load64(t + AGN_TASK_MAX_COST);
 }
 
 # Set the expected output. Returns the task so calls chain.
@@ -511,6 +536,10 @@ fn agnosai_task_to_value_a(a, t): i64 {
     var schema = load64(t + AGN_TASK_OUTPUT_SCHEMA);
     if (schema == 0) { schema = bayan_json_v_null_a(a); }
     bayan_json_v_obj_set_a(a, obj, AGN_JK_OUTPUT_SCHEMA, schema);
+    # Only when it has one (ADR 033), so a task without keeps the oracle's shape.
+    var budget = agnosai_spend_limits_to_value_a(a, load64(t + AGN_TASK_MAX_TOKENS),
+      load64(t + AGN_TASK_MAX_COST));
+    if (budget != 0) { bayan_json_v_obj_set_a(a, obj, str_from_a(a, "budget"), budget); }
     return obj;
 }
 
@@ -593,6 +622,13 @@ fn agnosai_task_from_value(v): i64 {
     if (os != 0 && bayan_json_v_is_null(os) == 0) {
         store64(t + AGN_TASK_OUTPUT_SCHEMA, os);
     }
+
+    # A budget that cannot be read is an error, as a malformed `assigned_agent` is: dropping it
+    # would run the task with no limit where the record set one.
+    var lim: i64[2];
+    if (agnosai_spend_limits_from_value(bayan_json_v_obj_get_by_cstr(v, "budget"), &lim) == 0) { return 0; }
+    store64(t + AGN_TASK_MAX_TOKENS, load64(&lim));
+    store64(t + AGN_TASK_MAX_COST, load64(&lim + 8));
     return t;
 }
 

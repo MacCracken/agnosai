@@ -2,9 +2,28 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-11-12 (the 2.4.0 release gate).
+> Last refreshed: 2026-11-12 (the 2.4.1 release gate).
 
-## Now — 2.4.0
+## Now — 2.4.1
+
+| | |
+|---|---|
+| **version** | **2.4.1** (cut 2026-11-12, `version-bump.sh`'s UTC date): budgets, caps and crew concurrency are enforced (ADR 033). Crews wait their turn, a parallel crew is a sliding window, outbound https is capped at 64, and token and cost are held per tenant, crew and task, each under the one above it |
+| **cyrius pin** | **6.7.18**, unchanged, the latest tag |
+| **tests** | **112 suites, 12,631 assertions, 0 failed** under `CYRIUS_DCE=1` with wasmtime 50.0.1, counted from each suite's printed line as well as its exit code. 2.4.0's tree read 12,192: +439, with `orch_caps` (142), `semaphore` (108) and `tls_permit` (34) new and `orch_lifecycle` at 134 from 107. **77 mutants, all killed**, in six groups run side by side in copies of the tree: the semaphore 12, crews' turns, tenants and budgets 29, the sliding window 7, TLS permits 12, trackers, tool limits and the wire 15, and the cancel's wake 2. A first pass let one through, a gap in a new test (a subscriber that attached mid-task heard that task's end), closed. Writing them found three more gaps first, each closed before they ran |
+| **coverage** | **99%**: 110/110 files, 1,995/2,005 fns (gate `--min 80`), the same 10 unreferenced as 2.4.0. A first run read 1,984: eleven new functions only the suites' paths reached, each now named by a test |
+| **dist** | `dist/agnosai.cyr` 48,680 lines + `dist/agnosai-guard.cyr` 1,034, both v2.4.1, by `wc -l` (2.4.0's read 47,506 and 1,034). Sidecars **6 / 1** leaves, unchanged. `[lib]` gains `src/semaphore.cyr` and `src/tls_permit.cyr`, 120 modules |
+| **binary** | `build/agnosai` **3,094,352 B** (2.4.0: 3,073,192). aarch64 **7,169,384 B** (7,103,176), not compacted, built and not started. The native binary answers `/ready` with `"version":"2.4.1"` and exits 0 on SIGTERM |
+| **deps** | Unchanged from 2.4.0: every pin on its latest tag. hoosh at 2.12.3 |
+| **lock** | `cyrius.lock` unchanged: 119 files, 8 commit pins |
+| **gates** | `check-symbols.sh`: 3,471 top-level definitions across 121 files, no duplicates, all prefixed. `check-clean.sh`: fmt and lint 247 files, doc 122, doctest 1, vet, deny, `deps --verify` 119, lib snapshot 113, generated sources, log lengths 246, dist matches src. Fuzz 4/4. The examples run. CI replica (ubuntu:26.04, wasmtime 47.0.3, fresh user, all 8 pins from GitHub): **every `ci.yml` step passed**, 112 suites, 12,599 assertions, 0 failed, coverage, the examples, fuzz and `cyrius bench` |
+| **benchmarks** | The interleaved A/B against a 2.4.0 build on the same `lib/`, four rounds of `orch`, `server`, `core`, `tools` and `llm` at a mean load of 3.16: median −0.2% across 192 rows, 164 within 5%. `run_crew_10_tasks_parallel_4_traced` 687.4 → 608.1 µs (−11.5%, every round), the sliding window; the other parallel rows 4–8% faster; `orchestrator_new` 4.3 → 5.4 µs (+24.3%, real). `bench-history.sh` appended 254 rows for 2.4.1, among them `tls_permit_take_give_https` 142 ns, from 1,450 in the A/B before a free permit was taken without reading the clock, and `budget_check_and_record_3_levels` 42 ns |
+| **the caps** | `tests/orch_caps.tcyr`: a crew past the cap waits `pending` and runs when a turn frees, in the order it came, inline as well as submitted; its deadline starts at its run; a cancel ends its wait at once and it never runs. Crew, task and orchestrator budgets, a refused call that is not retried though its message holds `429`, tenants spent, re-registered and reset, a tenant at its crews, and the task cap. `tests/orch_lifecycle.tcyr`: the sliding window, a reviewed task giving its slot back once, a late subscriber hearing no end without its start, and a crew its budget stopped, each a legal stream |
+| **build warnings** | Unchanged from 2.4.0: large static data, the DCE note, the two "refusing to overwrite stdlib leaf" lines, and the two `src/tool_loop.cyr` "assigning non-pointer to typed pointer" lines, now at 997 and 1173 |
+| **consumer** | Not re-run. agnostic pins 2.2.4. ⚠ It passes `max_concurrent_tasks` 10, now enforced: its 11th crew waits. Its `high` tasks wait for a reviewer since 2.4.0. It can now bring back `AGNOSTIC_CREW_MAX_CONCURRENT_TASKS` and give each crew its tenant (CHANGELOG *Behaviour changes*) |
+| **upstream filings** | ⚠ **Six not committed**, so not visible upstream: sigil (RSA over 4096 bits; the lane pool), sandhi (bytes per exchange; chunked bodies; the pooled connection's allocator), bote (MCP client) |
+
+### 2.4.0 — the release (2026-11-12)
 
 | | |
 |---|---|

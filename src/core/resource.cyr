@@ -501,12 +501,12 @@ fn agnosai_resource_budget_default(): i64 {
     return agnosai_resource_budget_new(AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, 10);
 }
 
-# Maximum total LLM tokens, or AGNOSAI_NO_LIMIT.
+# Maximum total LLM tokens, or AGNOSAI_NO_LIMIT. An orchestrator's is each crew's (ADR 033).
 fn agnosai_resource_budget_max_tokens(b): i64 {
     return load64(b + AGN_BUD_MAX_TOKENS);
 }
 
-# Maximum total cost in micro-USD, or AGNOSAI_NO_LIMIT.
+# Maximum total cost in micro-USD, or AGNOSAI_NO_LIMIT. An orchestrator's is each crew's (ADR 033).
 fn agnosai_resource_budget_max_cost_micro_usd(b): i64 {
     return load64(b + AGN_BUD_MAX_COST_MICRO_USD);
 }
@@ -516,7 +516,8 @@ fn agnosai_resource_budget_max_duration_secs(b): i64 {
     return load64(b + AGN_BUD_MAX_DURATION_SECS);
 }
 
-# Maximum number of concurrent crew executions, or AGNOSAI_NO_LIMIT.
+# Maximum number of concurrent crew executions, or AGNOSAI_NO_LIMIT. An orchestrator enforces it
+# since 2.4.1, and reads `AGNOSAI_NO_LIMIT` as the oracle's 10 (ADR 033).
 fn agnosai_resource_budget_max_concurrent_tasks(b): i64 {
     return load64(b + AGN_BUD_MAX_CONCURRENT_TASKS);
 }
@@ -577,6 +578,50 @@ fn agnosai_resource_budget_from_value(v): i64 {
     return agnosai_resource_budget_new(_agnosai_opt_int_field(v, "max_tokens"), micro,
       _agnosai_opt_int_field(v, "max_duration_secs"),
       _agnosai_opt_int_field(v, "max_concurrent_tasks"));
+}
+
+# The `budget` a crew or a task carries (ADR 033): `{"max_tokens":N,"max_cost_usd":X}`, each key
+# only when it is set, or 0 when neither is, so one without a budget keeps the shape it had.
+# `max_cost_usd` goes out in dollars, as a `ResourceBudget`'s does.
+fn agnosai_spend_limits_to_value_a(a, max_tokens, max_cost_micro_usd): i64 {
+    if (max_tokens == AGNOSAI_NO_LIMIT && max_cost_micro_usd == AGNOSAI_NO_LIMIT) { return 0; }
+    var obj = bayan_json_v_obj_new_a(a);
+    if (max_tokens != AGNOSAI_NO_LIMIT) {
+        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "max_tokens"), bayan_json_v_int_new_a(a, max_tokens));
+    }
+    if (max_cost_micro_usd != AGNOSAI_NO_LIMIT) {
+        bayan_json_v_obj_set_a(a, obj, str_from_a(a, "max_cost_usd"),
+          bayan_json_v_float_new_a(a, agnosai_micro_usd_to_f64(max_cost_micro_usd)));
+    }
+    return obj;
+}
+
+# Read the `budget` of a crew or a task into `out`, two words: tokens, then micro-USD, each
+# `AGNOSAI_NO_LIMIT` when the key is absent or null. A `v` of 0 is no budget. Returns 1, or 0 for
+# one that is not a budget: not an object, a limit that is not a number, or one below 0.
+fn agnosai_spend_limits_from_value(v, out): i64 {
+    store64(out, AGNOSAI_NO_LIMIT);
+    store64(out + 8, AGNOSAI_NO_LIMIT);
+    if (v == 0) { return 1; }
+    if (bayan_json_v_is_null(v) == 1) { return 1; }
+    if (bayan_json_v_is_obj(v) == 0) { return 0; }
+    var tv = bayan_json_v_obj_get_by_cstr(v, "max_tokens");
+    if (tv != 0 && bayan_json_v_is_null(tv) == 0) {
+        if (bayan_json_v_is_int(tv) == 0) { return 0; }
+        if (bayan_json_v_int(tv) < 0) { return 0; }
+        store64(out, bayan_json_v_int(tv));
+    }
+    var cv = bayan_json_v_obj_get_by_cstr(v, "max_cost_usd");
+    if (cv != 0 && bayan_json_v_is_null(cv) == 0) {
+        var micro = 0 - 1;
+        if (bayan_json_v_is_float(cv) == 1) { micro = agnosai_f64_to_micro_usd(bayan_json_v_float(cv)); }
+        elif (bayan_json_v_is_int(cv) == 1) {
+            if (bayan_json_v_int(cv) >= 0) { micro = bayan_json_v_int(cv) * AGNOSAI_MICRO_USD_PER_USD; }
+        }
+        if (micro < 0) { return 0; }
+        store64(out + 8, micro);
+    }
+    return 1;
 }
 
 # Create a GPU device with VRAM capacity information.

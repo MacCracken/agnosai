@@ -65,17 +65,25 @@ no gate. See [`roadmap.md`](../development/roadmap.md) for what remains.
 CrewSpec (JSON/YAML)
     │
     ▼
-CrewRunner::new(spec)
+admit (ADR 033): task cap, tenant known / not spent / under its crews
+    │
+    ▼
+wait for a turn: at most max_concurrent_tasks crews at once, first come first served
+    │
+    ▼
+CrewRunner::new(spec), with a budget tracker under its tenant's
     │
     ├── ProcessMode::Sequential → run tasks in order
-    ├── ProcessMode::Parallel   → JoinSet + Semaphore(max_concurrency)
-    ├── ProcessMode::DAG        → topological sort → wave execution
+    ├── ProcessMode::Parallel   → a sliding window of max_concurrency
+    ├── ProcessMode::DAG        → topological sort → each wave a sliding window
     └── ProcessMode::Hierarchical → manager delegation (falls back to sequential)
     │
     ├── For each task:
     │   ├── score_agent() → rank agents by suitability (5-factor weighted)
     │   ├── pick_best_agent() → assign highest-scoring agent
-    │   └── execute_task() → LLM inference via hoosh + response caching
+    │   └── execute_task() → LLM inference via hoosh, each call checked against
+    │       the task's, crew's and tenant's budgets first, and its https exchange
+    │       one of 64 TLS permits (ADR 033)
     │       ├── model (ADR 030): the agent's own, else the operator's for its
     │       │   tier, else the tier's in hoosh's catalog, else the task fails
     │       └── tool loop (ADR 029): while the model asks for the tools its agent

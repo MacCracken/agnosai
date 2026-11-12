@@ -23,8 +23,8 @@ with `agnosai_process_kind(p)`, `agnosai_process_max_concurrency(p)` and
 ⚠ **Every mode observes the execution deadline**, including Parallel. That was
 not always true — until 2026-08-13 the cooperative check sat only on the
 sequential and DAG loop heads, so a Parallel crew ran past
-`budget.max_duration_secs` and reported success. It is checked at each batch head
-now.
+`budget.max_duration_secs` and reported success. It is checked at each dispatch
+now, as a crew's budget is (2.4.1).
 
 ⚠ **The deadline is cooperative, not an abort.** Cyrius cannot interrupt a thread
 mid-syscall, so no task *starts* after the deadline but a task already running
@@ -76,11 +76,13 @@ var state = agnosai_orchestrator_run_crew(orchestrator, crew);
 // order (2.4.0, ADR 032).
 ```
 
-`max_concurrency` controls how many tasks run at once. ⚠ There is no semaphore —
-the port batches: `_agnosai_crew_run_wave` spawns at most `max_concurrency` real
-OS threads, **joins every one of them** before starting the next batch, and
-checks the deadline and the cancel flag at each batch head. So no thread is left
-detached and the concurrency ceiling is structural rather than permit-based.
+`max_concurrency` controls how many tasks run at once. **It is a sliding window**
+(2.4.1, ADR 033): `_agnosai_crew_run_wave` starts at most `max_concurrency` real OS
+threads, and the next as soon as one ends, checking the deadline, the cancel flag
+and the crew's budget before each. A task whose answer waits on a reviewer gives its
+slot back first, so its siblings go on. Every thread is waited for before the wave
+returns. Through 2.4.0 the wave ran fixed batches, and one slow task held its
+batch's other slots idle.
 
 **When to use:** Independent tasks that can safely run at the same time (e.g., analyzing separate modules, running parallel test suites).
 
@@ -143,6 +145,43 @@ let result = orchestrator.run_crew(crew).await?;
 **When to use:** Scenarios where a lead agent should decompose and assign work. Currently equivalent to sequential; full manager delegation is on the roadmap.
 
 ---
+
+## How many crews, and how much of the model
+
+An orchestrator runs at most its budget's `max_concurrent_tasks` crews at once (10
+when it sets none), and the rest wait, `pending`, in the order they came (2.4.1,
+[ADR 033](../adr/033-budgets-caps-and-crew-concurrency-are-enforced.md)). A crew's
+deadline starts when it runs.
+
+Budgets subdivide, and each only tightens the one above it:
+
+```cyr
+# Every crew of this orchestrator gets at most 200,000 tokens and $2.
+var o = agnosai_orchestrator_new(agnosai_resource_budget_new(200000, 2000000, 600, 10));
+
+# This crew asks for less, and this task less again.
+agnosai_crew_with_budget(crew, 50000, AGNOSAI_NO_LIMIT);
+agnosai_task_with_budget(task, 8000, AGNOSAI_NO_LIMIT);
+
+# A tenant's spending counts across all its crews.
+var tenants = agnosai_tenant_registry_new();
+agnosai_tenant_registry_register(tenants, str_from("acme"), agnosai_tenant_budget_new(1000000, 10000000, 3));
+agnosai_orchestrator_with_tenants(o, tenants);
+agnosai_crew_with_tenant(crew, str_from("acme"));
+```
+
+Every model call is checked first, against the task's budget, its crew's and its
+tenant's. A crew that has spent its own, or its tenant's, starts no more tasks and
+ends `failed` with `reason: budget_exceeded`, keeping the results it has. A task
+that spends its own fails alone. A tenant that is spent, or has its
+`max_concurrent_crews` running, is refused before its crew registers:
+`agnosai_orchestrator_run_crew_err` and `agnosai_orchestrator_submit_crew_err` say
+why. ⚠ A budget is a ceiling checked before each call, so calls already in flight
+can pass it by what they spend.
+
+`agnosai_crew_with_tool_limits` holds a crew's tool loop to fewer turns, calls or
+bytes than the process allows, and `agnosai_orchestrator_with_max_tasks` refuses a
+crew of too many tasks.
 
 ## Agent Scoring and Assignment
 

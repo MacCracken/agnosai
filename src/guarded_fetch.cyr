@@ -24,6 +24,9 @@
 # Include order: needs `src/server/ssrf.cyr` for `agnosai_is_safe_url`.
 # =========================================================================
 
+# The 64 outbound TLS permits (ADR 033).
+include "src/tls_permit.cyr"
+
 # Redirect hop limit — reqwest's default, which is what both oracles inherit.
 var AGNOSAI_FETCH_MAX_HOPS = 10;
 
@@ -238,8 +241,11 @@ fn agnosai_guarded_fetch_hops(arena, method, url: Str, headers, opts, timeout_ms
         sandhi_http_options_read_ms(opts, left_ms);
         sandhi_http_options_write_ms(opts, left_ms);
 
+        # A permit per hop, as a redirect may change the scheme (ADR 033).
+        var tls = agnosai_tls_permit_take_str(current);
         var r = sandhi_http_request_auto_a(arena, verb, str_data(str_clone_a(arena, current)), headers,
           body, body_len, opts);
+        agnosai_tls_permit_give(tls);
         if (r == 0) { return 0; }
         if (sandhi_http_err_kind(r) != SANDHI_OK) {
             if (out_kind != 0) { store64(out_kind, sandhi_http_err_kind(r)); }

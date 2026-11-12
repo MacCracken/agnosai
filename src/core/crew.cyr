@@ -52,7 +52,17 @@ enum AgnosaiCrewSpecOff {
     AGN_CREW_RUNS = 72;
     # 1 for a crew a tool started on an agent's behalf (ADR 029).
     AGN_CREW_DELEGATED = 80;
-    AGN_CREW_SIZE = 88;
+    # The crew's own token and cost limits (ADR 033), each `AGNOSAI_NO_LIMIT` when unset. They
+    # only tighten what its orchestrator gives every crew.
+    AGN_CREW_MAX_TOKENS = 88;
+    AGN_CREW_MAX_COST = 96;
+    # The tenant whose budget the crew's spending counts against, or 0 for none (ADR 033). Who
+    # runs a crew is not part of its definition, so it is never serialised, as `TRACE_PARENT` is not.
+    AGN_CREW_TENANT = 104;
+    # The crew's own tool-loop limits, four words in its allocator, or 0 for the process's
+    # (ADR 033). Like the tenant, how a crew runs and not what it is, so never serialised.
+    AGN_CREW_TOOL_LIMITS = 112;
+    AGN_CREW_SIZE = 120;
 }
 
 # CrewState heap layout — 40 bytes. `REASON` says why a crew did not complete, or is 0 (ADR 032).
@@ -138,7 +148,62 @@ fn agnosai_crew_new_a(a, name: Str): i64 {
     store64(c + AGN_CREW_ARENA, 0);
     store64(c + AGN_CREW_RUNS, 0);
     store64(c + AGN_CREW_DELEGATED, 0);
+    store64(c + AGN_CREW_MAX_TOKENS, AGNOSAI_NO_LIMIT);
+    store64(c + AGN_CREW_MAX_COST, AGNOSAI_NO_LIMIT);
+    store64(c + AGN_CREW_TENANT, 0);
+    store64(c + AGN_CREW_TOOL_LIMITS, 0);
     return c;
+}
+
+# Hold the crew's tool loop to less than the process's (ADR 033, ADR 029): turns a task may take,
+# calls a turn may make, and bytes of one result and of all a task's results a model reads. Each
+# only tightens what `agnosai_tool_loop_set_limits` set, and 0 leaves it. Returns the crew.
+fn agnosai_crew_with_tool_limits(c, max_steps, max_calls, result_bytes, transcript_bytes): i64 {
+    var l = alloc_via(agnosai_crew_alloc(c), 32);
+    store64(l, max_steps);
+    store64(l + 8, max_calls);
+    store64(l + 16, result_bytes);
+    store64(l + 24, transcript_bytes);
+    store64(c + AGN_CREW_TOOL_LIMITS, l);
+    return c;
+}
+
+# The crew's own tool-loop limits, four words, or 0 for none.
+fn agnosai_crew_tool_limits(c): i64 {
+    return load64(c + AGN_CREW_TOOL_LIMITS);
+}
+
+# Give the crew its own limits (ADR 033): at most `max_tokens` and `max_cost_micro_usd` of the
+# model's across all its tasks, either `AGNOSAI_NO_LIMIT`. They only tighten what its
+# orchestrator gives every crew. A crew that reaches one stops, `failed` with
+# `reason: budget_exceeded`. Returns the crew.
+fn agnosai_crew_with_budget(c, max_tokens, max_cost_micro_usd): i64 {
+    store64(c + AGN_CREW_MAX_TOKENS, max_tokens);
+    store64(c + AGN_CREW_MAX_COST, max_cost_micro_usd);
+    return c;
+}
+
+# The crew's own token limit, or `AGNOSAI_NO_LIMIT`.
+fn agnosai_crew_max_tokens(c): i64 {
+    return load64(c + AGN_CREW_MAX_TOKENS);
+}
+
+# The crew's own cost limit in micro-USD, or `AGNOSAI_NO_LIMIT`.
+fn agnosai_crew_max_cost_micro_usd(c): i64 {
+    return load64(c + AGN_CREW_MAX_COST);
+}
+
+# Name the tenant the crew runs for (ADR 033): its spending counts against that tenant's budget,
+# on an orchestrator given a tenant registry, which refuses a tenant it does not hold. 0 for none.
+# Returns the crew.
+fn agnosai_crew_with_tenant(c, tenant: Str): i64 {
+    store64(c + AGN_CREW_TENANT, tenant);
+    return c;
+}
+
+# The tenant the crew runs for, or 0.
+fn agnosai_crew_tenant(c): i64 {
+    return load64(c + AGN_CREW_TENANT);
 }
 
 # The allocator everything of this crew comes from: its arena, or the global heap.
@@ -292,6 +357,10 @@ fn agnosai_crew_to_value_a(a, c): i64 {
       _agnosai_map_to_value_a(a, load64(c + AGN_CREW_METADATA)));
     bayan_json_v_obj_set_a(a, obj, AGN_JK_TRUST_LEVEL,
       bayan_json_v_str_new_a(a, load64(c + AGN_CREW_TRUST_LEVEL)));
+    # Only when it has one (ADR 033), so a crew without keeps the oracle's shape.
+    var budget = agnosai_spend_limits_to_value_a(a, load64(c + AGN_CREW_MAX_TOKENS),
+      load64(c + AGN_CREW_MAX_COST));
+    if (budget != 0) { bayan_json_v_obj_set_a(a, obj, str_from_a(a, "budget"), budget); }
     return obj;
 }
 
@@ -341,6 +410,13 @@ fn agnosai_crew_from_value(v): i64 {
 
     var tl = _agnosai_str_field(v, "trust_level");
     if (tl != 0) { store64(c + AGN_CREW_TRUST_LEVEL, tl); }
+
+    # A budget that cannot be read is an error: dropping it would run the crew with no limit
+    # where the record set one.
+    var lim: i64[2];
+    if (agnosai_spend_limits_from_value(bayan_json_v_obj_get_by_cstr(v, "budget"), &lim) == 0) { return 0; }
+    store64(c + AGN_CREW_MAX_TOKENS, load64(&lim));
+    store64(c + AGN_CREW_MAX_COST, load64(&lim + 8));
     return c;
 }
 
@@ -692,6 +768,8 @@ var AGNOSAI_CREW_REASON_TIMEOUT = str_from("timeout");
 var AGNOSAI_CREW_REASON_CANCELLED = str_from("cancelled");
 var AGNOSAI_CREW_REASON_INVALID_DAG = str_from("invalid_dag");
 var AGNOSAI_CREW_REASON_NOT_STARTED = str_from("not_started");
+# A budget ran out: the crew's, a task's, or its tenant's (ADR 033).
+var AGNOSAI_CREW_REASON_BUDGET_EXCEEDED = str_from("budget_exceeded");
 
 # The reason word `s` spells, or 0 for one that is none of them.
 fn agnosai_crew_reason_from_wire(s: Str): i64 {
@@ -700,6 +778,7 @@ fn agnosai_crew_reason_from_wire(s: Str): i64 {
     if (str_eq(s, AGNOSAI_CREW_REASON_CANCELLED) == 1) { return AGNOSAI_CREW_REASON_CANCELLED; }
     if (str_eq(s, AGNOSAI_CREW_REASON_INVALID_DAG) == 1) { return AGNOSAI_CREW_REASON_INVALID_DAG; }
     if (str_eq(s, AGNOSAI_CREW_REASON_NOT_STARTED) == 1) { return AGNOSAI_CREW_REASON_NOT_STARTED; }
+    if (str_eq(s, AGNOSAI_CREW_REASON_BUDGET_EXCEEDED) == 1) { return AGNOSAI_CREW_REASON_BUDGET_EXCEEDED; }
     return 0;
 }
 
