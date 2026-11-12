@@ -265,6 +265,106 @@ fn _t_tool_crew_doc(ring, reg): i64 {
 # The W3C example traceparent, which tests pass in as a caller would.
 var _T_TP = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
 
+# --- a gateway on a socket, which keeps what it was sent (2.3.8) -------------
+#
+# One thread answers every connection with the same chat completion and keeps the last
+# request's text, so a test reads the headers `agnosai_hoosh_chat_in` really sent.
+var _T_GW_LFD = 0;
+var _T_GW_PORT = 0;
+var _T_GW_SEEN = 0;
+var _T_GW_REPLY = 0;
+
+# Read a request to its end, so closing the socket cannot reset the answer away.
+fn _t_gw_read(cfd, buf): i64 {
+    var got = 0;
+    var need = 0 - 1;
+    while (need < 0 || got < need) {
+        var rt, n = sock_recv(cfd, buf + got, 65536 - got);
+        if (is_err_result(rt) == 1 || n <= 0) { return got; }
+        got = got + n;
+        var head = str_new(buf, got);
+        var end = str_index_of_cstr(head, "\r\n\r\n");
+        if (end >= 0 && need < 0) {
+            var at = str_index_of_cstr(head, "ontent-Length: ");
+            var len = 0;
+            if (at >= 0) {
+                var p = at + 15;
+                while (load8(buf + p) >= 48 && load8(buf + p) <= 57) {
+                    len = len * 10 + load8(buf + p) - 48;
+                    p = p + 1;
+                }
+            }
+            need = end + 4 + len;
+        }
+    }
+    return got;
+}
+
+fn _t_gw_serve(arg): i64 {
+    var buf = alloc(65536);
+    while (1 == 1) {
+        var at, cfd = sock_accept(_T_GW_LFD);
+        if (is_err_result(at) == 0) {
+            var n = _t_gw_read(cfd, buf);
+            var seen = alloc(n + 1);
+            memcpy(seen, buf, n);
+            store8(seen + n, 0);
+            # Kept before the answer goes, so a caller that has its answer reads this request.
+            atomic_store(&_T_GW_SEEN, seen);
+            atomic_fence();
+            sock_send_all(cfd, _T_GW_REPLY, strlen(_T_GW_REPLY));
+            sock_close(cfd);
+        }
+    }
+    return 0;
+}
+
+fn _t_gw_start(): i64 {
+    var bb = str_builder_new();
+    str_builder_add_cstr(bb, "{\"model\":\"gpt-4o\",\"choices\":[{\"message\":{\"content\":\"hi\"}}],");
+    str_builder_add_cstr(bb, "\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}");
+    var body = str_cstr(str_builder_build(bb));
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n");
+    str_builder_add_cstr(sb, "Content-Length: ");
+    str_builder_add_int(sb, strlen(body));
+    str_builder_add_cstr(sb, "\r\n\r\n");
+    str_builder_add_cstr(sb, body);
+    _T_GW_REPLY = str_cstr(str_builder_build(sb));
+    var lt, lfd = tcp_socket();
+    if (is_err_result(lt) == 1) { return 0; }
+    sock_reuse(lfd);
+    var lp = 48301;
+    while (lp < 48341 && _T_GW_PORT == 0) {
+        var bt, bv = sock_bind(lfd, INADDR_LOOPBACK(), lp);
+        if (is_err_result(bt) == 0) { _T_GW_PORT = lp; }
+        lp = lp + 1;
+    }
+    if (_T_GW_PORT == 0) { return 0; }
+    var st, sv = sock_listen(lfd, 16);
+    if (is_err_result(st) == 1) { return 0; }
+    _T_GW_LFD = lfd;
+    thread_create(&_t_gw_serve, 0);
+    return 1;
+}
+
+fn _t_gw_url(): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "http://127.0.0.1:");
+    str_builder_add_int(sb, _T_GW_PORT);
+    return str_builder_build(sb);
+}
+
+# The value of the `traceparent` header the gateway last saw, as a Str, or 0 for none.
+fn _t_gw_traceparent(): i64 {
+    var seen = atomic_load(&_T_GW_SEEN);
+    if (seen == 0) { return 0; }
+    var s = str_from(seen);
+    var at = str_index_of_cstr(s, "\r\ntraceparent: ");
+    if (at < 0) { return 0; }
+    return str_new(seen + at + 15, AGNOSAI_TRACEPARENT_LEN);
+}
+
 fn main(): i64 {
     # A crew with no `llm_model` needs a model to send, and which one is not what this suite is about.
     agnosai_model_set_tier_override(AGNOSAI_TIER_CAPABLE, str_from("stub-model"));
@@ -559,6 +659,56 @@ fn main(): i64 {
     assert_eq(str_contains_cstr(rdoc, "\"name\":\"chat gpt-4o\""), 1, "and records its span");
     assert_eq(str_contains_cstr(rdoc, "parentSpanId"), 0, "as a root");
 
+    # --- the chat span's context goes to the gateway (2.3.8) -----------------
+    # A real exchange with a gateway that keeps what it was sent: the header names the chat span,
+    # in the caller's trace, so the gateway's own span is the chat span's child.
+    if (_t_gw_start() == 0) { return assert(0, "a loopback port for the gateway"); }
+    store64(&cresp, 0);
+    agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    assert_eq(agnosai_hoosh_chat_in(_t_gw_url(), str_from("sk-t"), creq, &cresp, tp), 0,
+      "a chat call to the gateway answers");
+    var gtp = _t_gw_traceparent();
+    assert(gtp != 0, "and sends a traceparent");
+    var gdoc = agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    var gspan = vec_get(_t_named(_t_frags(gdoc), "chat gpt-4o"), 0);
+    if (gtp != 0 && gspan != 0) {
+        var want = str_builder_new();
+        str_builder_add_cstr(want, "00-4bf92f3577b34da6a3ce929d0e0e4736-");
+        str_builder_add(want, _t_val(gspan, "spanId"));
+        str_builder_add_cstr(want, "-01");
+        assert(str_eq(gtp, str_builder_build(want)) == 1,
+          "naming the chat span: the caller's trace, the chat span's own id, the caller's flags");
+        assert(str_contains_cstr(gtp, "00f067aa0ba902b7") == 0,
+          "and not the caller's span, which hoosh would then hang beside the chat span");
+        var gsc = agnosai_otlp_span_context_parse(gtp);
+        assert(gsc != 0, "a header the W3C parser accepts");
+    }
+    var seen = str_from(atomic_load(&_T_GW_SEEN));
+    assert(str_contains_cstr(seen, "\r\nAuthorization: Bearer sk-t\r\n") == 1,
+      "beside the headers the call always sent");
+    assert_eq(_t_count(seen, "traceparent"), 1, "once");
+    # An unsampled caller stays unsampled at the gateway.
+    var quiet_tp = agnosai_otlp_span_context_parse(
+      str_from("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"));
+    store64(&cresp, 0);
+    agnosai_hoosh_chat_in(_t_gw_url(), str_from(""), creq, &cresp, quiet_tp);
+    var qtp = _t_gw_traceparent();
+    assert(qtp != 0 && str_ends_with(qtp, str_from("-00")) == 1,
+      "a caller's flags 00 reach the gateway as 00, as ParentBased sampling needs");
+    assert_eq(agnosai_otlp_ring_count(ring), 0, "and the unsampled chat span is not queued here");
+    # A root chat call is a root at the gateway's side too: a fresh trace, its own span.
+    store64(&cresp, 0);
+    agnosai_otlp_ring_drain(ring, str_from("agnosai"));
+    agnosai_hoosh_chat(_t_gw_url(), str_from(""), creq, &cresp);
+    var rtp = _t_gw_traceparent();
+    var rspan = vec_get(_t_named(_t_frags(agnosai_otlp_ring_drain(ring, str_from("agnosai"))),
+        "chat gpt-4o"), 0);
+    if (rtp != 0 && rspan != 0) {
+        assert(str_contains_cstr(rtp, str_cstr(_t_val(rspan, "traceId"))) == 1,
+          "a root chat span sends its own new trace");
+        assert(str_contains_cstr(rtp, str_cstr(_t_val(rspan, "spanId"))) == 1, "and its own span id");
+    }
+
     # The client's live chat pointer — what the crew runner calls when no suite
     # swapped it — hands its fourth argument on as the chat span's parent.
     var live = agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"), str_from(""));
@@ -704,6 +854,14 @@ fn main(): i64 {
     assert(agnosai_hoosh_chat_in(str_from("http://127.0.0.1:1"), str_from(""), creq, &cresp,
         tp) != 0, "the chat call still answers its error");
     assert_eq(agnosai_otlp_ring_count(ring), 0, "and the stopped exporter's ring stays empty");
+    # No span, so no header: a caller's context is not passed through either, as no crew built
+    # with telemetry off has one.
+    store64(&cresp, 0);
+    atomic_store(&_T_GW_SEEN, 0);
+    assert_eq(agnosai_hoosh_chat_in(_t_gw_url(), str_from(""), creq, &cresp, tp), 0,
+      "a chat call with telemetry off reaches the gateway");
+    assert(atomic_load(&_T_GW_SEEN) != 0, "which saw it");
+    assert_eq(_t_gw_traceparent(), 0, "and sends no traceparent");
 
     # ⚠ With telemetry off the span sites allocate NOTHING (ADR 023). Under ADR
     # 017 every tool call, inference and crew run built a 104-byte record and an

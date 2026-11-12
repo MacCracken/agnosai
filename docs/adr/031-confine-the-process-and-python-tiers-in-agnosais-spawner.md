@@ -88,8 +88,8 @@ not run. kavach's score has given these tiers no network credit since 3.14.7 (`s
 network isolation that is not applied.
 
 Landlock ABI 4 (Linux 6.7) refuses TCP connect and bind with no namespace and no privilege, and since 3.14.8 kavach
-applies that to a confined payload whose policy denies the network. agnosai still passes `network_enabled = 1`, what it
-applied before, as taking a tool's network away is a behaviour change with its own release (roadmap 2.3.8).
+applies that to a confined payload whose policy denies the network. agnosai passed `network_enabled = 1` through 2.3.7,
+what it applied before. **Since 2.3.8 it denies the network by default** (the addendum below).
 
 ### The OCI tier: docker's own hardening
 
@@ -128,7 +128,8 @@ and writes only `/tmp`. Measured: the image builds, answers `/ready`, and `id` r
 - **Negative, a behaviour change.** A tool that read or wrote outside the rules now gets EACCES. That includes `$HOME`,
   the user site-packages in `~/.local`, `/var`, `/opt`, and another process's `/proc`. The operator's paths are how to
   give one back.
-- **Negative.** Network is not isolated on these tiers, as above.
+- **Negative, through 2.3.7.** Network is not isolated on these tiers, as above. 2.3.8 closes it where the kernel has
+  landlock ABI 4 (the addendum below).
 - **Negative.** `/proc/self` is the confined process's own `/proc/<pid>`, as the rule is opened in the child, so a
   process the tool starts reads its own `/proc` as EACCES. A tool that runs `sh -c "a; b"` or forks a helper that
   reads `/proc/self` sees it fail. Allowing all of `/proc` would give every tool the server's
@@ -156,3 +157,50 @@ and writes only `/tmp`. Measured: the image builds, answers `/ready`, and `id` r
 - **Requiring a network namespace.** Fails every process and Python tool on Ubuntu 24.04 and later, in docker, and on
   GitHub's runners, as above.
 - **Confining the docker CLI.** The daemon builds the container, so the CLI's confinement says nothing about the tool's.
+
+## Addendum (2.3.8): a tool denied the network loses it
+
+**The process and Python tiers deny the network unless their config allows it**, as the OCI tier's `--network=none` always
+has. `agnosai_process_config_set_network(c, 1)` and `agnosai_python_sandbox_with_network(s, 1)` give it back, and anything
+but 1 is a no. The manager's process arm passes the policy's `needs_network`, which is 0 for every policy that reaches it,
+as a policy needing the network resolves to the OCI tier.
+
+### How
+
+A confinement holds two kavach policies, with the network and without it, over the same landlock rules, and a work
+directory's pair is made together and kept, so a call picks one and builds nothing. The spawner's
+`agnosai_spawn_capture_confined_net_a` takes the flag. Its older forms keep the network, as every confined child did, so
+a consumer calling the spawner directly is unchanged. kavach's `confine_child_caps` does the rest (3.14.8,
+`_spawn_net_alone`): landlock's TCP connect and bind rights, and a seccomp filter for what landlock does not hold. Measured
+from inside the child on Linux 7.2.14 (landlock ABI 10), all EACCES:
+
+| What the child does | Allowed | Denied |
+|---|---|---|
+| TCP connect to a loopback listener (bash `/dev/tcp`, Python) | connects | `Permission denied` |
+| TCP bind (Python, port 0) | binds | `PermissionError` |
+| A UDP socket (bash `/dev/udp`, Python `SOCK_DGRAM`) | opens | `Permission denied` |
+| A unix socket (Python `AF_UNIX`) | opens | opens: the host's own, by kavach's design |
+
+### A kernel before landlock ABI 4
+
+**There the child keeps the network**, whatever its config says: kavach applies neither half below ABI 4, and the only
+other way to hold it is a network namespace, rejected above. `agnosai_confinement_denies_network(c)` says which a host is,
+and the default confinement warns once when it is built. `tests/sandbox_confine.tcyr` measures both kernels on one box:
+a child of the suite hides landlock behind a seccomp filter that answers `landlock_create_ruleset` with ENOSYS, builds the
+default afresh, and finds the warning, `denies_network` 0, and a denied child that connects. Seccomp can only refuse, so
+that is ABI 0 rather than 1 to 3. The network is the same on all four.
+
+### Consequences
+
+- **Negative, a behaviour change.** A process or Python tool that used the network fails with EACCES: an HTTP client, a
+  package install, a DNS lookup. **To migrate:** allow it on that tool's config, or give the tool a policy with
+  `needs_network`, which runs it in a container. The CHANGELOG says so.
+- **Positive.** A tool's command or Python cannot reach the network from these tiers: not a cloud metadata address, not a
+  service on the server's loopback, not an exfiltration endpoint. That was the threat model's largest open row for them.
+- **Negative, small.** One more kavach policy per confinement and per work directory, built once, and a call allocates
+  nothing more (asserted, 0 B). The child loads one more seccomp filter and landlock's network rights: about 57 µs a
+  spawn, `spawn_true_confined_no_network` 1.297 ms against `spawn_true_confined` 1.240 ms in one binary. A Python tool
+  call, at about 36 ms, does not show it.
+- **Neutral.** kavach's score gives the process backend no network credit (`score_backend`), so a crew profile's
+  `sandbox_strength` does not move.
+

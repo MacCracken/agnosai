@@ -114,8 +114,11 @@ Read once, at start-up. A path the host does not have is skipped.
 
 - ⚠ **A tool reading outside the rules gets EACCES**, which includes `$HOME`, `~/.local`'s site-packages, `/var`,
   `/opt` and another process's `/proc`.
-- ⚠ **The network is not isolated on these tiers.** WASM tools have none, and an OCI tool has none unless its policy
-  allows it.
+- ⚠ **A process or Python tool has no network unless its config allows it** (2.3.8): a TCP connect or bind, and any
+  socket but a unix one, reads EACCES. `agnosai_process_config_set_network(c, 1)` and
+  `agnosai_python_sandbox_with_network(s, 1)` allow it, and the manager's process tier follows the tool's policy. A
+  kernel before landlock ABI 4 (Linux 6.7) leaves the tool the network, and the server warns once. WASM tools have none,
+  and an OCI tool has none unless its policy allows it.
 - ⚠ **A server running as root without `CAP_SETPCAP` refuses every process and Python tool**, with `failed to confine
   <program>: cannot bound capabilities`, since 2.3.6. With it, or as any other user, a tool holds no capabilities.
 - ⚠ **A host where kavach cannot build its seccomp filter refuses every process and Python tool**, with
@@ -139,7 +142,10 @@ honoured). The spans follow the OTel GenAI semantic conventions, pinned at
 | `execute_tool {tool name}` | INTERNAL | tool call |
 
 Within a crew they form one trace: each task is the workflow's child, and each
-inference is its task's child.
+inference is its task's child. Since 2.3.8 each `chat` call sends `traceparent`
+to the gateway, naming its own span, so hoosh 2.10.3 and later record theirs as
+its child and the trace runs on to the provider. With telemetry off nothing is
+sent.
 
 agnosai's own server records no span per HTTP request (roadmap B7). A program
 that embeds agnosai and serves its own HTTP can record one through the same

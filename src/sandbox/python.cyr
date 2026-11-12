@@ -28,6 +28,11 @@
 # `PythonSandbox` is a plain subprocess with a timeout. kavach supplies the
 # real confinement in this port — see `kavach_bridge` — and that is a milestone
 # gate, not something this module quietly does.
+#
+# Since 2.3.4 the interpreter runs under kavach's seccomp and landlock (ADR 031),
+# and since 2.3.8 with no network unless `agnosai_python_sandbox_with_network`
+# allows it, on a kernel with landlock ABI 4. No namespace: see `spawn.cyr`, *The
+# network*. cgroups are still not applied.
 # =========================================================================
 
 # ---------------------------------------------------------------------------
@@ -78,7 +83,8 @@ enum AgnosaiPySandboxOff {
     AGN_PYS_TIMEOUT_MS = 8;
     AGN_PYS_WORK_DIR = 16;
     AGN_PYS_CONFINE = 24;
-    AGN_PYS_SIZE = 32;
+    AGN_PYS_NETWORK = 32;
+    AGN_PYS_SIZE = 40;
 }
 
 # `PythonSandbox::new` — `python3`, a 30-second deadline, no working directory.
@@ -93,8 +99,25 @@ fn agnosai_python_sandbox_new(): i64 {
     store64(s + AGN_PYS_WORK_DIR, 0);
     # Confined by default since 2.3.4 (ADR 031): the oracle's "seccomp + Landlock (future)".
     store64(s + AGN_PYS_CONFINE, AGNOSAI_CONFINEMENT_DEFAULT);
+    # And with no network since 2.3.8: the oracle's "network namespace (future)".
+    store64(s + AGN_PYS_NETWORK, 0);
     return s;
 }
+
+# Let the interpreter keep the network with 1, or take it away with 0 (2.3.8). Anything but
+# 1 takes it away. An unconfined interpreter keeps it either way. Returns the sandbox.
+#
+# ⚠ **0 holds only where the kernel has landlock ABI 4** (Linux 6.7): before it, the
+# interpreter keeps the network and the server warns once (`agnosai_confinement_denies_network`).
+fn agnosai_python_sandbox_with_network(s, allow): i64 {
+    var v = 0;
+    if (allow == 1) { v = 1; }
+    store64(s + AGN_PYS_NETWORK, v);
+    return s;
+}
+
+# Whether a confined interpreter keeps the network: 0, the default, or 1.
+fn agnosai_python_sandbox_network(s): i64 { return load64(s + AGN_PYS_NETWORK); }
 
 # Run the interpreter under `cf` instead: a confinement from `agnosai_confinement_with_path`,
 # `AGNOSAI_CONFINEMENT_DEFAULT`, or 0 for none. ⚠ **0 runs a tool's Python with the server's
@@ -185,8 +208,8 @@ fn agnosai_python_execute_script_a(a, s, script: Str, input: Str, out_err): i64 
               "failed to confine: kavach could not build its seccomp filter for the python process")));
         return 0;
     }
-    var sp = agnosai_spawn_capture_confined_a(a, load64(argv), argv, agnosai_sanitized_envp(),
-      input, load64(s + AGN_PYS_TIMEOUT_MS), wd, cf);
+    var sp = agnosai_spawn_capture_confined_net_a(a, load64(argv), argv, agnosai_sanitized_envp(),
+      input, load64(s + AGN_PYS_TIMEOUT_MS), wd, cf, load64(s + AGN_PYS_NETWORK));
 
     if (agnosai_spawn_status(sp) == AGNOSAI_SPAWN_FAILED) {
         var cw = agnosai_spawn_confine_failure(sp);

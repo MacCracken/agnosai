@@ -304,13 +304,24 @@ fn agnosai_fd_set_cloexec(fd): i64 {
 # so a program can read its own status and nobody else's. A path the host does not have is
 # left out, as kavach fails a rule it cannot open. `agnosai_confinement_allow` adds one.
 #
-# ⚠ **Network is not isolated on these tiers.** Without a rootfs that takes a network
-# namespace, which needs a user namespace when unprivileged, and Ubuntu 24.04 and later,
-# docker's default seccomp profile and GitHub's runners refuse one. Requiring it would stop
-# every process and Python tool on those hosts. Since kavach 3.14.8 a policy that denies the
-# network is enforced through landlock ABI 4, with no namespace, and agnosai still passes the
-# network as allowed, as taking it away is a behaviour change with its own release (roadmap
-# 2.3.8). kavach's score gives these tiers no network credit, so nothing claims what is not applied.
+# ## The network (2.3.8)
+#
+# **A call says whether its child keeps the network**, and the process and Python tiers say
+# no unless their config allows it, as the OCI tier's `--network=none` always has. A child
+# denied it has its TCP connects and binds refused by landlock's network rights (ABI 4,
+# Linux 6.7), and its UDP, raw and other sockets by kavach's network filter, both EACCES,
+# with no namespace and no privilege. Its unix sockets stay, as they are the host's own.
+# kavach applies the two, since 3.14.8, to a confined child whose policy denies the network
+# (`_spawn_net_alone`), so a confinement holds a policy of each kind and a call picks one.
+#
+# ⚠ **A kernel before landlock ABI 4 has no network rights, and the child keeps the
+# network** whatever its policy says, as kavach applies neither half there.
+# `agnosai_confinement_denies_network` says which this host is, and the default confinement
+# warns once when it is built. A network namespace would hold it there and is not asked for:
+# unprivileged it needs a user namespace, which Ubuntu 24.04 and later, docker's default
+# seccomp profile and GitHub's runners refuse, so it would stop every process and Python
+# tool on them. kavach's score gives these tiers no network credit, so nothing claims what is
+# not applied.
 
 # `F_DUPFD_CLOEXEC` — duplicate onto the lowest free fd at or above an argument.
 var AGNOSAI_F_DUPFD_CLOEXEC = 1030;
@@ -330,17 +341,23 @@ var AGNOSAI_RLIMIT_NOFILE = 7;
 # is below it.
 var AGNOSAI_SPAWN_FAIL_CONFINE_FDS = 5;
 
-# Confinement layout — 40 bytes. `POLICY` is a kavach `SandboxPolicy` with seccomp on and
-# the landlock rules. `SECCOMP` is kavach's exec filter, built once. `LANDLOCK` is the ABI
-# the kernel reports, 0 where it has none. `WORKDIRS` holds a policy per work directory.
+# Confinement layout — 48 bytes. `POLICY` is a kavach `SandboxPolicy` with seccomp on, the
+# landlock rules and the network, and `POLICY_NONET` the same without the network.
+# `SECCOMP` is kavach's exec filter, built once. `LANDLOCK` is the ABI the kernel reports, 0
+# where it has none. `WORKDIRS` holds the two policies per work directory, as
+# `(directory, with the network, without it)` triples.
 enum AgnosaiConfinementOff {
     AGN_CF_POLICY = 0;
     AGN_CF_SECCOMP = 8;
     AGN_CF_LANDLOCK = 16;
     AGN_CF_RULES = 24;
     AGN_CF_WORKDIRS = 32;
-    AGN_CF_SIZE = 40;
+    AGN_CF_POLICY_NONET = 40;
+    AGN_CF_SIZE = 48;
 }
+
+# The landlock ABI that brought the network rights: TCP bind and connect (Linux 6.7).
+var AGNOSAI_LANDLOCK_NET_ABI = 4;
 
 # The read-and-execute trees every confined child gets, where the host has them.
 var _AGNOSAI_CONFINE_READ = 0;
@@ -406,19 +423,19 @@ fn _agnosai_confine_add(p, rules, path, access): i64 {
     return 1;
 }
 
-# kavach's basic policy, saying what this confinement applies: seccomp, and the network
-# left on. `policy_basic()` says no network, which kavach enforces since 3.14.8 (see the section
-# header), so this flag is what keeps every tool from being cut off in a patch release. A tool
-# loses its network when agnosai asks for that, and not before.
-fn _agnosai_confine_base_policy(): i64 {
+# kavach's basic policy, saying what this confinement applies: seccomp, and the network when
+# `network` is 1. `policy_basic()` says no network, which kavach enforces since 3.14.8 (see
+# the section header), so the flag is set either way and never left to the constructor.
+fn _agnosai_confine_base_policy(network): i64 {
     var p = policy_basic();
-    SandboxPolicy_set_network_enabled(p, 1);
+    SandboxPolicy_set_network_enabled(p, network);
     return p;
 }
 
-# A policy holding `c`'s rules, and `workdir` read-write when it is not 0.
-fn _agnosai_confine_policy(rules, workdir): i64 {
-    var p = _agnosai_confine_base_policy();
+# A policy holding `c`'s rules, `workdir` read-write when it is not 0, and the network when
+# `network` is 1.
+fn _agnosai_confine_policy(rules, workdir, network): i64 {
+    var p = _agnosai_confine_base_policy(network);
     var n = vec_len(rules);
     for (var i = 0; i + 1 < n; i = i + 2) {
         policy_landlock_add(p, vec_get(rules, i), vec_get(rules, i + 1));
@@ -440,7 +457,7 @@ fn agnosai_confinement_new(): i64 {
     store64(c + AGN_CF_SECCOMP, result_unwrap(sres_t, sres_v));
     store64(c + AGN_CF_LANDLOCK, security_landlock_abi_version());
     var rules = vec_new();
-    var p = _agnosai_confine_base_policy();
+    var p = _agnosai_confine_base_policy(1);
     for (var i = 0; i < vec_len(_AGNOSAI_CONFINE_READ); i = i + 1) {
         _agnosai_confine_add(p, rules, vec_get(_AGNOSAI_CONFINE_READ, i), FS_READ_ONLY);
     }
@@ -455,6 +472,8 @@ fn agnosai_confinement_new(): i64 {
         }
     }
     store64(c + AGN_CF_POLICY, p);
+    # The same rules, as `_agnosai_confine_add` kept only the paths it gave `p`.
+    store64(c + AGN_CF_POLICY_NONET, _agnosai_confine_policy(rules, 0, 0));
     store64(c + AGN_CF_RULES, rules);
     store64(c + AGN_CF_WORKDIRS, vec_new());
     return c;
@@ -462,7 +481,7 @@ fn agnosai_confinement_new(): i64 {
 
 # The confinement every process and Python tool runs under, built on first use and kept,
 # or 0 when the host cannot confine. A kernel with no landlock gets one with no filesystem
-# rules, and says so once.
+# rules, and one before ABI 4 one that cannot take the network away, and each says so once.
 fn agnosai_confinement_default(): i64 {
     var c = atomic_load(&_AGNOSAI_CONFINE_DEFAULT);
     if (c != 0) { return c; }
@@ -474,6 +493,10 @@ fn agnosai_confinement_default(): i64 {
             if (load64(c + AGN_CF_LANDLOCK) == 0) {
                 var m = "this kernel has no landlock: process and Python tools run without filesystem confinement";
                 sakshi_warn(m, strlen(m));
+            }
+            if (agnosai_confinement_denies_network(c) == 0) {
+                var nm = "this kernel's landlock has no network rights: a tool denied the network keeps it";
+                sakshi_warn(nm, strlen(nm));
             }
             atomic_fence();
             atomic_store(&_AGNOSAI_CONFINE_DEFAULT, c);
@@ -514,7 +537,8 @@ fn agnosai_confinement_with_path(c, path: Str, writable): i64 {
     store64(n + AGN_CF_SECCOMP, load64(c + AGN_CF_SECCOMP));
     store64(n + AGN_CF_LANDLOCK, load64(c + AGN_CF_LANDLOCK));
     store64(n + AGN_CF_RULES, rules);
-    store64(n + AGN_CF_POLICY, _agnosai_confine_policy(rules, 0));
+    store64(n + AGN_CF_POLICY, _agnosai_confine_policy(rules, 0, 1));
+    store64(n + AGN_CF_POLICY_NONET, _agnosai_confine_policy(rules, 0, 0));
     store64(n + AGN_CF_WORKDIRS, vec_new());
     return n;
 }
@@ -524,30 +548,49 @@ fn agnosai_confinement_landlock_abi(c): i64 {
     return load64(c + AGN_CF_LANDLOCK);
 }
 
+# 1 when a child confined by `c` and denied the network loses it: the kernel has landlock's
+# network rights (ABI 4). 0 when such a child keeps it, whatever its policy says (the section
+# header).
+fn agnosai_confinement_denies_network(c): i64 {
+    if (load64(c + AGN_CF_LANDLOCK) >= AGNOSAI_LANDLOCK_NET_ABI) { return 1; }
+    return 0;
+}
+
 # How many landlock rules `c` holds, the host's paths that exist.
 fn agnosai_confinement_rule_count(c): i64 {
     return vec_len(load64(c + AGN_CF_RULES)) / 2;
 }
 
-# The policy for a child working in `workdir`, a cstring or 0. One per distinct directory,
-# made once and kept: a tier's work directory is the operator's, so there are few, and a
-# policy a call built for itself would be one more allocation per call that never goes.
-fn _agnosai_confine_policy_for(c, workdir): i64 {
-    if (workdir == 0) { return load64(c + AGN_CF_POLICY); }
+# The policy for a child working in `workdir`, a cstring or 0, with the network when
+# `network` is 1. Two per distinct directory, made together once and kept: a tier's work
+# directory is the operator's, so there are few, and a policy a call built for itself would
+# be one more allocation per call that never goes.
+fn _agnosai_confine_policy_for(c, workdir, network): i64 {
+    var slot = 2;
+    if (network == 1) { slot = 1; }
+    if (workdir == 0) {
+        if (network == 1) { return load64(c + AGN_CF_POLICY); }
+        return load64(c + AGN_CF_POLICY_NONET);
+    }
     mutex_lock(_AGNOSAI_CONFINE_LOCK);
     var dirs = load64(c + AGN_CF_WORKDIRS);
     var p = 0;
-    for (var i = 0; i + 1 < vec_len(dirs); i = i + 2) {
-        if (streq(vec_get(dirs, i), workdir) == 1) { p = vec_get(dirs, i + 1); }
+    for (var i = 0; i + 2 < vec_len(dirs); i = i + 3) {
+        if (streq(vec_get(dirs, i), workdir) == 1) { p = vec_get(dirs, i + slot); }
     }
     if (p == 0) {
         var n = strlen(workdir);
         var key = alloc(n + 1);
         memcpy(key, workdir, n);
         store8(key + n, 0);
-        p = _agnosai_confine_policy(load64(c + AGN_CF_RULES), key);
+        var rules = load64(c + AGN_CF_RULES);
+        var with_net = _agnosai_confine_policy(rules, key, 1);
+        var without = _agnosai_confine_policy(rules, key, 0);
         vec_push(dirs, key);
-        vec_push(dirs, p);
+        vec_push(dirs, with_net);
+        vec_push(dirs, without);
+        p = without;
+        if (network == 1) { p = with_net; }
     }
     mutex_unlock(_AGNOSAI_CONFINE_LOCK);
     return p;
@@ -977,7 +1020,21 @@ fn agnosai_spawn_capture_confined(path, argv, envp, input: Str, timeout_ms, work
 # streams, the result, and a resolved program path. A per-call arena then keeps nothing of
 # the spawn on the global heap. ⚠ **`a` is this thread's**: the drain runs on it, and nothing
 # else does.
+#
+# The child keeps the network, as every confined child did through 2.3.7.
+# `agnosai_spawn_capture_confined_net_a` is the form that can take it away, and the process
+# and Python tiers call that.
 fn agnosai_spawn_capture_confined_a(a, path, argv, envp, input: Str, timeout_ms, work_dir, cf): i64 {
+    return agnosai_spawn_capture_confined_net_a(a, path, argv, envp, input, timeout_ms, work_dir,
+      cf, 1);
+}
+
+# `agnosai_spawn_capture_confined_a`, with the child keeping the network only when `network`
+# is 1 (2.3.8). Denied, a confined child's TCP connects and binds and its UDP and raw sockets
+# read EACCES where the kernel has landlock ABI 4, and it keeps the network on one that does
+# not (`agnosai_confinement_denies_network`). Unconfined, `cf` 0, `network` changes nothing.
+fn agnosai_spawn_capture_confined_net_a(a, path, argv, envp, input: Str, timeout_ms, work_dir, cf,
+  network): i64 {
     # **Ignore `SIGPIPE` before anything can be written.** A child that exits
     # without draining its stdin leaves the parent writing into a pipe with no
     # reader, and the default disposition kills the *writer* — agnosai itself,
@@ -1029,7 +1086,7 @@ fn agnosai_spawn_capture_confined_a(a, path, argv, envp, input: Str, timeout_ms,
             store64(nf + AGN_SPR_FAIL_REASON, AGNOSAI_SPAWN_FAIL_EXEC);
             return nf;
         }
-        cpol = _agnosai_confine_policy_for(cf, work_dir);
+        cpol = _agnosai_confine_policy_for(cf, work_dir, network);
         ppid = sys_getpid();
     }
 

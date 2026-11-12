@@ -1168,6 +1168,24 @@ fn _agnosai_hoosh_headers_a(a, api_key: Str): i64 {
     return h;
 }
 
+# Add `traceparent` for span context `sc` to `h`, in `a` (2.3.8): the chat span's own context, so
+# the gateway's span is its child. Nothing when `sc` is 0, which is telemetry off. Returns 0, or -1
+# when `a` runs out, as a header that is half written is not sent.
+#
+# The flags are the chat span's, which it took from its parent, so an unsampled crew stays unsampled
+# at the gateway too (ParentBased, ADR 023). `tracestate` is not passed on (roadmap 2.6.2).
+fn _agnosai_hoosh_add_traceparent_a(a, h, sc): i64 {
+    if (sc == 0) { return 0; }
+    var tp = agnosai_otlp_span_context_format_a(a, sc);
+    if (tp == 0) { return 0 - 1; }
+    var v = alloc_via(a, AGNOSAI_TRACEPARENT_LEN + 1);
+    if (v == 0) { return 0 - 1; }
+    memcpy(v, str_data(tp), AGNOSAI_TRACEPARENT_LEN);
+    store8(v + AGNOSAI_TRACEPARENT_LEN, 0);
+    sandhi_headers_set_a(a, h, "traceparent", v);
+    return 0;
+}
+
 # What a failed chat's body says, for its error text, or 0. `tree` is the parsed body, 0 if it did not
 # parse.
 #
@@ -1201,10 +1219,12 @@ fn _agnosai_hoosh_detail_a(a, tree, body, body_len): i64 {
 # `parent_sc` is the calling task's span context — the crew runner passes its
 # `invoke_agent` span's — or 0 for a root span.
 #
-# ⚠ **No outbound `traceparent` header.** hoosh 2.7.1 honours one, but exports
-# its own span with the inbound parent-id as its spanId, which would duplicate
-# this chat span's id inside one trace. It waits on a hoosh fix (roadmap,
-# *Upstream*), then hoosh's server span can be this span's child.
+# **Sends `traceparent` from the chat span** (2.3.8, ADR 023's addendum), so the
+# gateway's own span is this span's child, in the crew's trace. hoosh 2.10.3 puts
+# its span under the caller's, exporting `parentSpanId`. Through 2.10.2 it took the
+# inbound parent-id as its own span id, which would have repeated this span's id in
+# one trace, so a gateway older than that still does. With telemetry off there is
+# no span and nothing is sent.
 fn agnosai_hoosh_chat_in(base_url: Str, api_key: Str, request, out_response, parent_sc): i64 {
     # ADR 017 — the oracle defines the GenAI span helpers and never calls them;
     # this port must, or the OTLP exporter has no producers. Built before the
@@ -1306,6 +1326,9 @@ fn _agnosai_hoosh_chat_a(a, base_url: Str, api_key: Str, request, out_response,
     var ra = agnosai_inference_request_alloc(request);
     var url = _agnosai_hoosh_endpoint_cstr_a(a, base_url);
     var headers = _agnosai_hoosh_headers_a(a, api_key);
+    if (headers != 0) {
+        if (_agnosai_hoosh_add_traceparent_a(a, headers, _self) != 0) { headers = 0; }
+    }
     var body = agnosai_inference_request_to_json_a(a, request);
     if (url == 0 || headers == 0 || body == 0) {
         _agnosai_hoosh_span_done(_span, _self, parent_sc, _t0, 0,

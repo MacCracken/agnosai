@@ -51,9 +51,13 @@ within 14 days of confirmation.
     call's work directory, with the binary pinned by descriptor. Through 2.3.3
     it was a plain subprocess with the server's privileges.
     Since 2.3.6 these tools hold no capabilities, even under a root server.
-    ⚠ **Still open:** the network is not isolated on this tier; a kernel without landlock runs them
-    with no filesystem rules, and the server warns once. There is no memory
-    limit and no cgroup. `docs/development/threat-model.md` has the detail.
+    Since 2.3.8 they have no network unless their config allows it: landlock
+    refuses a TCP connect or bind and kavach's filter every other socket but a
+    unix one, all EACCES.
+    ⚠ **Still open:** a kernel before landlock ABI 4 (Linux 6.7) leaves these
+    tools the network, and one without landlock runs them with no filesystem
+    rules; the server warns once for each. There is no memory limit and no
+    cgroup. `docs/development/threat-model.md` has the detail.
   - **Native** tools run in-process and should be reviewed carefully before
     registration.
 - **LLM provider calls**: HTTP requests are made to configured provider

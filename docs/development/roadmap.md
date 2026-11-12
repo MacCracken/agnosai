@@ -6,7 +6,7 @@
 > [`cyrius-port-plan.md`](cyrius-port-plan.md) is the port's reasoning archive, and
 > [`known-unreachable.md`](known-unreachable.md) records code kept for oracle shape.
 
-**Status as of 2.3.5 (2026-11-08).**
+**Status as of 2.3.8 (2026-11-12).**
 
 **How releases are ordered.** A release holds only work that can ship now. Work that waits on another project is not
 given a number: it is listed under [*Waiting on another project*](#waiting-on-another-project), with its filed issue,
@@ -50,7 +50,6 @@ Carried from the Rust line as *goals*, not as comparisons: the Cyrius baseline s
 
 | Release | What it does |
 |---|---|
-| **2.3.8** | A tool's policy can deny it the network, and one trace from a crew to the provider |
 | **2.4.0** | The crew lifecycle as one state machine, with the approval gate wired |
 | **2.4.1** | Budgets, caps and crew concurrency enforced |
 | **2.4.2** | Hand a downstream task a summary, not a transcript |
@@ -71,23 +70,12 @@ Carried from the Rust line as *goals*, not as comparisons: the Cyrius baseline s
 2.3.3 chose a model by hoosh's tier, kind and tools bit (ADR 030's addendum), 2.3.4 confined the process and Python
 tools with kavach's primitives in agnosai's own spawner, and hardened the OCI tier's container
 ([ADR 031](../adr/031-confine-the-process-and-python-tiers-in-agnosais-spawner.md)), 2.3.5 validated a WASM module at
-load, freed it with its tool, and took the spawner's idle sleep out (ADR 019's 2.3.5 addendum), and 2.3.6 gave each
+load, freed it with its tool, and took the spawner's idle sleep out (ADR 019's 2.3.5 addendum), 2.3.6 gave each
 simulated user of a load test one connection, took a tool's capabilities away under a root server, moved the URL check
-off the global heap, and put the tool list and a task's keys in order, and 2.3.7 gave the Rust line's types their JSON
-forms and its log events their fields.
-
-#### 2.3.8 — a tool's policy can deny it the network, and one trace from a crew to the provider
-
-**A process or Python tool whose policy denies the network should lose it.** kavach enforces that through landlock ABI 4
-since 3.14.8, with no namespace, and agnosai still passes the network as allowed. Set `network_enabled` on the
-confinement's policy from the tier's own policy. It cuts tools off that have it today, so it is a behaviour change, and
-the CHANGELOG says so. A policy with `network_enabled = 1` is unaffected. A kernel before 6.7 has no such rules: state
-what it leaves, and test both.
-
-**Follow one request from a crew to the provider.** hoosh 2.10.3 puts its own span under the caller's, exporting
-`parentSpanId`, so agnosai's half can ship: `agnosai_hoosh_chat_in` sends an outbound `traceparent` from its `chat` span.
-It sends none today, as hoosh's span would have repeated the chat span's id. Check the pair end to end against a real
-hoosh.
+off the global heap, and put the tool list and a task's keys in order, 2.3.7 gave the Rust line's types their JSON
+forms and its log events their fields, and 2.3.8 took the network from a process or Python tool whose policy denies it
+(ADR 031's 2.3.8 addendum) and sent the chat span's `traceparent` to hoosh (ADR 023's 2.3.8 addendum). The line is
+done: 2.4.0 is next.
 
 ### 2.4.x — the orchestration contract
 
@@ -300,7 +288,7 @@ The ~650 comment lines citing a `rust-old/` path stay as historical pointers. No
 | Decision | Needed by | Where it stands |
 |---|---|---|
 | **Who owns the MCP client: bote, or agnosai and agnostic?** | Before remote MCP tools | bote's roadmap lists an MCP client as a non-goal (`docs/development/roadmap.md:206`), its own consumer audit lists it as a gap daimon and thoth want (G10), and agnosai and agnostic settled on 2026-10-07 that it is bote's. The bote filing above states all three |
-| **Require hoosh 2.10.2 or newer?** | Any time | It would drop three workarounds for older gateways. `_agnosai_hoosh_detail_a`'s raw scan of an error body that is not JSON. `_AGN_CAT_REREAD_MS`'s ration on re-reading the catalog, which 2.3.3 also applies to a task with tools on a list where nothing takes them: hoosh 2.10.2 holds the catalog's body, so a GET no longer grows its heap. And `_agnosai_model_is_chat`'s twelve words, which on 2.10.2 only repeat what hoosh already did (ADR 030's addendum). ADR 030's price rule stays either way, for models hoosh has no row for |
+| **Require hoosh 2.10.2 or newer?** | Any time | It would drop three workarounds for older gateways. `_agnosai_hoosh_detail_a`'s raw scan of an error body that is not JSON. `_AGN_CAT_REREAD_MS`'s ration on re-reading the catalog, which 2.3.3 also applies to a task with tools on a list where nothing takes them: hoosh 2.10.2 holds the catalog's body, so a GET no longer grows its heap. And `_agnosai_model_is_chat`'s twelve words, which on 2.10.2 only repeat what hoosh already did (ADR 030's addendum). ADR 030's price rule stays either way, for models hoosh has no row for. **Since 2.3.8 the floor would be 2.10.3**: a chat call sends `traceparent`, and a gateway before 2.10.3 takes its parent-id as its own span id, repeating the chat span's in one trace (ADR 023's 2.3.8 addendum) |
 | **Make CI's Lockfile step fail on a drifted lock (`cyrius deps --locked`)?** | Any time | `CLAUDE.md` has CI resolve the lock rather than audit a committed one. Since cyrius 6.7.6 a plain local `cyrius deps` writes the same 8-pin lock CI does, so `--locked` would now catch a tag that moved upstream. Adopting it changes the policy that file states |
 | **Note the 2.1.5 exception in the CHANGELOG, or change its policy line?** | Any time | `CHANGELOG.md:6` claims Semantic Versioning, but 2.1.5 shipped a `### Breaking` section under a patch number (*Settled decisions*) and neither says so |
 

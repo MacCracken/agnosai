@@ -2,9 +2,29 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-11-08 (the 2.3.7 release gate).
+> Last refreshed: 2026-11-12 (the 2.3.8 release gate).
 
-## Now — 2.3.7
+## Now — 2.3.8
+
+| | |
+|---|---|
+| **version** | **2.3.8** (cut 2026-11-12, by `version-bump.sh`'s UTC date): a process or Python tool whose policy denies the network loses it, and a chat call sends `traceparent`, so one request reads as one trace from a crew to the provider. The 2.3.x line is done |
+| **cyrius pin** | **6.7.18**, unchanged, the latest tag |
+| **tests** | **108 suites, 11,989 assertions, 0 failed** under `CYRIUS_DCE=1` with wasmtime 50.0.1, counted from each suite's printed line as well as its exit code. 2.3.7's tree read 11,917: +72, in `sandbox_confine` (144), `telemetry_wiring` (138) and `sandbox_wasm` (147, from 145). 20 mutants, all killed: 16 on the network, 4 on the header. A first pass let two through, both gaps in new tests (a `with_path` confinement denied the network; the older spawn form keeping it), closed. **A full `cyrius test` leaves nothing in `/tmp` again**: 2.3.7's left four files (CHANGELOG *Fixed*), measured on both trees |
+| **coverage** | **99%**: 108/108 files, 1,918/1,928 fns (gate `--min 80`), the same 10 unreferenced as 2.3.7 |
+| **dist** | `dist/agnosai.cyr` 46,930 lines + `dist/agnosai-guard.cyr` 1,034, both v2.3.8, by `wc -l` (2.3.7's read 46,804 and 1,034). Sidecars **6 / 1** leaves, unchanged |
+| **binary** | `build/agnosai` **3,056,320 B** (2.3.7: 3,056,208). aarch64 **7,102,688 B** (7,102,576), not compacted, built and not started. The native binary answers `/ready` with `"version":"2.3.8"` and exits 0 on SIGTERM |
+| **deps** | **None moved.** Checked against GitHub at the start of this release: sigil 3.13.15, bote 3.8.15, majra 2.13.0, kavach 3.14.9, ai-hwaccel 2.5.6, tyche 1.2.2, and libro 2.11.3 and patra 1.16.6 through them, each its latest tag. cyrius 6.7.18 is the latest. hoosh, which agnosai talks to and does not pin, is at 2.12.3 |
+| **lock** | `cyrius.lock` unchanged: 119 files, 8 commit pins, re-verified |
+| **gates** | `check-symbols.sh` 3,336 definitions across 119 files; `check-clean.sh` fmt 241, lint 241, doc 120, doctest 1 files; `deps --verify` 119; lib snapshot 113; log lengths 240 files; dist. Then build, aarch64, tests under DCE, coverage, the example built and run, fuzz 4/4, `distlib --all --check`. **The `ubuntu:26.04` CI replica ran** on the bumped tree laid over a clean copy, as a fresh user, wasmtime 47.0.3, all 8 pins from GitHub: every `ci.yml` step passed, 108 suites, 11,845 assertions, 0 failed, and `cyrius bench`. `sandbox_confine` ran all 144 inside docker: the network denied under docker's seccomp profile, and the old-kernel child's own filter loaded |
+| **benchmarks** | The interleaved A/B against a 2.3.7 build on the same `lib/`, four rounds of `sandbox`, `llm`, `tools` and `orch` at a mean load of 2.35: **median −0.1% across 143 rows**, 140 within 5%. `tool_registry_has_50_miss` +60.7%, bimodal on both sides (2.3.7's rounds 91, 91, 92, 236 ns) and unchanged code, not claimed. **The denied network costs a spawn about 57 µs**: `spawn_true_confined_no_network` 1.297 ms against `spawn_true_confined` 1.240 ms in one binary (+4.6%). A Python tool call does not show it, 36.24 → 36.03 ms. `bench-history.csv` has 249 rows at 2.3.8, the two new rows included, one sweep at a load of about 2–2.2: median +6.9% against 2.3.7's rows, where the same-`lib/` A/B reads −0.1%, so not claimed |
+| **the network** | A process or Python tool denied the network, measured from inside the child on Linux 7.2.14 (landlock ABI 10): a TCP connect, a TCP bind and a UDP socket read EACCES, a unix socket opens, and a tool allowed the network connects. In a work directory and in a `with_path` confinement too. The manager's process tier, the shell entry point and a Python tool on the loop's path, all denied. **A kernel before ABI 4, measured on this one**: a forked child of the suite hides landlock behind a seccomp filter answering ENOSYS, and its default confinement warns, says it cannot deny, and a denied child connects. A process call still keeps 0 B in its arena, asserted |
+| **the trace** | **End to end against hoosh 2.12.3** on loopback, the agnosai binary and hoosh both exporting OTLP to a stub collector, hoosh calling a stub provider: a crew posted to `/api/v1/crews` gave `invoke_workflow` → `invoke_agent` → `chat` → hoosh's `inference` in one trace, hoosh's span the chat span's child with an id of its own, no span id repeated. The 2.3.7 binary against the same hoosh: hoosh's span a root in a trace of its own. In the suite: the header names the chat span, flags `00` reach the gateway as `00`, a root chat sends its own trace, telemetry off sends none |
+| **build warnings** | Unchanged from 2.3.7: large static data, the DCE note, the two "refusing to overwrite stdlib leaf" lines, and **two** `src/tool_loop.cyr` "assigning non-pointer to typed pointer" lines, at 895 and 1070, which the 2.3.7 tree prints too and this row did not list. They date from 2.3.0's tool loop |
+| **consumer** | Not re-run. agnostic pins 2.2.4, and calls none of the process, Python, spawn or manager functions directly, checked in its `src/`. ⚠ A process or Python tool loses the network, and a chat call sends `traceparent` (CHANGELOG *Behaviour changes*) |
+| **upstream filings** | ⚠ **Six not committed**, so not visible upstream: sigil (RSA over 4096 bits; the lane pool), sandhi (bytes per exchange; chunked bodies; the pooled connection's allocator), bote (MCP client) |
+
+### 2.3.7 — the release (2026-11-08)
 
 | | |
 |---|---|

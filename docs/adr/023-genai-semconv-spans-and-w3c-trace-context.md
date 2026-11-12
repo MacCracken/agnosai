@@ -201,7 +201,8 @@ all).
   traceparent but exports its own span with the inbound parent-id as its spanId
   and no parentSpanId (`hoosh/src/lib/otlp.cyr:72-77`), so propagating now
   would duplicate the chat span's id inside one trace. That is a hoosh fix
-  first (roadmap, *Upstream*), then agnosai adds the header.
+  first (roadmap, *Upstream*), then agnosai adds the header. **Shipped in
+  2.3.8**, with hoosh 2.10.3's fix: the addendum below.
 - **B7.** The remaining `#[instrument]` span coverage, trace ids in JSON log
   lines, aggregate usage on `invoke_agent`, request parameters, `finish_reasons`
   (a `string[]` needs an OTLP `arrayValue`), `Span.flags` is_remote, and
@@ -283,3 +284,28 @@ all).
   an Ollama fallback, where hoosh knows the real provider.
 - **Dual-emit old and new names** (`OTEL_SEMCONV_STABILITY_OPT_IN` style).
   Rejected: there is no installed base to protect.
+
+## Addendum (2.3.8): the chat span's context goes to the gateway
+
+`agnosai_hoosh_chat_in` sends `traceparent` from its `chat` span: the crew's trace id, the chat span's own id and its
+flags, which it took from its parent. hoosh 2.10.3 puts its own span under the caller's and exports `parentSpanId`, so
+one request reads as one trace from the crew to the provider:
+
+    invoke_workflow trace-crew   (root)
+    └ invoke_agent A
+      └ chat stub-model          CLIENT, agnosai
+        └ inference              CLIENT, hoosh 2.12.3
+
+Measured end to end on loopback: the agnosai binary with OTLP on, hoosh 2.12.3 with OTLP on, a stub provider and a stub
+collector both export to. A crew posted to `/api/v1/crews` gave the four spans above in one trace, hoosh's span the chat
+span's child with an id of its own, and no span id repeated. The 2.3.7 binary against the same hoosh gave hoosh's span
+as a root in a trace of its own.
+
+- **No span, no header.** With telemetry off there is no chat span, and a caller's context is not passed through, as no
+  crew built with telemetry off has one.
+- **The flags go as they came.** A crew whose inbound context says `00` sends `00`, so hoosh does not sample it either
+  (ParentBased, as above).
+- **`tracestate` is not sent** (roadmap 2.6.2), and the catalog's `GET`s carry no header, as they belong to no span.
+- **A gateway before hoosh 2.10.3** still takes the parent-id as its own span id, so its span repeats the chat span's
+  id. agnosai does not pin hoosh, and does not detect that.
+

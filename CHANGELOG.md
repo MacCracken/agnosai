@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.8] — 2026-11-12
+
+A process or Python tool whose policy denies the network loses it, and one request reads as one trace from a crew to the
+provider, through hoosh.
+
+### ⚠ Behaviour changes
+
+- **A process or Python tool has no network unless its config allows it.** A TCP connect or bind reads EACCES, and so does
+  a UDP, raw or other non-TCP socket: an HTTP client, a package install and a DNS lookup all fail. Unix sockets stay. Through
+  2.3.7 these tiers kept the server's network whatever the policy said. The manager's process tier follows the tool's
+  policy, and `SandboxPolicy::process()` needs no network. **To migrate:** `agnosai_process_config_set_network(c, 1)` or
+  `agnosai_python_sandbox_with_network(s, 1)` on that tool's config, or a policy with `needs_network`, which runs the tool
+  in a container. ⚠ **A kernel before landlock ABI 4 (Linux 6.7) leaves the tool the network**, and the server warns once
+  (ADR 031's 2.3.8 addendum).
+- **A chat call sends `traceparent`** to the gateway, naming its `chat` span, when telemetry is on. hoosh 2.10.3 and later
+  put their span under it. A gateway before 2.10.3 takes the parent-id as its own span id, so its span repeats the chat
+  span's (ADR 023's 2.3.8 addendum). Measured end to end against hoosh 2.12.3: a crew posted to the server gave its
+  workflow, agent and chat spans and hoosh's `inference` span in one trace, hoosh's under the chat span, where 2.3.7's
+  left hoosh's span a root of its own.
+
+### Added
+
+- **`agnosai_process_config_network`, `agnosai_process_config_set_network`, `agnosai_python_sandbox_network` and
+  `agnosai_python_sandbox_with_network`**: whether a tier's confined child keeps the network. 0 by default.
+- **`agnosai_spawn_capture_confined_net_a`**: the confined spawn with the flag. The forms without it keep the network, as
+  before.
+- **`agnosai_confinement_denies_network`**: 1 where the kernel has landlock's network rights, so a denied child loses the
+  network.
+
+### Changed
+
+- **A confinement holds two kavach policies**, with the network and without it, over the same landlock rules, and a work
+  directory's pair is built together and kept. kavach applies the denied one, since 3.14.8, through landlock's TCP rights
+  and a seccomp filter for the rest.
+- **The default confinement warns once** on a kernel whose landlock has no network rights.
+- **Dependencies:** none moved. Every pin was already on its latest tag, and so were libro and patra, which come through
+  them. hoosh, which agnosai talks to and does not pin, is at 2.12.3.
+
+### Fixed
+
+- **A full `cyrius test` left four files in `/tmp` again**, as it did not since 2.3.5. 2.3.7's log-field checks in
+  `tests/sandbox_oci.tcyr` and `tests/sandbox_wasm.tcyr` ran after each suite's cleanup: a stand-in runtime, a module
+  under the suite's removed directory, and two staged copies of modules never freed. They run before it now, and free
+  what they load. Only the suites changed.
+
+### Security
+
+- **A tool's command or Python cannot reach the network from the process and Python tiers**, where the kernel has landlock
+  ABI 4: not a cloud metadata address, not a service on the server's loopback, not an exfiltration endpoint. It was the
+  threat model's largest open row for those tiers.
+
+### Performance
+
+- **The interleaved A/B against a 2.3.7 build on the same `lib/`:** four rounds of `sandbox`, `llm`, `tools` and `orch` at a
+  mean load of 2.35, median −0.1% across 143 rows, 140 of them within 5%. `tool_registry_has_50_miss` read +60.7% (92 to
+  147 ns), and is bimodal on both sides: 2.3.7's four rounds read 91, 91, 92 and 236 ns. Its code is unchanged, and it
+  moved −38.6%, +1.1% and +15.6% in the last three releases with no change to it either, so it is not claimed.
+- ⚠ **Not free: a denied network costs a spawn about 57 µs.** `spawn_true_confined_no_network`, new, reads 1.297 ms
+  against `spawn_true_confined`'s 1.240 ms in the same binary (+4.6%): the network filter and landlock's network rights,
+  loaded in the child. `spawn_true_confined`, which keeps the network, read 1.218 → 1.240 ms (+1.8%), inside its
+  rounds' spread. A Python tool call does not show it: `python_tool_call_confined` 36.24 ms with the network on 2.3.7 and
+  36.03 ms without it on 2.3.8, and `python_tool_call_confined_network`, new, 35.92 ms.
+
 ## [2.3.7] — 2026-11-08
 
 The Rust line's types have their JSON forms, in both directions, and its log events have their fields. Every form is built in

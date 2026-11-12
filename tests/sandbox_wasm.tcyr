@@ -632,6 +632,10 @@ fn _t_v237_events(): i64 {
         agnosai_wasm_execute(s, spin, str_from(""), &err);
         _tl_saw("WASM execution interrupted by its deadline", "a guest stopped at its deadline is a warning");
         _tl_saw("WASM execution complete exit_code=-1", "with the deadline's exit code");
+        # Each loaded module was staged, and goes when it is freed (2.3.8: 2.3.7 left both).
+        assert_eq(agnosai_wasm_module_free(nop), 1, "the module goes");
+        assert_eq(agnosai_wasm_module_free(spin), 1, "and the spinning one");
+        sys_unlink(str_data(path));
     }
     _tl_stop();
     return 0;
@@ -927,6 +931,10 @@ fn main(): i64 {
         _t_store_limit_suite();
     }
 
+    # Before the teardown, as it writes under `_T_ROOT`: 2.3.7 ran it after, and left a module
+    # there and two staged copies beside it.
+    _t_v237_events();
+
     # --- teardown -----------------------------------------------------------
     agnosai_wasm_module_free(fm);
     sys_unlink(str_data(good_path));
@@ -936,7 +944,6 @@ fn main(): i64 {
     # 2.3.5: every scratch path this suite made goes, so two runs at once share none and a run
     # leaves nothing behind (`tests/test_tmp.cyr`).
     _tt_cleanup();
-    _t_v237_events();
     return assert_summary();
 }
 

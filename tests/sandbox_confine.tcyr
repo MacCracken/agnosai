@@ -24,6 +24,7 @@ include "src/server/ssrf.cyr"
 include "src/tools/native.cyr"
 include "src/tools/python_tool.cyr"
 include "tests/test_helpers.cyr"
+include "tests/test_log.cyr"
 
 # A Python tool that answers `{"ok": 1}`.
 var _T_PY_TOOL = "class T:\n    def execute(self, p):\n        return {'ok': 1}\ndef create_tool():\n    return T()\n";
@@ -483,6 +484,296 @@ fn test_resolve(): i64 {
     return 0;
 }
 
+# --- the network (2.3.8) -----------------------------------------------------
+#
+# A loopback listener stands for the network: a TCP connect completes in the kernel's
+# backlog with no `accept`, so no thread serves it. bash's `/dev/tcp` and `/dev/udp` make
+# the sockets, as dash has neither, and Python makes the bind and the unix socket.
+
+var _T_NET_PORT = 0;
+var _T_NET_FD = 0;
+# Whether this kernel takes a denied child's network away (landlock ABI 4).
+var _T_NET_DENIES = 0;
+
+fn _t_net_listen(): i64 {
+    var lt, lfd = tcp_socket();
+    if (is_err_result(lt) == 1) { return 0; }
+    sock_reuse(lfd);
+    var lp = 48201;
+    while (lp < 48261 && _T_NET_PORT == 0) {
+        var bt, bv = sock_bind(lfd, INADDR_LOOPBACK(), lp);
+        if (is_err_result(bt) == 0) { _T_NET_PORT = lp; }
+        lp = lp + 1;
+    }
+    if (_T_NET_PORT == 0) { return 0; }
+    var st, sv = sock_listen(lfd, 64);
+    if (is_err_result(st) == 1) { return 0; }
+    _T_NET_FD = lfd;
+    return 1;
+}
+
+# `exec 3<>/dev/tcp/127.0.0.1/PORT && echo connected`, as bash's argv.
+fn _t_net_tcp(): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "exec 3<>/dev/tcp/127.0.0.1/");
+    str_builder_add_int(sb, _T_NET_PORT);
+    str_builder_add_cstr(sb, " && echo connected");
+    return _t_argv("/bin/bash", "-c", str_cstr(str_builder_build(sb)));
+}
+
+# A UDP socket bash connects to port 9, which needs no listener: the socket is the test.
+fn _t_net_udp(): i64 {
+    return _t_argv("/bin/bash", "-c", "exec 3<>/dev/udp/127.0.0.1/9 && echo opened");
+}
+
+fn _t_net_run(cf, argv, wd, network): i64 {
+    return agnosai_spawn_capture_confined_net_a(default_alloc(), load64(argv), argv,
+      agnosai_sanitized_envp(), str_from(""), 20000, wd, cf, network);
+}
+
+# Whether `sp` connected, which a denied child never prints.
+fn _t_net_connected(sp): i64 {
+    return str_eq_cstr(_t_out(sp), "connected");
+}
+
+# Whether `sp` was refused with EACCES, which is how landlock and kavach's filter refuse.
+fn _t_net_refused(sp): i64 {
+    if (agnosai_spawn_status(sp) != AGNOSAI_SPAWN_OK) { return 0; }
+    if (agnosai_spawn_exit_code(sp) == 0) { return 0; }
+    if (str_index_of_cstr(agnosai_spawn_stderr(sp), "Permission denied") < 0) { return 0; }
+    return 1;
+}
+
+# A Python script connecting to the listener.
+fn _t_net_py_connect(): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "import socket\ns = socket.socket()\ns.connect(('127.0.0.1', ");
+    str_builder_add_int(sb, _T_NET_PORT);
+    str_builder_add_cstr(sb, "))\nprint('connected')\n");
+    return str_builder_build(sb);
+}
+
+fn test_network(): i64 {
+    var cf = agnosai_confinement_default();
+    assert_eq(SandboxPolicy_network_enabled(load64(cf + AGN_CF_POLICY)), 1,
+      "a confinement holds a policy with the network");
+    assert_eq(SandboxPolicy_network_enabled(load64(cf + AGN_CF_POLICY_NONET)), 0,
+      "and one without it");
+    assert_eq(SandboxPolicy_landlock_rules_len(load64(cf + AGN_CF_POLICY_NONET)),
+      SandboxPolicy_landlock_rules_len(load64(cf + AGN_CF_POLICY)),
+      "with the same landlock rules, so a call without the network loses nothing else");
+    assert_eq(_agnosai_confine_policy_for(cf, 0, 1), load64(cf + AGN_CF_POLICY), "1 picks the first");
+    assert_eq(_agnosai_confine_policy_for(cf, 0, 0), load64(cf + AGN_CF_POLICY_NONET), "0 the second");
+    assert_eq(_agnosai_confine_policy_for(cf, 0, 7), load64(cf + AGN_CF_POLICY_NONET),
+      "and anything but 1 the second: a flag that is not a yes takes the network away");
+    assert_eq(agnosai_confinement_denies_network(cf), _T_NET_DENIES,
+      "the confinement says whether this kernel can take the network away");
+
+    if (sys_access("/bin/bash", 1) != 0) {
+        println("  skip: no /bin/bash to open a socket with");
+        return 0;
+    }
+    if (_t_net_listen() == 0) { return assert(0, "a loopback port to connect to"); }
+
+    var kept = _t_net_run(cf, _t_net_tcp(), 0, 1);
+    assert(_t_net_connected(kept) == 1, "a confined child allowed the network connects");
+    var old_form = _t_run_in(cf, _t_net_tcp(), "", 0);
+    assert(_t_net_connected(old_form) == 1,
+      "and the form without the flag keeps it, as every confined child did through 2.3.7");
+    var ukept = _t_net_run(cf, _t_net_udp(), 0, 1);
+    assert(str_eq_cstr(_t_out(ukept), "opened") == 1, "and opens a UDP socket");
+    var bare = _t_net_run(0, _t_net_tcp(), 0, 0);
+    assert(_t_net_connected(bare) == 1,
+      "an unconfined child keeps the network whatever the flag says: there is no policy to hold it");
+
+    if (_T_NET_DENIES == 0) {
+        # What a kernel before ABI 4 leaves, and the reason the server warns.
+        var old = _t_net_run(cf, _t_net_tcp(), 0, 0);
+        assert(_t_net_connected(old) == 1,
+          "a kernel before landlock ABI 4 leaves a denied child the network, as kavach applies nothing");
+        println("  skip: this kernel's landlock has no network rights, so nothing below is refused");
+        return 0;
+    }
+
+    var tcp = _t_net_run(cf, _t_net_tcp(), 0, 0);
+    _t_ran(tcp, "a confined child denied the network runs");
+    assert(_t_net_connected(tcp) == 0, "and does not connect");
+    assert(_t_net_refused(tcp) == 1, "refused with EACCES: landlock's TCP connect right");
+    var udp = _t_net_run(cf, _t_net_udp(), 0, 0);
+    assert(str_eq_cstr(_t_out(udp), "opened") == 0, "nor opens a UDP socket");
+    assert(_t_net_refused(udp) == 1,
+      "refused with EACCES: kavach's network filter, as landlock holds TCP alone");
+
+    # A confinement with one more path has both policies too.
+    var extra = agnosai_confinement_with_path(cf, str_from(_T_ALLOWED), 0);
+    assert_eq(SandboxPolicy_network_enabled(load64(extra + AGN_CF_POLICY_NONET)), 0,
+      "a confinement with one more path has a policy without the network");
+    assert_eq(SandboxPolicy_network_enabled(load64(extra + AGN_CF_POLICY)), 1, "and one with it");
+    assert(_t_net_refused(_t_net_run(extra, _t_net_tcp(), 0, 0)) == 1, "and denies it");
+    assert(_t_net_connected(_t_net_run(extra, _t_net_tcp(), 0, 1)) == 1, "or keeps it, as asked");
+
+    # A work directory's policies, the two made together and kept. A directory no call has
+    # used yet, as `test_files` already made `_T_OUT`'s.
+    var nwd = _t_join(_T_OUT, "/netwd");
+    sys_mkdir(nwd, 493);
+    var dirs = load64(cf + AGN_CF_WORKDIRS);
+    var before = vec_len(dirs);
+    var wtcp = _t_net_run(cf, _t_net_tcp(), nwd, 0);
+    assert(_t_net_refused(wtcp) == 1, "denied in a work directory as well");
+    assert_eq(vec_len(dirs) - before, 3, "which made one entry of three: the directory and its two policies");
+    var wkept = _t_net_run(cf, _t_net_tcp(), nwd, 1);
+    assert(_t_net_connected(wkept) == 1, "and allowed there, from the same entry");
+    assert_eq(vec_len(dirs) - before, 3, "made once");
+    sys_rmdir(nwd);
+
+    # The process tier: no network unless its config allows it.
+    var c = agnosai_process_config_default();
+    assert_eq(agnosai_process_config_network(c), 0, "a process config has no network by default");
+    var err: i64[1];
+    store64(&err, 0);
+    var argv = vec_new();
+    vec_push(argv, str_from("/bin/bash"));
+    vec_push(argv, str_from("-c"));
+    vec_push(argv, str_from(load64(_t_net_tcp() + 16)));
+    var pr = agnosai_process_execute_argv(c, argv, str_from(""), &err);
+    if (pr == 0) { return assert(0, "the process tier runs"); }
+    assert(str_eq_cstr(str_trim(agnosai_process_result_stdout(pr)), "connected") == 0,
+      "the process tier's child does not connect: it kept the network through 2.3.7");
+    assert(str_index_of_cstr(agnosai_process_result_stderr(pr), "Permission denied") >= 0, "EACCES");
+    assert_eq(agnosai_process_config_set_network(c, 1), c, "a config allows it, and returns itself");
+    assert_eq(agnosai_process_config_network(c), 1, "and says so");
+    var pk = agnosai_process_execute_argv(c, argv, str_from(""), &err);
+    if (pk != 0) {
+        assert(str_eq_cstr(str_trim(agnosai_process_result_stdout(pk)), "connected") == 1,
+          "and its child connects");
+    }
+    agnosai_process_config_set_network(c, 2);
+    assert_eq(agnosai_process_config_network(c), 0, "anything but 1 is a no");
+    var sh = agnosai_process_config_default();
+    agnosai_process_config_set_executable(sh, str_from("/bin/bash"));
+    var shr = agnosai_process_execute(sh, str_from(load64(_t_net_tcp() + 16)), str_from(""), &err);
+    assert(shr != 0, "the shell entry point runs");
+    if (shr != 0) {
+        assert(str_index_of_cstr(agnosai_process_result_stderr(shr), "Permission denied") >= 0,
+          "the shell entry point is denied as well");
+    }
+
+    # The manager, which is how a tool reaches the tier, from the tool's own policy.
+    var m = agnosai_sandbox_manager_new(agnosai_sandbox_manager_config_default());
+    var mr = agnosai_sandbox_manager_execute_argv(m, agnosai_sandbox_policy_process(), argv,
+      str_from(""), &err);
+    if (mr == 0) { return assert(0, "the manager's process tier runs"); }
+    assert_eq(agnosai_sandbox_result_backend(mr), AGNOSAI_ISOLATION_PROCESS, "on the process tier");
+    assert(str_index_of_cstr(agnosai_sandbox_result_stderr(mr), "Permission denied") >= 0,
+      "and SandboxPolicy::process(), which needs no network, has none");
+
+    # The Python tier.
+    if (sys_access("/usr/bin/python3", 1) != 0) {
+        println("  skip: no python3 for the python tier's network");
+        return 0;
+    }
+    var py = agnosai_python_sandbox_new();
+    assert_eq(agnosai_python_sandbox_network(py), 0, "a python sandbox has no network by default");
+    store64(&err, 0);
+    var yp = agnosai_python_execute_script(py, _t_net_py_connect(), str_from(""), &err);
+    if (yp == 0) { return assert(0, "python runs"); }
+    assert(agnosai_python_result_exit_code(yp) != 0, "a tool's python cannot connect");
+    assert(str_index_of_cstr(agnosai_python_result_stderr(yp), "PermissionError") >= 0,
+      "and says why in its traceback");
+    var bind = agnosai_python_execute_script(py, str_from(
+        "import socket\nsocket.socket().bind(('127.0.0.1', 0))\nprint('bound')\n"), str_from(""), &err);
+    if (bind != 0) {
+        assert(str_index_of_cstr(agnosai_python_result_stderr(bind), "PermissionError") >= 0,
+          "nor bind a TCP port: landlock's bind right");
+    }
+    var unix = agnosai_python_execute_script(py, str_from(
+        "import socket\nsocket.socket(socket.AF_UNIX).close()\nprint('unix')\n"), str_from(""), &err);
+    if (unix != 0) {
+        assert(str_eq_cstr(str_trim(agnosai_python_result_stdout(unix)), "unix") == 1,
+          "and keeps unix sockets, which are the host's own");
+    }
+    assert_eq(agnosai_python_sandbox_with_network(py, 1), py, "a sandbox allows it, and returns itself");
+    var yk = agnosai_python_execute_script(py, _t_net_py_connect(), str_from(""), &err);
+    if (yk != 0) {
+        assert(str_eq_cstr(str_trim(agnosai_python_result_stdout(yk)), "connected") == 1,
+          "and its python connects");
+    }
+    agnosai_python_sandbox_with_network(py, 0 - 1);
+    assert_eq(agnosai_python_sandbox_network(py), 0, "anything but 1 is a no");
+
+    # A Python tool, on the loop's path.
+    var tsb = str_builder_new();
+    str_builder_add_cstr(tsb, "import socket\nclass T:\n    def execute(self, p):\n");
+    str_builder_add_cstr(tsb, "        socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n");
+    str_builder_add_cstr(tsb, "        return {'ok': 1}\ndef create_tool():\n    return T()\n");
+    var tool = agnosai_python_tool(str_from("net"), str_from("d"), vec_new(), str_builder_build(tsb),
+      agnosai_python_sandbox_new());
+    var out = agnosai_tool_execute(tool, agnosai_tool_input_new());
+    assert_eq(agnosai_tool_output_success(out), 0, "a python tool opening a UDP socket fails");
+    return 0;
+}
+
+# `landlock_create_ruleset` answers ENOSYS under this filter, as on a kernel without landlock.
+var _T_NOLL_FILTER[64];
+
+fn _t_net_hide_landlock(): i64 {
+    var f = &_T_NOLL_FILTER;
+    var p = _seccomp_prologue_len();
+    var allow = p + 1;
+    var nosys = p + 2;
+    var kill = p + 3;
+    _seccomp_write_prologue(f, kill);
+    security_bpf_write_insn(f, p * 8, BPF_JMP_JEQ_K, nosys - p - 1, 0, 444);
+    security_bpf_write_insn(f, allow * 8, BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW);
+    security_bpf_write_insn(f, nosys * 8, BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO | ENOSYS);
+    security_bpf_write_insn(f, kill * 8, BPF_RET_K, 0, 0, SECCOMP_RET_KILL_PROCESS);
+    return is_ok(security_load_seccomp(f, (kill + 1) * 8));
+}
+
+# A kernel before landlock ABI 4, measured on this one: a child of the suite hides landlock
+# behind a seccomp filter, builds the default afresh, and reports in its exit code. Seccomp
+# can only refuse, so this is ABI 0, not 1 to 3; the network is the same on all four, as
+# kavach applies its rules only from 4.
+fn test_network_old_kernel(): i64 {
+    if (_T_NET_PORT == 0 || sys_access("/bin/bash", 1) != 0) {
+        println("  skip: no listener or no bash for the old-kernel case");
+        return 0;
+    }
+    var pid = sys_fork();
+    if (pid == 0) {
+        if (_t_net_hide_landlock() == 0) { syscall(SYS_EXIT_GROUP, 64); }
+        var code = 0;
+        if (security_landlock_abi_version() != 0) { code = code | 1; }
+        _AGNOSAI_CONFINE_DEFAULT = 0;
+        _tl_start(SK_WARN);
+        var c = agnosai_confinement_default();
+        _tl_stop();
+        if (c == 0) { syscall(SYS_EXIT_GROUP, 65); }
+        if (agnosai_confinement_denies_network(c) != 0) { code = code | 2; }
+        if (_tl_line("no network rights") == 0) { code = code | 4; }
+        if (_tl_line("has no landlock") == 0) { code = code | 8; }
+        var sp = _t_net_run(c, _t_net_tcp(), 0, 0);
+        if (agnosai_spawn_status(sp) != AGNOSAI_SPAWN_OK) { code = code | 16; }
+        if (_t_net_connected(sp) == 0) { code = code | 32; }
+        syscall(SYS_EXIT_GROUP, code);
+    }
+    var st[8];
+    store64(&st, 0);
+    sys_waitpid(pid, &st, 0);
+    var raw = load64(&st);
+    var code = (raw >> 8) & 255;
+    assert_eq(raw & 127, 0, "the old-kernel child exits rather than dying");
+    assert(code != 64, "and could hide landlock behind a seccomp filter");
+    assert(code != 65, "and still build a confinement, as seccomp does not need landlock");
+    assert_eq(code & 1, 0, "landlock reads as absent there");
+    assert_eq(code & 2, 0, "so the confinement says it cannot take the network away");
+    assert_eq(code & 4, 0, "and the default warns that a denied tool keeps it");
+    assert_eq(code & 8, 0, "beside the warning that it has no filesystem rules either");
+    assert_eq(code & 16, 0, "a denied child still runs, as nothing refuses it");
+    assert_eq(code & 32, 0, "and connects: on such a kernel the network is not held");
+    return 0;
+}
+
 # --- concurrency: nothing shared between two confined calls ----------------
 
 var _t_mismatch = 0;
@@ -521,13 +812,22 @@ fn main(): i64 {
     if (_t_setup() == 0) { return assert(0, "a working directory to test from"); }
     # Before anything builds the default, as `agnosai_confinement_allow` asks.
     assert_eq(agnosai_confinement_allow(str_from(_T_ALLOWED), 0), 0, "a path given at start-up");
+    _tl_start(SK_WARN);
     var cf = agnosai_confinement_default();
+    _tl_stop();
     if (cf == 0) { return assert(0, "this host can build kavach's seccomp filter"); }
     _T_LANDLOCK = agnosai_confinement_landlock_abi(cf);
+    _T_NET_DENIES = 0;
+    if (security_landlock_abi_version() >= 4) { _T_NET_DENIES = 1; }
+    if (_T_NET_DENIES == 1) {
+        _tl_never("no network rights", "a kernel with landlock ABI 4 builds the default with no network warning");
+    } else {
+        _tl_saw("no network rights", "a kernel before landlock ABI 4 warns that a denied tool keeps the network");
+    }
     assert(agnosai_confinement_rule_count(cf) >= 6, "the base rules, as far as this host has them");
-    assert_eq(SandboxPolicy_network_enabled(load64(cf + AGN_CF_POLICY)), 1,
-      "the policy says the network is on, as applied: a kavach enforcing basic()'s 0 would cut tools off");
     assert_eq(SandboxPolicy_seccomp_enabled(load64(cf + AGN_CF_POLICY)), 1, "and seccomp on");
+    assert_eq(SandboxPolicy_seccomp_enabled(load64(cf + AGN_CF_POLICY_NONET)), 1,
+      "in both of its policies");
     test_files();
     test_process();
     test_failure();
@@ -535,6 +835,9 @@ fn main(): i64 {
     test_tiers();
     test_allocator_forms();
     test_resolve();
+    test_network();
+    # Before any thread, as it forks.
+    test_network_old_kernel();
     # Before the threads: `alloc_used` counts every thread's allocations.
     test_cost();
     test_concurrent();

@@ -84,7 +84,8 @@ enum AgnosaiProcCfgOff {
     AGN_PRC_ENV = 32;
     AGN_PRC_CLEAN_ENV = 40;
     AGN_PRC_CONFINE = 48;
-    AGN_PRC_SIZE = 56;
+    AGN_PRC_NETWORK = 56;
+    AGN_PRC_SIZE = 64;
 }
 
 # The oracle's `Default` — `/bin/sh -c`, 30 s, inherit everything.
@@ -103,6 +104,23 @@ fn agnosai_process_config_default(): i64 {
     store64(c + AGN_PRC_CLEAN_ENV, 0);
     # Confined by default since 2.3.4 (ADR 031). The oracle had no confinement at all.
     store64(c + AGN_PRC_CONFINE, AGNOSAI_CONFINEMENT_DEFAULT);
+    # And with no network since 2.3.8, as `SandboxPolicy::process()` says.
+    store64(c + AGN_PRC_NETWORK, 0);
+    return c;
+}
+
+# Whether a confined child keeps the network: 0, the default, or 1.
+fn agnosai_process_config_network(c): i64 { return load64(c + AGN_PRC_NETWORK); }
+
+# Let a confined child keep the network with 1, or take it away with 0 (2.3.8). Anything
+# but 1 takes it away. An unconfined child keeps it either way. Returns the config.
+#
+# ⚠ **0 holds only where the kernel has landlock ABI 4** (Linux 6.7): before it, the child
+# keeps the network and the server warns once (`agnosai_confinement_denies_network`).
+fn agnosai_process_config_set_network(c, allow): i64 {
+    var v = 0;
+    if (allow == 1) { v = 1; }
+    store64(c + AGN_PRC_NETWORK, v);
     return c;
 }
 
@@ -432,8 +450,8 @@ fn agnosai_process_execute_argv_a(a, c, argv, input: Str, out_err): i64 {
     if (load64(c + AGN_PRC_WORK_DIR) != 0) {
         wd = str_data(str_clone_a(a, load64(c + AGN_PRC_WORK_DIR)));
     }
-    var sp = agnosai_spawn_capture_confined_a(a, load64(raw), raw, _agnosai_process_envp_a(a, c),
-      input, load64(c + AGN_PRC_TIMEOUT_MS), wd, cf);
+    var sp = agnosai_spawn_capture_confined_net_a(a, load64(raw), raw, _agnosai_process_envp_a(a, c),
+      input, load64(c + AGN_PRC_TIMEOUT_MS), wd, cf, load64(c + AGN_PRC_NETWORK));
     return _agnosai_process_finish_a(a, sp, exe, out_err);
 }
 
@@ -468,7 +486,8 @@ fn agnosai_process_execute(c, command: Str, input: Str, out_err): i64 {
     var ok: i64[1];
     var cf = agnosai_confinement_resolve(load64(c + AGN_PRC_CONFINE), &ok);
     if (load64(&ok) == 0) { return _agnosai_process_unconfinable(exe, out_err); }
-    var sp = agnosai_spawn_capture_confined(str_cstr(exe), raw, _agnosai_process_envp(c), input,
-      load64(c + AGN_PRC_TIMEOUT_MS), _agnosai_process_work_dir_cstr(c), cf);
+    var sp = agnosai_spawn_capture_confined_net_a(default_alloc(), str_cstr(exe), raw,
+      _agnosai_process_envp(c), input, load64(c + AGN_PRC_TIMEOUT_MS),
+      _agnosai_process_work_dir_cstr(c), cf, load64(c + AGN_PRC_NETWORK));
     return _agnosai_process_finish(sp, exe, out_err);
 }
