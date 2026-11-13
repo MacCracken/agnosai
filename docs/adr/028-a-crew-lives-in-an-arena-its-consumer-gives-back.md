@@ -69,6 +69,8 @@ agnosai_event_bus_recycle(bus, sub);
 - **What outlives a crew stays off its arena.** The audit chain keeps its entries' metadata, and a JSON string
   holds its `Str` by pointer, so that metadata is on the global heap and owns copies. Built only when there is a
   chain. A span's fields are encoded when it is queued, and nothing keeps them.
+  **2.5.2 note** ([ADR 038](038-an-audit-entry-lives-in-its-ring-slot.md)): the chain copies an entry's metadata into
+  its ring slot, so a caller builds it in a scratch it gives back, and nothing of it stays on the global heap.
 - **`release_crew` waits out the run's last instructions, and takes the crew out after them.** A run drops its
   flag under the registry lock and then still has its event channel to remove, with the crew's id in hand.
   `AGN_CREW_RUNS` falls as the run's last touch of the crew, and `release_crew` reads the flag and the count under
@@ -105,6 +107,8 @@ agnosai_event_bus_recycle(bus, sub);
   - **agnostic, about 1.7 KiB per crew.** Its ledger entry and what it clones. Owned by agnostic, which also
     has to adopt this: it builds specs with `agnosai_crew_new` today, so none of this reaches it until it does.
   - **The audit chain**, for a consumer with one: entries, and the run's scratch. A log, and off in agnostic.
+    **2.5.2 note** ([ADR 038](038-an-audit-entry-lives-in-its-ring-slot.md)): an entry lives in a ring slot the chain
+    resets when the ring takes it again, and the run's scratch is gone: a full chain costs its ring and nothing more.
   - **Telemetry**, with the exporter on: a span per task and per call, on the global heap.
   - **The binary's REST path.** A crew from `POST /api/v1/crews` is on the global heap, and stays. A route
     reads a registry entry with no hold on it, so eviction cannot release under it. That needs a reader count.

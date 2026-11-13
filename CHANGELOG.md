@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.2] — 2026-11-13
+
+The audit chain gives back what it lets go: each entry lives in a slot of its ring, which the chain reuses when the
+entry leaves it ([ADR 038](docs/adr/038-an-audit-entry-lives-in-its-ring-slot.md)).
+
+### ⚠ Behaviour changes
+
+- **`agnosai_audit_chain_recent` hands back copies** of the entries, taken under the chain's lock, where it handed out
+  the chain's own. An entry now lives in a ring slot that the next record past the cap resets, from whatever thread
+  records it. A copy reads the same; an edit to one cannot reach the chain, as it could not through the vec before.
+- **The entry `agnosai_audit_record` returns is valid until the ring takes its slot again**, `max_entries` records
+  later. Through 2.5.1 it was valid for good, as nothing was given back. No caller in the tree keeps one.
+- **An entry keeps a copy of its metadata**, where it kept the caller's tree, so a caller builds it wherever it likes
+  and an edit to the caller's tree after recording no longer reaches the entry. `agnosai_audit_entry_metadata` reads
+  the copy.
+
+### Added
+
+- `agnosai_audit_chain_recent_a(a, c, n)`, the copies in `a`.
+- `agnosai_audit_scratch_acquire` and `agnosai_audit_scratch_release`: a scratch from the chain module's pool, to build
+  an entry's metadata in and record it through.
+
+### Changed
+
+- **The chain is a ring of slot arenas** (`AGNOSAI_AUDIT_SLOT_BYTES`, 1,024 B): an entry, its id, strings, link,
+  signature and metadata copy are built in its slot, and past the cap a record resets the oldest's slot and moves the
+  head, where it removed the vec's first element and shifted the rest. The hash and the signature are built in a
+  scratch: the caller's for `agnosai_audit_record_a`, a pooled one for `agnosai_audit_record` and
+  `agnosai_audit_verify`. The hash chain, the signature and what `verify` checks are unchanged.
+- The orchestrator, the crew runner and the tool loop build an entry's metadata in a pooled scratch and give it back,
+  where they built it on the global heap, owning its strings. The crew runner's per-run audit scratch is gone, so a
+  parallel or DAG crew no longer hashes on the global heap.
+- `agnosai_audit_chain_with_key` keeps 1 entry for a `max_entries` below 1.
+
+### Fixed
+
+- **The server's audit chain kept 6,360 B a crew for good**: each entry the ring let go kept its memory, with the
+  metadata its caller built and, for the orchestrator's own records, the hashing. With the server's chain on, the REST
+  loop in `tests/orch_crew_arena.tcyr` reads 0 B a crew, and so does an A2A delegation.
+- **A verify left a hash tree and a signature on the global heap for every entry it read**; it reads through a pooled
+  scratch, reset per entry.
+- **A reviewer's decision kept 16 B for good in each of its event and its audit entry**:
+  `agnosai_approval_decision_to_wire` minted its spelling on the global heap per call. The two spellings are made once,
+  and shared.
+- The crew log's arena pool is built at module scope, as `src/arena_pool.cyr` requires, where it was built on first
+  use: a wave's first two workers could each build one, and the loser's four arenas stayed for good.
+
+### Performance
+
+- **What the server keeps for a crew with its chain on**: `benches/rest_crews.bcyr`'s new `_chain_on` rows post the
+  two-task crew with the orchestrator's own 10,000-entry chain, after enough posts to fill the ring and wrap it once:
+  **2.5.1 kept 9,480 B a crew for good, 2.5.2 keeps 0**. 2.5.1's 6,360, the roadmap's number, was measured before
+  its ring filled; past it, each record also re-hashed the entry it let go on the global heap. A full chain holds
+  11,888,696 B, 1,188 B a slot.
+- **What that costs, in time**, interleaved against a 2.5.1 build on the same `lib/`, three rounds of `orch`, `server`,
+  `rest_crews`, `manager` and `handoff` at a mean load of 2.45: `audit_record` 26.9 → 16.7 µs (−38%), as eviction
+  moves the head where it shifted 10,000 pointers; `audit_verify_256` 2.52 → 2.29 ms (−9%);
+  `rest_post_crew_2_tasks_chain_on` 400 → 334 µs (−17%); the orchestrator's crews, whose chain is on,
+  `run_crew_1_task_sequential` 98.3 → 85.8 µs (−13%), `run_crew_then_release` −13%, `run_crew_then_forget` −12%,
+  `run_crew_at_registry_cap` −10%, `run_crew_10_tasks_sequential` −8%. Median +0.4% across 145 rows, 122 within 5%.
+- ⚠ **Two parallel rows read +53% and +63% in that A/B**, `run_crew_10_tasks_parallel_4` and
+  `crew_runner_10_tasks_parallel_4_watched`, and are not this release's: the second runs no chain at all. Run alone,
+  interleaved three times, they read the same on both trees (727–757 µs against 721–755, and 684–748 against 683–724):
+  in the full file 2.5.1 read them at 440 and 397 µs, where they sat for it, which is the row-position effect roadmap
+  2.7.1 is for.
+
 ## [2.5.1] — 2026-11-13
 
 The server's own crews live in arenas its orchestrator gives back, and every route that reads one holds it

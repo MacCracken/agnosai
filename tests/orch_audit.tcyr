@@ -87,68 +87,207 @@ fn _t_zero_passes_through(): i64 {
     return 0;
 }
 
-# **The hashing garbage goes in the caller's scratch, not on the global bump.**
+# **A chain past its cap records for nothing on the global heap (2.5.2).**
 #
-# `_agnosai_audit_entry_hash` builds a whole JSON tree and serialises it purely
-# to feed the digest, then discards both — twice per record once the chain is at
-# capacity. That was ~4.6 KB per task and the largest consumer in a crew run.
+# Through 2.5.1 every entry an eviction let go kept its memory — the entry, its
+# cloned strings, the hash and the signature, and the caller's metadata — and the
+# hashing garbage was the caller's to put somewhere. Since 2.5.2 each entry lives
+# in its ring slot's arena, which the slot resets when the ring takes it again,
+# and what the hash and the signature build goes in a scratch: the caller's for
+# `agnosai_audit_record_a`, a pooled one for `agnosai_audit_record`.
 #
-# This measures it directly: record through a growable scratch and assert the
-# global bump barely moves. It cannot be exactly zero — the entry, its cloned
-# strings, the hash and the signature are all retained by design — so the
-# assertion is that the *transient* half moved, by comparing against the same
-# work on the global allocator.
+# So once the ring has wrapped and every slot has seen the largest entry, the
+# global heap does not move, through either form. **The bound is 0, which is
+# what makes it strict**: un-threading any allocation on this path — the temp
+# entry, its id, the hash tree, the serialise, the digest's hex, the sign
+# builder, the mac, an entry string cloned on the global heap rather than its
+# slot — moves it.
 fn _t_hashing_uses_the_scratch(): i64 {
-    var c1 = _t_chain(64);
-    var c2 = _t_chain(64);
+    var c1 = _t_chain(8);
+    var c2 = _t_chain(8);
     var sc = arena_allocator_growable(1024);
     var msg = str_from("a message of some length to make the hash input real");
+    var ev = str_from("ev");
+    var lv = str_from("info");
 
-    # warm both paths
-    agnosai_audit_record(c1, str_from("ev"), str_from("info"), msg, 0, 0, 0);
-    agnosai_audit_record_a(sc, c2, str_from("ev"), str_from("info"), msg, 0, 0, 0);
-    reset_via(sc);
-
-    var b1 = alloc_used();
-    for (var i = 0; i < 16; i = i + 1) {
-        agnosai_audit_record(c1, str_from("ev"), str_from("info"), msg, 0, 0, 0);
-    }
-    var per_global = (alloc_used() - b1) / 16;
-
-    var b2 = alloc_used();
-    for (var j = 0; j < 16; j = j + 1) {
-        agnosai_audit_record_a(sc, c2, str_from("ev"), str_from("info"), msg, 0, 0, 0);
+    # Wrap both rings twice, so every slot has held an entry and been reset.
+    for (var w = 0; w < 16; w = w + 1) {
+        agnosai_audit_record(c1, ev, lv, msg, 0, 0, 0);
+        agnosai_audit_record_a(sc, c2, ev, lv, msg, 0, 0, 0);
         reset_via(sc);
     }
-    var per_scratch = (alloc_used() - b2) / 16;
 
-    assert(per_global > 0, "recording on the global allocator costs something");
-    assert(per_scratch < per_global,
-      "recording through a scratch costs less — the hash tree and the sign \
-    builders move off the global bump");
+    var b1 = alloc_used();
+    for (var i = 0; i < 64; i = i + 1) {
+        agnosai_audit_record(c1, ev, lv, msg, 0, 0, 0);
+    }
+    assert_eq(alloc_used() - b1, 0,
+      "a full chain records on the global allocator for 0 B — the entry is its slot's, \
+    the hashing a pooled scratch's");
 
-    # **528 is calibrated, not chosen, and a ratio could not do this job.**
-    # Measured per record: baseline **496 B**; un-threading the 32-byte mac
-    # buffer **528**; the sign builder **584**; the hash object **672**; the
-    # serialise **1,144**. The global arm is 2,432 throughout, so all four still
-    # clear `scratch * 2 < global` and even `* 4` — a ratio threshold passes
-    # every one of them while looking strict.
-    #
-    # ⚠ **This bound has 32 bytes of headroom, deliberately, and that is all
-    # there is to have**: the smallest transient allocation on this path is the
-    # 32-byte mac buffer, so anything looser cannot see it. If you add a small
-    # *retained* allocation to an audit entry this will fail — that is the bound
-    # doing its job, and the fix is to re-measure and move the number, not to
-    # widen it into something that asserts nothing.
-    assert(per_scratch < 528,
-      "...and what remains is the retained half — the entry, its cloned strings, \
-    the hash and the signature. Un-threading any one of the three transient \
-    allocations shows up here and nowhere else");
+    var b2 = alloc_used();
+    for (var j = 0; j < 64; j = j + 1) {
+        agnosai_audit_record_a(sc, c2, ev, lv, msg, 0, 0, 0);
+        reset_via(sc);
+    }
+    assert_eq(alloc_used() - b2, 0,
+      "...and through a caller's scratch for 0 B, the hashing the caller's");
 
     # Both chains still verify: hashing must be byte-identical either way, or
     # every signature in the chain changes.
     assert(agnosai_audit_verify(c1) == 0, "the global-allocator chain verifies");
     assert(agnosai_audit_verify(c2) == 0, "and the scratch chain verifies too");
+
+    # And verifying is itself free: it walks the ring through a pooled scratch.
+    var b3 = alloc_used();
+    for (var k = 0; k < 16; k = k + 1) { agnosai_audit_verify(c2); }
+    assert_eq(alloc_used() - b3, 0, "verify costs the global heap nothing");
+    return 0;
+}
+
+# **The ring takes its slots again, and verifies across every wrap (2.5.2).**
+#
+# The chain is a ring of slot arenas: past its cap a record resets the oldest's slot, builds the new
+# entry there and moves the head. So the order `recent` reads is the head's, the anchor `verify`
+# starts from is the hash of the entry eviction let go, and a chain mints a slot only while it fills.
+fn _t_ev(i): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "e");
+    str_builder_add_int(sb, i);
+    return str_builder_build(sb);
+}
+
+fn _t_ring_reuses_its_slots(): i64 {
+    var c = _t_chain(3);
+    var first = agnosai_audit_record(c, _t_ev(0), str_from("info"), str_from("zero"), 0, 0, 0);
+    var copies = agnosai_audit_chain_recent(c, 1);
+    assert(vec_get(copies, 0) != first, "recent hands back a copy, not the ring's entry");
+
+    # 31 more: ten wraps of three and one over, so the head is not back at slot 0.
+    for (var i = 1; i <= 31; i = i + 1) {
+        agnosai_audit_record(c, _t_ev(i), str_from("info"), str_from("more"), 0, 0, 0);
+    }
+    assert_eq(agnosai_audit_chain_count(c), 3, "the ring holds its cap");
+    assert_eq(vec_len(load64(c + AGN_AC_SLOTS)), 3, "and minted a slot only while it filled");
+    assert_eq(load64(c + AGN_AC_HEAD), 32 % 3, "its head is where 32 records leave it");
+
+    var r = agnosai_audit_chain_recent(c, 3);
+    assert(str_eq_cstr(agnosai_audit_entry_event(vec_get(r, 0)), "e29") == 1, "oldest first, from the head");
+    assert(str_eq_cstr(agnosai_audit_entry_event(vec_get(r, 1)), "e30") == 1, "...then the next");
+    assert(str_eq_cstr(agnosai_audit_entry_event(vec_get(r, 2)), "e31") == 1, "...ending at the newest");
+    assert(str_eq(agnosai_audit_entry_previous_hash(vec_get(r, 1)),
+        agnosai_audit_entry_previous_hash(_agnosai_audit_at_locked(c, 1))) == 1,
+      "a copy carries the link the ring's entry holds");
+
+    assert(str_eq_cstr(agnosai_audit_entry_event(vec_get(copies, 0)), "e0") == 1,
+      "a copy outlives the slot it was taken from");
+    assert(str_eq_cstr(agnosai_audit_entry_event(first), "e30") == 1,
+      "where the entry record returned is the slot's, and reads the one that took it last");
+
+    # The anchor is the evicted entry's hash, which the oldest survivor links to.
+    assert(str_eq(agnosai_audit_entry_previous_hash(_agnosai_audit_at_locked(c, 0)),
+        load64(c + AGN_AC_FIRST_VALID_HASH)) == 1,
+      "the oldest survivor links to the anchor eviction carried forward");
+    assert_eq(agnosai_audit_verify(c), 0, "so the chain verifies after ten wraps");
+
+    # The oldest survivor is entry 0 to verify, wherever the head has it in the ring.
+    store64(_agnosai_audit_at_locked(c, 0) + AGN_AE_MESSAGE, str_from("rewritten"));
+    var bad = agnosai_audit_verify(c);
+    assert(bad != 0, "editing the oldest survivor breaks verification");
+    assert(str_contains(bad, str_from("Entry 0")) == 1, "and verify names it entry 0, in the ring's order");
+
+    # A cap below 1 keeps 1: every record takes the one slot.
+    var one = _t_chain(0);
+    for (var j = 0; j < 5; j = j + 1) {
+        agnosai_audit_record(one, _t_ev(j), str_from("info"), str_from("only"), 0, 0, 0);
+    }
+    assert_eq(agnosai_audit_chain_count(one), 1, "a cap of 0 keeps one entry");
+    assert(str_eq_cstr(agnosai_audit_entry_event(vec_get(agnosai_audit_chain_recent(one, 9), 0)), "e4") == 1,
+      "the newest");
+    assert_eq(agnosai_audit_verify(one), 0, "and it verifies");
+    return 0;
+}
+
+# **Many recorders, one small ring, and a reader (2.5.2).**
+#
+# A slot is reset by whichever thread's record takes it, and the hashing scratch is the pool's, so
+# this is the shape a parallel crew's tasks give the server's chain: recorders building metadata in
+# a pooled scratch as the callers do, and a reader taking copies while they wrap the ring. A slot
+# reset outside the lock, a scratch two threads shared, or a copy taken unlocked would show here as a
+# chain that no longer verifies, or a copy with a stranger's bytes.
+var _T_AW_CHAIN = 0;
+var _T_AW_ROUNDS = 300;
+
+enum _TAuditJob {
+    _T_AJ_ID = 0;
+    _T_AJ_BAD = 8;
+    _T_AJ_DONE = 16;
+    _T_AJ_SIZE = 24;
+}
+
+fn _t_audit_writer(job): i64 {
+    var id = load64(job + _T_AJ_ID);
+    for (var i = 0; i < _T_AW_ROUNDS; i = i + 1) {
+        var s = agnosai_audit_scratch_acquire();
+        var md = bayan_json_v_obj_new_a(s);
+        bayan_json_v_obj_set_a(s, md, str_from_a(s, "writer"), bayan_json_v_int_new_a(s, id));
+        bayan_json_v_obj_set_a(s, md, str_from_a(s, "round"), bayan_json_v_int_new_a(s, i));
+        agnosai_audit_record_a(s, _T_AW_CHAIN, str_from_a(s, "written"), str_from_a(s, "info"),
+          str_from_a(s, "a writer's entry"), 0, 0, md);
+        agnosai_audit_scratch_release(s);
+    }
+    atomic_store(job + _T_AJ_DONE, 1);
+    return 0;
+}
+
+# Reads copies until every writer is done; a copy must be one whole entry a writer wrote.
+fn _t_audit_reader(job): i64 {
+    var a = arena_allocator_growable(4096);
+    var bad = 0;
+    while (atomic_load(job + _T_AJ_DONE) == 0) {
+        var r = agnosai_audit_chain_recent_a(a, _T_AW_CHAIN, 8);
+        for (var i = 0; i < vec_len(r); i = i + 1) {
+            var e = vec_get(r, i);
+            if (str_eq_cstr(agnosai_audit_entry_event(e), "written") != 1) { bad = bad + 1; }
+            if (str_eq_cstr(agnosai_audit_entry_message(e), "a writer's entry") != 1) { bad = bad + 1; }
+            var w = bayan_json_v_obj_get_by_cstr(agnosai_audit_entry_metadata(e), "writer");
+            if (w == 0) { bad = bad + 1; }
+            elif (bayan_json_v_int(w) < 1 || bayan_json_v_int(w) > 4) { bad = bad + 1; }
+            if (str_len(agnosai_audit_entry_signature(e)) != 64) { bad = bad + 1; }
+        }
+        reset_via(a);
+    }
+    store64(job + _T_AJ_BAD, bad);
+    atomic_store(job + _T_AJ_ID, 1);
+    return 0;
+}
+
+fn _t_concurrent_recorders(): i64 {
+    _T_AW_CHAIN = _t_chain(16);
+    var jobs = vec_new();
+    for (var w = 1; w <= 4; w = w + 1) {
+        var job = alloc(_T_AJ_SIZE);
+        store64(job + _T_AJ_ID, w);
+        store64(job + _T_AJ_BAD, 0);
+        store64(job + _T_AJ_DONE, 0);
+        vec_push(jobs, job);
+        assert(thread_create_detached(&_t_audit_writer, job) != 0, "a recorder starts");
+    }
+    var rj = alloc(_T_AJ_SIZE);
+    store64(rj + _T_AJ_ID, 0);
+    store64(rj + _T_AJ_BAD, 0);
+    store64(rj + _T_AJ_DONE, 0);
+    assert(thread_create_detached(&_t_audit_reader, rj) != 0, "a reader starts");
+    for (var k = 0; k < 4; k = k + 1) {
+        while (atomic_load(vec_get(jobs, k) + _T_AJ_DONE) == 0) { sys_sched_yield(); }
+    }
+    atomic_store(rj + _T_AJ_DONE, 1);
+    while (atomic_load(rj + _T_AJ_ID) == 0) { sys_sched_yield(); }
+
+    assert_eq(load64(rj + _T_AJ_BAD), 0, "every copy the reader took is one whole entry, whatever the writers did");
+    assert_eq(agnosai_audit_chain_count(_T_AW_CHAIN), 16, "four recorders wrap a ring of 16 and it holds 16");
+    assert_eq(vec_len(load64(_T_AW_CHAIN + AGN_AC_SLOTS)), 16, "in its 16 slots");
+    assert_eq(agnosai_audit_verify(_T_AW_CHAIN), 0, "and the chain they wrote verifies");
     return 0;
 }
 
@@ -176,6 +315,8 @@ fn main() {
 
     _t_entry_owns_its_strings();
     _t_hashing_uses_the_scratch();
+    _t_ring_reuses_its_slots();
+    _t_concurrent_recorders();
     _t_signature_fits_the_inline_buffer();
     _t_zero_passes_through();
 
@@ -326,9 +467,16 @@ fn main() {
     var me = agnosai_audit_record(m, str_from("crew_finished"), str_from("info"),
       str_from("done"), 0, 0, meta);
     assert_eq(agnosai_audit_verify(m), 0, "an entry with metadata verifies");
-    assert_eq(agnosai_audit_entry_metadata(me), meta, "and carries it");
+    var mine = agnosai_audit_entry_metadata(me);
+    assert(mine != meta, "and carries its own copy, in its slot, not the caller's value");
+    assert(str_eq(bayan_json_v_build(mine), bayan_json_v_build(meta)) == 1,
+      "a copy that renders the same");
 
+    # The caller's value is the caller's: editing it after recording changes nothing.
     bayan_json_v_obj_set(meta, str_from("status"), bayan_json_v_str_new(str_from("failed")));
+    assert_eq(agnosai_audit_verify(m), 0, "editing the CALLER's metadata leaves the chain intact");
+
+    bayan_json_v_obj_set(mine, str_from("status"), bayan_json_v_str_new(str_from("failed")));
     assert(agnosai_audit_verify(m) != 0,
       "editing the METADATA breaks verification — which is the whole reason this chain exists \
     rather than hoosh's, whose audit_record has no metadata slot at all");

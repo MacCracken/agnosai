@@ -1203,6 +1203,59 @@ fn _t_rest_suite(): i64 {
     return 0;
 }
 
+# ── the server's chain on (2.5.2, ADR 038) ─────────────────────────────────
+
+# The same loop with the orchestrator's own audit chain, as the binary mints it: every crew records
+# its acceptance and its end. Through 2.5.1 each entry the ring let go kept its memory, 6,360 B
+# a crew; since 2.5.2 an entry lives in its ring slot's arena, reset when the ring takes the slot again.
+#
+# The ring is the binary's code with a smaller cap, so the loop wraps it in a test's time: the cap is
+# read when the chain is made, so it is set around `agnosai_orchestrator_new` and put back after.
+var _T_CHAIN_CAP = 96;
+
+fn _t_rest_chain_suite(): i64 {
+    var cap = AGNOSAI_MAX_RETAINED_CREWS;
+    var low = AGNOSAI_CREWS_LOW_WATER;
+    var entries = AGNOSAI_AUDIT_MAX_ENTRIES;
+    AGNOSAI_MAX_RETAINED_CREWS = 8;
+    AGNOSAI_CREWS_LOW_WATER = 4;
+    AGNOSAI_AUDIT_MAX_ENTRIES = _T_CHAIN_CAP;
+    var bus = agnosai_event_bus_new();
+    var o = agnosai_orchestrator_new(_t_budget());
+    AGNOSAI_AUDIT_MAX_ENTRIES = entries;
+    agnosai_orchestrator_with_events(o, bus);
+    var chain = agnosai_orchestrator_audit(o);
+    assert(chain != 0, "the orchestrator mints its own chain, as the binary's does");
+    var state = _t_rest_state(o);
+    var ra = arena_allocator_growable(65536);
+    var body = _t_rest_body();
+
+    # --- the measurement the roadmap asked for ---
+    assert_eq(_t_rest_growth(state, ra, body, 200), 0,
+      "with the server's chain on, a crew posted, read, snapshotted and listed leaves nothing once evicted");
+    assert_eq(agnosai_audit_chain_count(chain), _T_CHAIN_CAP, "the ring is full, and has let entries go");
+    assert_eq(agnosai_audit_verify(chain), 0, "and what it holds verifies, past many wraps");
+
+    var newest = vec_get(agnosai_audit_chain_recent(chain, 1), 0);
+    assert(str_eq(agnosai_audit_entry_event(newest), str_from("crew_finished")) == 1,
+      "the newest entry is the last crew's end");
+
+    var a2a = str_from("{\"task_id\":\"t-1\",\"description\":\"look into it\",\"domain\":\"qa\"}");
+    for (var w = 0; w < _T_REST_WARM; w = w + 1) { _t_a2a_cycle(state, ra, a2a); }
+    var before = alloc_used();
+    var bad = 0;
+    for (var i = 0; i < 200; i = i + 1) {
+        if (_t_a2a_cycle(state, ra, a2a) == 0) { bad = bad + 1; }
+    }
+    assert_eq(bad, 0, "every A2A delegation answers");
+    assert_eq(alloc_used() - before, 0, "and with the chain on, its crew, evicted, leaves nothing");
+    assert_eq(agnosai_audit_verify(chain), 0, "and the chain still verifies");
+
+    AGNOSAI_MAX_RETAINED_CREWS = cap;
+    AGNOSAI_CREWS_LOW_WATER = low;
+    return 0;
+}
+
 # An answer is a copy, so it says the same once its crew has gone back: each route's body, rendered
 # before its crew is evicted and given back and again after, is the same text.
 fn _t_answers_outlive_their_crews(state, ra, body, a2a): i64 {
@@ -1246,6 +1299,7 @@ fn main() {
     _t_copy_suite();
     _t_holds_suite();
     _t_rest_suite();
+    _t_rest_chain_suite();
     return assert_summary();
 }
 

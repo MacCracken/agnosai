@@ -585,18 +585,25 @@ fn _agnosai_orch_advance(o, crew_id: Str, from, to): i64 {
     return moved;
 }
 
-# Record one of the orchestrator's three audit events.
-fn _agnosai_orch_audit(o, event: Str, level: Str, message: Str, metadata): i64 {
+# Record one of the orchestrator's audit events through `s`, a scratch from
+# `agnosai_audit_scratch_acquire` the metadata was built in, which the caller gives back (2.5.2):
+# the entry keeps copies, so nothing a record is handed stays on the global heap.
+fn _agnosai_orch_audit_a(o, s, event: Str, level: Str, message: Str, metadata): i64 {
     var chain = load64(o + AGN_OR_AUDIT);
     if (chain == 0) { return 0; }
-    return agnosai_audit_record(chain, event, level, message, 0, 0, metadata);
+    return agnosai_audit_record_a(s, chain, event, level, message, 0, 0, metadata);
 }
 
 # The audit level for a finished crew's status.
 fn _agnosai_orch_level_for(status): i64 {
-    if (status == AGNOSAI_CREW_FAILED) { return str_from("error"); }
-    if (status == AGNOSAI_CREW_CANCELLED) { return str_from("warn"); }
-    return str_from("info");
+    return _agnosai_orch_level_for_a(default_alloc(), status);
+}
+
+# `_agnosai_orch_level_for`, in `a`.
+fn _agnosai_orch_level_for_a(a, status): i64 {
+    if (status == AGNOSAI_CREW_FAILED) { return str_from_a(a, "error"); }
+    if (status == AGNOSAI_CREW_CANCELLED) { return str_from_a(a, "warn"); }
+    return str_from_a(a, "info");
 }
 
 # ── crews the orchestrator gives back itself (2.5.1, ADR 037) ──────────────
@@ -789,15 +796,15 @@ fn _agnosai_orch_register_with(o, spec, parent, rp): i64 {
     var a = agnosai_crew_alloc(spec);
     atomic_fetch_add(spec + AGN_CREW_RUNS, 1);
 
-    # ⚠ **Built only for a chain, on the global heap, owning its strings.** The entry keeps
-    # this for as long as the chain keeps it, which outlives a crew in an arena.
+    # Built only for a chain, in a scratch of the chain's: the entry keeps its own copy (2.5.2), where
+    # through 2.5.1 this was built on the global heap, owning its strings, for good.
     if (load64(o + AGN_OR_AUDIT) != 0) {
-        var accepted = bayan_json_v_obj_new();
-        bayan_json_v_obj_set(accepted, str_from("crew_id"),
-          bayan_json_v_str_new(str_clone(crew_id)));
-        bayan_json_v_obj_set(accepted, str_from("task_count"),
-          bayan_json_v_int_new(vec_len(tasks)));
-        _agnosai_orch_audit(o, str_from("crew_accepted"), str_from("info"), crew_name, accepted);
+        var s = agnosai_audit_scratch_acquire();
+        var accepted = bayan_json_v_obj_new_a(s);
+        bayan_json_v_obj_set_a(s, accepted, str_from_a(s, "crew_id"), bayan_json_v_str_new_a(s, crew_id));
+        bayan_json_v_obj_set_a(s, accepted, str_from_a(s, "task_count"), bayan_json_v_int_new_a(s, vec_len(tasks)));
+        _agnosai_orch_audit_a(o, s, str_from_a(s, "crew_accepted"), str_from_a(s, "info"), crew_name, accepted);
+        agnosai_audit_scratch_release(s);
     }
 
     var runner = agnosai_crew_runner_new(spec);
@@ -944,12 +951,14 @@ fn _agnosai_orch_refused(o, spec, err): i64 {
         sakshi_log_kv(SK_WARN, "crew refused", 12, "reason", 6, str_data(why), str_len(why));
     }
     if (load64(o + AGN_OR_AUDIT) != 0) {
-        var md = bayan_json_v_obj_new();
-        bayan_json_v_obj_set(md, str_from("crew_id"), bayan_json_v_str_new(str_clone(agnosai_crew_id(spec))));
-        bayan_json_v_obj_set(md, str_from("reason"), bayan_json_v_str_new(str_clone(why)));
+        var s = agnosai_audit_scratch_acquire();
+        var md = bayan_json_v_obj_new_a(s);
+        bayan_json_v_obj_set_a(s, md, str_from_a(s, "crew_id"), bayan_json_v_str_new_a(s, agnosai_crew_id(spec)));
+        bayan_json_v_obj_set_a(s, md, str_from_a(s, "reason"), bayan_json_v_str_new_a(s, why));
         var tenant = agnosai_crew_tenant(spec);
-        if (tenant != 0) { bayan_json_v_obj_set(md, str_from("tenant"), bayan_json_v_str_new(str_clone(tenant))); }
-        _agnosai_orch_audit(o, str_from("crew_refused"), str_from("warn"), str_clone(agnosai_crew_name(spec)), md);
+        if (tenant != 0) { bayan_json_v_obj_set_a(s, md, str_from_a(s, "tenant"), bayan_json_v_str_new_a(s, tenant)); }
+        _agnosai_orch_audit_a(o, s, str_from_a(s, "crew_refused"), str_from_a(s, "warn"), agnosai_crew_name(spec), md);
+        agnosai_audit_scratch_release(s);
     }
     return 0;
 }
@@ -1077,18 +1086,24 @@ fn _agnosai_orch_audit_finished(o, crew_id: Str, crew_name: Str, state): i64 {
         wall_ms = agnosai_crew_profile_wall_ms(profile);
         cost = agnosai_crew_profile_cost_micro_usd(profile);
     }
-    var finished = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(finished, str_from("crew_id"), bayan_json_v_str_new(str_clone(crew_id)));
-    bayan_json_v_obj_set(finished, str_from("status"),
-      bayan_json_v_str_new(agnosai_crew_status_to_wire(status)));
+    # In a scratch of the chain's, which the entry copies from (2.5.2).
+    var s = agnosai_audit_scratch_acquire();
+    var finished = bayan_json_v_obj_new_a(s);
+    bayan_json_v_obj_set_a(s, finished, str_from_a(s, "crew_id"), bayan_json_v_str_new_a(s, crew_id));
+    bayan_json_v_obj_set_a(s, finished, str_from_a(s, "status"),
+      bayan_json_v_str_new_a(s, agnosai_crew_status_to_wire(status)));
     var reason = agnosai_crew_state_reason(state);
-    if (reason != 0) { bayan_json_v_obj_set(finished, str_from("reason"), bayan_json_v_str_new(reason)); }
-    bayan_json_v_obj_set(finished, str_from("task_count"),
-      bayan_json_v_int_new(vec_len(agnosai_crew_state_results(state))));
-    bayan_json_v_obj_set(finished, str_from("wall_ms"), bayan_json_v_int_new(wall_ms));
-    bayan_json_v_obj_set(finished, str_from("cost_micro_usd"), bayan_json_v_int_new(cost));
-    return _agnosai_orch_audit(o, str_from("crew_finished"), _agnosai_orch_level_for(status),
+    if (reason != 0) {
+        bayan_json_v_obj_set_a(s, finished, str_from_a(s, "reason"), bayan_json_v_str_new_a(s, reason));
+    }
+    bayan_json_v_obj_set_a(s, finished, str_from_a(s, "task_count"),
+      bayan_json_v_int_new_a(s, vec_len(agnosai_crew_state_results(state))));
+    bayan_json_v_obj_set_a(s, finished, str_from_a(s, "wall_ms"), bayan_json_v_int_new_a(s, wall_ms));
+    bayan_json_v_obj_set_a(s, finished, str_from_a(s, "cost_micro_usd"), bayan_json_v_int_new_a(s, cost));
+    var e = _agnosai_orch_audit_a(o, s, str_from_a(s, "crew_finished"), _agnosai_orch_level_for_a(s, status),
       crew_name, finished);
+    agnosai_audit_scratch_release(s);
+    return e;
 }
 
 fn _agnosai_orch_finish(o, runner, crew_id: Str, crew_name: Str): i64 {
@@ -1536,10 +1551,12 @@ fn agnosai_orchestrator_cancel_crew(o, crew_id: Str): i64 {
     if (flag != 0) { agnosai_semaphore_wake_waiters(load64(o + AGN_OR_CREW_SEM)); }
 
     if (load64(o + AGN_OR_AUDIT) != 0) {
-        var md = bayan_json_v_obj_new();
-        bayan_json_v_obj_set(md, str_from("crew_id"), bayan_json_v_str_new(str_clone(crew_id)));
-        _agnosai_orch_audit(o, str_from("crew_cancelled"), str_from("warn"),
-          str_from("crew cancelled by caller"), md);
+        var s = agnosai_audit_scratch_acquire();
+        var md = bayan_json_v_obj_new_a(s);
+        bayan_json_v_obj_set_a(s, md, str_from_a(s, "crew_id"), bayan_json_v_str_new_a(s, crew_id));
+        _agnosai_orch_audit_a(o, s, str_from_a(s, "crew_cancelled"), str_from_a(s, "warn"),
+          str_from_a(s, "crew cancelled by caller"), md);
+        agnosai_audit_scratch_release(s);
     }
     return 0;
 }

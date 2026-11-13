@@ -8,6 +8,10 @@
 # either tree; on 2.5.0 the crews stay on the global heap, and `rest_post_crew_2_tasks_kept_bytes`
 # says how many bytes each leaves there.
 #
+# The `_chain_on` rows (2.5.2, ADR 038) run the same post with the orchestrator's own audit chain, as
+# the binary mints it, 10,000 entries, after enough posts to fill the ring and wrap it once. They
+# also use only what 2.5.1 had; on 2.5.1 every entry the ring let go stayed on the global heap.
+#
 # Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
 # =========================================================================
 
@@ -48,10 +52,11 @@ fn _b_body(): i64 {
     return str_builder_build(sb);
 }
 
-fn _b_state(): i64 {
+# An app state over a fresh orchestrator, with its own audit chain when `chain` is 1.
+fn _b_state(chain): i64 {
     var bus = agnosai_event_bus_new();
     var o = agnosai_orchestrator_new(agnosai_resource_budget_default());
-    agnosai_orchestrator_with_audit(o, 0);
+    if (chain == 0) { agnosai_orchestrator_with_audit(o, 0); }
     agnosai_orchestrator_with_events(o, bus);
     return agnosai_app_state_new(o, agnosai_tool_registry_new(), agnosai_auth_config_new(), bus, 0,
       agnosai_orchestrator_approval_gate(o));
@@ -128,13 +133,55 @@ fn _b_kept_row(state, ra, body): i64 {
         _b_post(state, ra, body, ka);
         reset_via(ka);
     }
-    var kept = (alloc_used() - before) / n;
+    _b_kept_line(ka, "  rest_post_crew_2_tasks_kept_bytes: ", (alloc_used() - before) / n);
+    return 0;
+}
+
+fn _b_kept_line(ka, label, kept): i64 {
     var sb = str_builder_new_a(ka);
-    str_builder_add_cstr_a(ka, sb, "  rest_post_crew_2_tasks_kept_bytes: ");
+    str_builder_add_cstr_a(ka, sb, label);
     str_builder_add_int_a(ka, sb, kept);
     str_builder_add_cstr_a(ka, sb, " B a crew, for good\n");
     var line = str_builder_build_a(ka, sb);
     sys_write(1, str_data(line), str_len(line));
+    return 0;
+}
+
+# The chain on: fill its ring, wrap it once, then time posts and count what they keep.
+fn _b_chain_rows(ra, body): i64 {
+    var state = _b_state(1);
+    var chain = agnosai_orchestrator_audit(agnosai_app_state_orchestrator(state));
+    var ka = arena_allocator_growable(4096);
+    var filled = 0;
+    while (agnosai_audit_chain_count(chain) < AGNOSAI_AUDIT_MAX_ENTRIES) {
+        _b_post(state, ra, body, ka);
+        reset_via(ka);
+        filled = filled + 1;
+    }
+    for (var w = 0; w < filled; w = w + 1) {
+        _b_post(state, ra, body, ka);
+        reset_via(ka);
+    }
+
+    var n = 2000;
+    var b = bench_new("rest_post_crew_2_tasks_chain_on");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            _b_post(state, ra, body, ka);
+            reset_via(ka);
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+
+    var k = 500;
+    var before = alloc_used();
+    for (var j = 0; j < k; j = j + 1) {
+        _b_post(state, ra, body, ka);
+        reset_via(ka);
+    }
+    _b_kept_line(ka, "  rest_post_crew_2_tasks_chain_on_kept_bytes: ", (alloc_used() - before) / k);
     return 0;
 }
 
@@ -143,13 +190,14 @@ fn main(): i64 {
     sakshi_set_level(SK_FATAL);
     AGNOSAI_MAX_RETAINED_CREWS = 8;
     AGNOSAI_CREWS_LOW_WATER = 4;
-    var state = _b_state();
+    var state = _b_state(0);
     var ra = arena_allocator_growable(65536);
     var body = _b_body();
     _b_post_row(state, ra, body);
     _b_get_row(state, ra, body);
     _b_history_row(state, ra);
     _b_kept_row(state, ra, body);
+    _b_chain_rows(ra, body);
     return 0;
 }
 

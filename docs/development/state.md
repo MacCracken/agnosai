@@ -2,9 +2,29 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-11-13 (the 2.5.1 release gate).
+> Last refreshed: 2026-11-13 (the 2.5.2 release gate).
 
-## Now — 2.5.1
+## Now — 2.5.2
+
+| | |
+|---|---|
+| **version** | **2.5.2** (cut 2026-11-13, `version-bump.sh`'s UTC date): the audit chain gives back what it lets go (ADR 038). Each entry lives in a slot of its ring, an arena the chain resets when the ring takes it again, with its strings, its link, its signature and a copy of its metadata; the hashing goes in a scratch that is given back; `agnosai_audit_chain_recent` hands back copies |
+| **cyrius pin** | **6.7.18**, unchanged |
+| **tests** | **116 suites, 13,307 assertions, 0 failed** under `CYRIUS_DCE=1` with wasmtime 50.0.1, counted from each suite's printed line as well as its exit code. 2.5.1's tree read 13,262: +45, `orch_audit` 99 (from 71: a full chain records and verifies for 0 B, the ring's order, its anchor and its slots across wraps, four recorders and a reader), `orch_crew_arena` 1,389 (the REST loop and A2A with the server's chain on), `orch_tool_loop` 406, `orch_crew_runner` 326 and `orch_approval` 78. **31 mutants, all killed**, in two groups run side by side in copies of the tree: the ring, its copies and its scratch 24, the callers 6, and one for the fix below. 28 were killed on the first pass; the 2 that got through, a reviewer's decision keeping its scratch and a tool call's metadata on the global heap, were each closed by a heap test, and the first of those tests found a decision's spelling minted on the global heap per call, 16 B, fixed |
+| **coverage** | **99%**: 113/113 files, 2,071/2,081 fns (gate `--min 80`), the same 10 unreferenced as 2.5.1. `audit.cyr` 19/19 |
+| **dist** | `dist/agnosai.cyr` 51,376 lines + `dist/agnosai-guard.cyr` 1,034, both v2.5.2, by `wc -l` (2.5.1's read 51,271 and 1,034). Sidecars unchanged. `[lib]` unchanged, 122 modules |
+| **binary** | `build/agnosai` **3,178,600 B** (2.5.1: 3,178,552). aarch64 **7,237,256 B** (7,237,216), not compacted, built and not started. The native binary answers `/ready` with `"version":"2.5.2"` and exits 0 on SIGTERM |
+| **deps** | Unchanged from 2.5.1, and not re-checked against GitHub this release. hoosh at 2.12.3 |
+| **lock** | `cyrius.lock` unchanged: 119 files, 8 commit pins |
+| **gates** | `check-symbols.sh`: 3,652 top-level definitions across 123 files, no duplicates, all prefixed. `check-clean.sh`: fmt and lint 257 files, doc 124, doctest 1, vet, deny, `deps --verify` 119, lib snapshot 113, generated sources, log lengths 256, dist matches src. Fuzz 4/4. The example runs. CI replica (ubuntu:26.04, wasmtime 47.0.3, fresh user, all 8 pins from GitHub): **every `ci.yml` step passed**, 116 suites, 13,277 assertions, 0 failed, coverage, the example, fuzz and `cyrius bench`, run again after three internals this release left without a caller were removed |
+| **benchmarks** | Interleaved against a 2.5.1 build on the same `lib/`, three rounds of `orch`, `server`, `rest_crews`, `manager` and `handoff` at a mean load of 2.45: `audit_record` 26.9 → 16.7 µs (−38%), eviction moving the ring's head where it shifted 10,000 pointers; `audit_verify_256` 2.52 → 2.29 ms (−9%); `rest_post_crew_2_tasks_chain_on` (new) 400 → 334 µs (−17%); the orchestrator's crews, whose chain is on, `run_crew_1_task_sequential` −13%, `run_crew_then_release` −13%, `run_crew_then_forget` −12%, `run_crew_at_registry_cap` −10%, `run_crew_10_tasks_sequential` −8%. Median +0.4% across 145 rows, 122 within 5%. ⚠ `run_crew_10_tasks_parallel_4` read +53% and `crew_runner_10_tasks_parallel_4_watched` +63%, the second with no chain at all: run alone, interleaved three times, both read the same on the two trees, and in the full file 2.5.1 read them at 440 and 397 µs where alone it reads 727–757 and 684–748, the row-position effect of roadmap 2.7.1. `bench-history.sh` appended 269 rows for 2.5.2 at a starting load of 4.5, among them `audit_record` 17.2 µs, `audit_verify_256` 2.37 ms and `rest_post_crew_2_tasks_chain_on` 366.5 µs; both kept-bytes lines read 0 |
+| **memory** | With the server's audit chain on, `tests/orch_crew_arena.tcyr`'s REST loop reads **0 B a crew**, and an A2A delegation 0 B (the ring at 96 so the loop wraps it). `benches/rest_crews.bcyr` at the binary's 10,000: **2.5.1 kept 9,480 B a crew for good, 2.5.2 keeps 0**; 2.5.1's 6,360 was measured before its ring filled, and past it each record also re-hashed the entry it let go on the global heap. A full chain holds **11,888,696 B**, 1,188 B a slot, and a second wrap adds 0. A server entry needs 768 B (a crew's acceptance) to 1,000 B (its end), inside a slot's 1,024. A full chain records and verifies for 0 B, a reviewer's decision audited 0 B, a tool call with the chain on 0 B |
+| **the ring** | `tests/orch_audit.tcyr`: past its cap a record takes the oldest's slot and the chain mints none; `recent` reads from the head, oldest first, and its copies outlive the slots they came from, where the entry `record` returned reads whatever took its slot last; the oldest survivor links to the anchor eviction carried forward, so the chain verifies after ten wraps, and an edit to that survivor fails as entry 0; a cap below 1 keeps 1. Four threads recording into a ring of 16 while a fifth copies it: every copy one whole entry, and the chain verifies |
+| **build warnings** | Unchanged from 2.5.1: large static data, the DCE note, the two "refusing to overwrite stdlib leaf" lines, and the two `src/tool_loop.cyr` "assigning non-pointer to typed pointer" lines, now at 1005 and 1182 |
+| **consumer** | Not re-run. agnostic pins 2.2.4 and reads no chain entries (its `src/engine/audit.cyr` names the chain's key, in a comment): nothing changes for it. `agnosai_audit_chain_recent` hands back copies now, and an entry `record` returns is valid until the ring takes its slot again |
+| **upstream filings** | ⚠ **Seven not committed**, so not visible upstream, unchanged from 2.5.1: sigil (RSA over 4096 bits; the lane pool), sandhi (bytes per exchange; chunked bodies; the pooled connection's allocator), bote (MCP client), bayan (its escape one builder call a byte) |
+
+### 2.5.1 — the release (2026-11-13)
 
 | | |
 |---|---|

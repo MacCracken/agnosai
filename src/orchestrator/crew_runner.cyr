@@ -605,9 +605,9 @@ fn _agnosai_crew_user_message_a(a, task): i64 {
 #
 # ⚠ Lazily, and pooled rather than per-call: an arena costs its capacity
 # permanently on the no-free bump, so minting one per task would cost more than
-# the tree it reclaims — the lesson the audit scratch learned
-# (`AGN_CR_SCRATCH`). Pooled arenas are mutex-guarded, so the parallel and DAG
-# workers can share them, which the audit scratch deliberately cannot.
+# the tree it reclaims — the lesson the runner's audit scratch learned
+# (`AGN_CR_SCRATCH`, one per run, and since 2.5.2 the chain's pool's instead).
+# Pooled arenas are mutex-guarded, so the parallel and DAG workers can share them.
 # ⚠ **Built EAGERLY, at module scope.** `src/arena_pool.cyr`'s header states the
 # rule and this code broke it: "Build the pool EAGERLY on the main thread. A lazy
 # `if (pool == 0)` double constructs when two spawned threads race it, and the
@@ -1376,6 +1376,7 @@ enum AgnosaiCrewRunnerOff {
     AGN_CR_EVENT_TX = 16;
     AGN_CR_CANCELLED = 24;
     AGN_CR_AUDIT = 32;
+    # Unused since 2.5.2: an audit record takes a scratch from its chain's pool.
     AGN_CR_SCRATCH = 40;
     # Monotonic nanosecond deadline, or 0 for none. Set by the orchestrator from
     # the resource budget — see `agnosai_crew_runner_set_deadline_ns`.
@@ -1422,16 +1423,6 @@ enum AgnosaiCrewRunnerOff {
     AGN_CR_REPLAY = 192;
     AGN_CR_SIZE = 200;
 }
-
-# Initial chunk for the sequential run's audit scratch.
-#
-# **1 KiB, chosen by measurement rather than by feel.** The chunk comes from the
-# no-free global bump, so its capacity is a permanent per-run cost — too large
-# and it eats the saving it was meant to produce. Measured on a 4-task run:
-# 512 B -> 26,344 · **1,024 B -> 26,296** · 2,048 B -> 27,304 · 4,096 B -> 27,288.
-# Below 1 KiB the arena grows an extra time and pays for a second chunk; above
-# it, the slack is dead weight.
-var AGNOSAI_CREW_SCRATCH_BYTES = 1024;
 
 # Create a runner over a crew spec. Everything optional starts absent.
 fn agnosai_crew_runner_new(spec): i64 {
@@ -1892,27 +1883,21 @@ fn _agnosai_crew_move_task_x(r, task, status, event_type: Str, data, extra): i64
     return _agnosai_crew_move(r, task + AGN_TASK_STATUS, status, event);
 }
 
-# Record an audit event, when a chain is attached.
-# ## The audit scratch, and why it is only set on one path
+# Record an audit event, when a chain is attached, through `s`, a scratch from
+# `agnosai_audit_scratch_acquire` the metadata was built in, which the caller gives back.
 #
-# `agnosai_audit_record_a` takes an allocator for the JSON tree it builds and
-# throws away per entry — measured at ~4.6 KB per task, the largest single
-# consumer in a crew run. `AGN_CR_SCRATCH` carries a growable arena for that.
+# ## The audit scratch is the chain's pool's (2.5.2)
 #
-# **It is set only while running sequentially, and is 0 otherwise.** The runner
-# is shared by every worker in `_agnosai_crew_run_parallel` and
-# `_agnosai_crew_run_dag`, so a scratch read off `r` would be reset by one
-# thread while another was mid-hash — silent corruption of a tamper-evident log.
-# 0 means "use the global allocator", which is what those paths get, and is
-# exactly the behaviour they had before.
-fn _agnosai_crew_audit(r, event: Str, level: Str, message: Str, metadata): i64 {
+# `agnosai_audit_record_a` takes an allocator for the JSON tree it builds and throws away per
+# entry, measured at ~4.6 KB a task, and the entry keeps copies of what it is handed. Through 2.5.1
+# the runner carried one growable scratch, `AGN_CR_SCRATCH`, set only while running sequentially,
+# as a wave's workers share the runner and would reset each other's mid-hash; so a parallel or DAG
+# crew hashed on the global heap, and every path built its metadata there, for good. A scratch from
+# the chain's pool is one thread's for one record, in every process mode.
+fn _agnosai_crew_audit(r, s, event: Str, level: Str, message: Str, metadata): i64 {
     var chain = load64(r + AGN_CR_AUDIT);
     if (chain == 0) { return 0; }
-    var scratch = load64(r + AGN_CR_SCRATCH);
-    if (scratch == 0) { scratch = default_alloc(); }
-    var e = agnosai_audit_record_a(scratch, chain, event, level, message, 0, 0, metadata);
-    if (load64(r + AGN_CR_SCRATCH) != 0) { reset_via(scratch); }
-    return e;
+    return agnosai_audit_record_a(s, chain, event, level, message, 0, 0, metadata);
 }
 
 # The `task_started` payload: id, description, and the agent key or null.
@@ -1948,27 +1933,27 @@ fn _agnosai_crew_completed_data_a(a, result): i64 {
 # audit would change what a consumer's trail contains.
 fn _agnosai_crew_audit_task(r, task, result, agent): i64 {
     if (load64(r + AGN_CR_AUDIT) == 0) { return 0; }
-    var level = str_from("info");
+    # In a scratch of the chain's: the entry copies what it keeps (2.5.2), where through 2.5.1 this
+    # was built on the global heap, owning its strings, for good (ADR 028).
+    var s = agnosai_audit_scratch_acquire();
+    var level = str_from_a(s, "info");
     if (agnosai_task_result_status(result) != AGNOSAI_STATUS_COMPLETED) {
-        level = str_from("error");
+        level = str_from_a(s, "error");
     }
-    # ⚠ **On the global heap, and owning its strings, whatever the crew lives in.** The
-    # chain keeps this for as long as it keeps the entry, so it outlives an arena crew,
-    # and a JSON string value holds its Str by pointer (ADR 028).
-    var md = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(md, str_from("crew_id"),
-      bayan_json_v_str_new(str_clone(agnosai_crew_id(load64(r + AGN_CR_SPEC)))));
-    bayan_json_v_obj_set(md, str_from("task_id"),
-      bayan_json_v_str_new(str_clone(agnosai_task_result_task_id(result))));
-    bayan_json_v_obj_set(md, str_from("status"),
-      bayan_json_v_str_new(agnosai_task_status_to_wire(agnosai_task_result_status(result))));
-    if (agent == 0) { bayan_json_v_obj_set(md, str_from("agent"), bayan_json_v_null()); }
+    var md = bayan_json_v_obj_new_a(s);
+    bayan_json_v_obj_set_a(s, md, str_from_a(s, "crew_id"),
+      bayan_json_v_str_new_a(s, agnosai_crew_id(load64(r + AGN_CR_SPEC))));
+    bayan_json_v_obj_set_a(s, md, str_from_a(s, "task_id"),
+      bayan_json_v_str_new_a(s, agnosai_task_result_task_id(result)));
+    bayan_json_v_obj_set_a(s, md, str_from_a(s, "status"),
+      bayan_json_v_str_new_a(s, agnosai_task_status_to_wire(agnosai_task_result_status(result))));
+    if (agent == 0) { bayan_json_v_obj_set_a(s, md, str_from_a(s, "agent"), bayan_json_v_null_a(s)); }
     else {
-        bayan_json_v_obj_set(md, str_from("agent"),
-          bayan_json_v_str_new(str_clone(agnosai_agent_key(agent))));
+        bayan_json_v_obj_set_a(s, md, str_from_a(s, "agent"), bayan_json_v_str_new_a(s, agnosai_agent_key(agent)));
     }
-    return _agnosai_crew_audit(r, str_from("task_completed"), level,
-      agnosai_task_description(task), md);
+    var e = _agnosai_crew_audit(r, s, str_from_a(s, "task_completed"), level, agnosai_task_description(task), md);
+    agnosai_audit_scratch_release(s);
+    return e;
 }
 
 # ── the approval gate (ADR 032) ─────────────────────────────────────────────
@@ -2043,20 +2028,23 @@ fn _agnosai_crew_decided_data_a(a, tx, task, decision, reason: Str): i64 {
     return d;
 }
 
-# Audit a decision, when a chain is attached: who decided what is the trail's business. On the
-# global heap and owning its strings, as the entry outlives a crew in an arena (ADR 028).
+# Audit a decision, when a chain is attached: who decided what is the trail's business. In a scratch
+# of the chain's, as the entry copies what it keeps (2.5.2).
 fn _agnosai_crew_audit_decided(r, task, decision, reason: Str): i64 {
     if (load64(r + AGN_CR_AUDIT) == 0) { return 0; }
-    var level = str_from("info");
-    if (decision != AGNOSAI_APPROVAL_APPROVED) { level = str_from("warn"); }
-    var md = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(md, str_from("crew_id"),
-      bayan_json_v_str_new(str_clone(agnosai_crew_id(load64(r + AGN_CR_SPEC)))));
-    bayan_json_v_obj_set(md, str_from("task_id"), bayan_json_v_str_new(str_clone(agnosai_task_id(task))));
-    bayan_json_v_obj_set(md, str_from("decision"),
-      bayan_json_v_str_new(agnosai_approval_decision_to_wire(decision)));
-    bayan_json_v_obj_set(md, str_from("reason"), bayan_json_v_str_new(reason));
-    return _agnosai_crew_audit(r, str_from("approval_decided"), level, agnosai_task_description(task), md);
+    var s = agnosai_audit_scratch_acquire();
+    var level = str_from_a(s, "info");
+    if (decision != AGNOSAI_APPROVAL_APPROVED) { level = str_from_a(s, "warn"); }
+    var md = bayan_json_v_obj_new_a(s);
+    bayan_json_v_obj_set_a(s, md, str_from_a(s, "crew_id"),
+      bayan_json_v_str_new_a(s, agnosai_crew_id(load64(r + AGN_CR_SPEC))));
+    bayan_json_v_obj_set_a(s, md, str_from_a(s, "task_id"), bayan_json_v_str_new_a(s, agnosai_task_id(task)));
+    bayan_json_v_obj_set_a(s, md, str_from_a(s, "decision"),
+      bayan_json_v_str_new_a(s, agnosai_approval_decision_to_wire(decision)));
+    bayan_json_v_obj_set_a(s, md, str_from_a(s, "reason"), bayan_json_v_str_new_a(s, reason));
+    var e = _agnosai_crew_audit(r, s, str_from_a(s, "approval_decided"), level, agnosai_task_description(task), md);
+    agnosai_audit_scratch_release(s);
+    return e;
 }
 
 # Hold `result` for a reviewer when `task` needs one, and return what stands: `result` as it was,
@@ -2124,19 +2112,6 @@ fn _agnosai_crew_run_sequential(r): i64 {
 # with the tools `withheld` maps its worker's key to, and once every worker has answered the manager
 # writes the crew's answer, as one more result.
 fn _agnosai_crew_run_in_order(r, pool, manager, withheld): i64 {
-    # One growable scratch for the whole run, reset after every audit entry.
-    # Growable rather than fixed because an entry's metadata is caller-supplied
-    # and unbounded; because it is reset each time, it converges on the
-    # high-water mark and then stops allocating.
-    #
-    # **Only when there is a chain to write to.** An arena's backing chunk comes
-    # from the no-free global bump, so creating one costs its capacity
-    # permanently — measured, an unconditional scratch made an audit-less run
-    # *4.2 KB worse* rather than better. The whole point is to spend that once
-    # and amortise it over many entries, which cannot happen if there are none.
-    if (load64(r + AGN_CR_AUDIT) != 0) {
-        store64(r + AGN_CR_SCRATCH, arena_allocator_growable(AGNOSAI_CREW_SCRATCH_BYTES));
-    }
     var spec = load64(r + AGN_CR_SPEC);
     var tasks = agnosai_crew_tasks(spec);
     var a = load64(r + AGN_CR_ALLOC);
@@ -2181,7 +2156,6 @@ fn _agnosai_crew_run_in_order(r, pool, manager, withheld): i64 {
           ev_started, ev_completed);
         vec_push_a(a, results, answer);
     }
-    store64(r + AGN_CR_SCRATCH, 0);
     return results;
 }
 

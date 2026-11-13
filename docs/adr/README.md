@@ -64,6 +64,7 @@ Regenerate rather than hand-edit — this index read _"No ADRs yet"_ until
 | [035](035-a-manager-assigns-its-workers-and-writes-the-crews-answer.md) | A manager assigns its workers and writes the crew's answer | Accepted — shipped in 2.4.3 |
 | [036](036-a-crew-keeps-a-log-and-resumes-from-it.md) | A crew keeps a log, and resumes from it | Accepted — shipped in 2.5.0 |
 | [037](037-the-servers-crews-are-the-orchestrators-to-give-back.md) | The server's crews are the orchestrator's to give back | Accepted — shipped in 2.5.1 |
+| [038](038-an-audit-entry-lives-in-its-ring-slot.md) | An audit entry lives in its ring slot | Accepted — shipped in 2.5.2 |
 
 ADRs 001-005 predate the current heading convention (`ADR-00N: Title` rather
 than `00N — Title`). The headings are left as written — renumbering accepted

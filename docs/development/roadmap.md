@@ -6,7 +6,7 @@
 > [`cyrius-port-plan.md`](cyrius-port-plan.md) is the port's reasoning archive, and
 > [`known-unreachable.md`](known-unreachable.md) records code kept for oracle shape.
 
-**Status as of 2.5.1 (2026-11-13).**
+**Status as of 2.5.2 (2026-11-13).**
 
 **How releases are ordered.** A release holds only work that can ship now. Work that waits on another project is not
 given a number: it is listed under [*Waiting on another project*](#waiting-on-another-project), with its filed issue,
@@ -50,7 +50,6 @@ Carried from the Rust line as *goals*, not as comparisons: the Cyrius baseline s
 
 | Release | What it does |
 |---|---|
-| **2.5.2** | The audit chain gives back what it lets go |
 | **2.6.0** | MCP 2026-07-28 on `/mcp`, and A2A 1.0 |
 | **2.6.1** | Server edges: SSE, shutdown, paths, config, JWT keys |
 | **2.6.2** | The tracing export: the remaining spans, and trace ids in log lines |
@@ -104,15 +103,10 @@ delegation or the `delegate` tool goes back once its registry lets it go and no 
 one holds it and copies what it renders, and the REST loop leaves 0 B a crew where 2.5.0 left 13,144
 ([ADR 037](../adr/037-the-servers-crews-are-the-orchestrators-to-give-back.md)).
 
-#### 2.5.2 — the audit chain gives back what it lets go
-
-The server mints an audit chain, and every crew it runs leaves its entries on the global heap: **6,360 B a two-task
-crew, for good**, measured as 2.5.1's REST loop measures, which reads 0 B without a chain. The chain is a ring of
-10,000 (`AGNOSAI_AUDIT_MAX_ENTRIES`), so it bounds how many entries are kept and not what they cost: an entry that
-leaves the ring keeps its memory, as the heap has no `free`. **The work:** each entry, its strings and its metadata in
-memory the chain reuses when the entry leaves the ring, an arena a slot, or a fixed slab, so the ring costs its size
-and nothing more. The hash chain and `verify` read what the ring holds, and must not change. **Done means:**
-`tests/orch_crew_arena.tcyr`'s REST loop reads 0 B with the server's chain on.
+2.5.2 gave the audit chain back what it lets go: each entry lives in a slot of its ring, an arena the chain resets when
+the ring takes the slot again, with its strings and a copy of its metadata, and the hashing goes in a scratch that is
+given back. With the server's chain on the REST loop reads 0 B a crew, where it kept 6,360
+([ADR 038](../adr/038-an-audit-entry-lives-in-its-ring-slot.md)). The line is done.
 
 ### 2.6.x — protocol and server currency
 

@@ -80,6 +80,8 @@ it keeps.**
 - **Named, and not here**: **the audit chain.** The server mints one, and each crew it runs leaves its entries on the
   global heap, 6,360 B for the two-task crew above, measured the same way: the chain is a ring of 10,000, and an entry
   that leaves it keeps its memory. That is the server's remaining per-crew cost, on the roadmap as its own release.
+  **2.5.2 note** ([ADR 038](038-an-audit-entry-lives-in-its-ring-slot.md)): an entry lives in its ring slot, which the
+  chain reuses, and the loop reads 0 B with the server's chain on.
   A crew resumed from its log at start-up (ADR 036) is on the global heap, as it is rebuilt there; it is one per crew a
   restart found unfinished.
 

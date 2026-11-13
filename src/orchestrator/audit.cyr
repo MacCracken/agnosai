@@ -44,6 +44,22 @@
 # would need a configured key and its own ADR.
 # =========================================================================
 
+# ## Where an entry lives (2.5.2, ADR 038)
+#
+# **Each entry lives in a slot of the ring, an arena the chain resets for the entry that takes the
+# slot when its own is evicted**, with its id, its strings, its hash, its signature and a copy of its
+# metadata. So a chain costs its ring and nothing more: through 2.5.1 every entry, and the
+# metadata tree its caller built, stayed on the global heap after the ring let it go, 6,360 B a
+# two-task crew on the server. The ring is a ring: eviction moves its head, where it shifted 10,000
+# pointers down by one. The hashing and signing scratch is the caller's, or one from a pool.
+#
+# ⚠ **The entry `agnosai_audit_record` returns is valid until the ring takes its slot again**,
+# `max_entries` records later, which a chain written from other threads can be at once.
+# `agnosai_audit_chain_recent` hands back copies, taken under the chain's lock, that a reader keeps.
+
+include "src/arena_pool.cyr"
+include "src/core/json.cyr"
+
 # The chain's genesis hash — 64 hex zeros, the oracle's `GENESIS_HASH`.
 var AGNOSAI_AUDIT_GENESIS =
 "0000000000000000000000000000000000000000000000000000000000000000";
@@ -158,6 +174,8 @@ fn agnosai_audit_entry_to_value(e): i64 {
 # timestamp` — not in declaration order. Getting that wrong produces a chain
 # that verifies against itself and against nothing else, which is the failure a
 # port would not notice until it tried to check a chain from elsewhere.
+#
+# The object and its serialised form exist only to be hashed, so they go in `a`, a scratch.
 fn _agnosai_audit_entry_hash_a(a, e): i64 {
     var obj = bayan_json_v_obj_new_a(a);
     bayan_json_v_obj_set_a(a, obj, str_from_a(a, "event"),
@@ -184,18 +202,26 @@ fn _agnosai_audit_entry_hash_a(a, e): i64 {
       bayan_json_v_int_new_a(a, load64(e + AGN_AE_TIMESTAMP)));
 
     var json = bayan_json_v_build_a(a, obj);
-    # **The hash itself is NOT from `a`.** It becomes `last_hash` and the next
-    # entry's `prev_hash`, so it outlives every reset of the scratch.
-    return str_from(sha256_hex(str_data(json), str_len(json)));
+    var digest[32];
+    sha256(str_data(json), str_len(json), &digest);
+    # In `a` too, as the caller copies what it keeps (2.5.2): through 2.5.1 the hex was minted on
+    # the global heap for every entry, and once more for each eviction's re-anchor.
+    return _agnosai_audit_hex_a(a, &digest);
 }
 
-# Global-allocator form of `_agnosai_audit_entry_hash_a`.
-#
-# The object and its serialised form exist only to be hashed — the whole tree is
-# garbage the moment `sha256_hex` returns. That is what the scratch arena is
-# for; this form is kept for callers outside the record path.
-fn _agnosai_audit_entry_hash(e): i64 {
-    return _agnosai_audit_entry_hash_a(default_alloc(), e);
+# 32 bytes as a 64-character lowercase hex Str, in `a`.
+fn _agnosai_audit_hex_a(a, bytes): i64 {
+    var buf = alloc_via(a, 65);
+    for (var i = 0; i < 32; i = i + 1) {
+        var b = load8(bytes + i) & 255;
+        store8(buf + i * 2, _agnosai_hex_digit(b / 16));
+        store8(buf + i * 2 + 1, _agnosai_hex_digit(b % 16));
+    }
+    store8(buf + 64, 0);
+    var s = alloc_via(a, 16);
+    store64(s, buf);
+    store64(s + 8, 64);
+    return s;
 }
 
 # The signature over `"{entry_hash}:{previous_hash}"`, HMAC-SHA256, hex.
@@ -208,27 +234,16 @@ fn _agnosai_audit_sign_a(a, key, entry_hash: Str, prev_hash: Str): i64 {
 
     var mac = alloc_via(a, 32);
     hmac_sha256(key, AGNOSAI_AUDIT_KEY_BYTES, str_data(input), str_len(input), mac);
-
-    # **64 hex chars into a 64-byte inline buffer, so this never grows** — which
-    # matters because `str_builder_putc` has no `_a` form and would grow on the
-    # global allocator regardless of `a`. `tests/orch_audit.tcyr` asserts the
-    # length so a longer digest cannot make that silent.
-    var hex = str_builder_new_a(a);
-    for (var i = 0; i < 32; i = i + 1) {
-        var b = load8(mac + i) & 255;
-        str_builder_putc(hex, _agnosai_hex_digit(b / 16));
-        str_builder_putc(hex, _agnosai_hex_digit(b % 16));
-    }
-    # The signature is stored on the entry, so it outlives the scratch.
-    return str_clone(str_builder_build_a(a, hex));
-}
-
-# Global-allocator form of `_agnosai_audit_sign_a`.
-fn _agnosai_audit_sign(key, entry_hash: Str, prev_hash: Str): i64 {
-    return _agnosai_audit_sign_a(default_alloc(), key, entry_hash, prev_hash);
+    # In `a`: a caller that keeps it copies it, into the entry's slot (2.5.2).
+    return _agnosai_audit_hex_a(a, mac);
 }
 
 # The chain itself.
+#
+# `ENTRIES` and `SLOTS` are the ring, one entry and one arena a slot, as many as have been used, up
+# to `MAX_ENTRIES`; `HEAD` is the slot of the oldest once it is full. `LAST_HASH` and
+# `FIRST_VALID_HASH` are Strs of the chain's own, whose 64 bytes each record overwrites, as an
+# entry they were taken from can go.
 enum AgnosaiAuditChainOff {
     AGN_AC_KEY = 0;
     AGN_AC_LAST_HASH = 8;
@@ -236,19 +251,52 @@ enum AgnosaiAuditChainOff {
     AGN_AC_MAX_ENTRIES = 24;
     AGN_AC_FIRST_VALID_HASH = 32;
     AGN_AC_MUTEX = 40;
-    AGN_AUDIT_CHAIN_SIZE = 48;
+    AGN_AC_SLOTS = 48;
+    AGN_AC_HEAD = 56;
+    AGN_AUDIT_CHAIN_SIZE = 64;
 }
 
-# Create a chain over a caller-supplied 32-byte signing key.
+# A slot's first chunk: about an entry, its strings and a small metadata object. A slot that holds a
+# larger one grows, and keeps what it grew to for the next entry in it.
+var AGNOSAI_AUDIT_SLOT_BYTES = 1024;
+
+# A Str of the chain's own holding `hex`, 64 characters.
+fn _agnosai_audit_hash_cell(hex): i64 {
+    var buf = alloc(65);
+    memcpy(buf, hex, 64);
+    store8(buf + 64, 0);
+    var cell = alloc(16);
+    store64(cell, buf);
+    store64(cell + 8, 64);
+    return cell;
+}
+
+# Overwrite a hash cell with `hash`, a 64-character Str.
+fn _agnosai_audit_hash_set(cell, hash: Str): i64 {
+    memcpy(load64(cell), str_data(hash), 64);
+    return 0;
+}
+
+# Create a chain over a caller-supplied 32-byte signing key. A `max_entries` below 1 keeps 1.
 fn agnosai_audit_chain_with_key(key, max_entries): i64 {
     var c = alloc(AGN_AUDIT_CHAIN_SIZE);
+    if (max_entries < 1) { max_entries = 1; }
     store64(c + AGN_AC_KEY, key);
-    store64(c + AGN_AC_LAST_HASH, str_from(AGNOSAI_AUDIT_GENESIS));
+    store64(c + AGN_AC_LAST_HASH, _agnosai_audit_hash_cell(AGNOSAI_AUDIT_GENESIS));
     store64(c + AGN_AC_ENTRIES, vec_new());
     store64(c + AGN_AC_MAX_ENTRIES, max_entries);
-    store64(c + AGN_AC_FIRST_VALID_HASH, str_from(AGNOSAI_AUDIT_GENESIS));
+    store64(c + AGN_AC_FIRST_VALID_HASH, _agnosai_audit_hash_cell(AGNOSAI_AUDIT_GENESIS));
     store64(c + AGN_AC_MUTEX, mutex_new());
+    store64(c + AGN_AC_SLOTS, vec_new());
+    store64(c + AGN_AC_HEAD, 0);
     return c;
+}
+
+# The `i`th entry in the order they were recorded, oldest first. The caller holds the lock.
+fn _agnosai_audit_at_locked(c, i): i64 {
+    var entries = load64(c + AGN_AC_ENTRIES);
+    var n = vec_len(entries);
+    return vec_get(entries, (load64(c + AGN_AC_HEAD) + i) % n);
 }
 
 # Create a chain with a fresh CSPRNG key — the oracle's `Orchestrator::new`.
@@ -271,33 +319,82 @@ fn agnosai_audit_chain_count(c): i64 {
     return n;
 }
 
-# The last `n` entries, oldest first. Fewer when the chain is shorter.
-fn agnosai_audit_chain_recent(c, n): i64 {
+# A copy of entry `e` in `a`, owning its every string and its metadata. A field that is 0 stays 0.
+fn _agnosai_audit_entry_copy_a(a, e): i64 {
+    var d = alloc_via(a, AGN_AE_SIZE);
+    store64(d + AGN_AE_ID, _agnosai_audit_str_own_a(a, load64(e + AGN_AE_ID)));
+    store64(d + AGN_AE_TIMESTAMP, load64(e + AGN_AE_TIMESTAMP));
+    store64(d + AGN_AE_EVENT, _agnosai_audit_str_own_a(a, load64(e + AGN_AE_EVENT)));
+    store64(d + AGN_AE_LEVEL, _agnosai_audit_str_own_a(a, load64(e + AGN_AE_LEVEL)));
+    store64(d + AGN_AE_MESSAGE, _agnosai_audit_str_own_a(a, load64(e + AGN_AE_MESSAGE)));
+    store64(d + AGN_AE_PROVIDER, _agnosai_audit_str_own_a(a, load64(e + AGN_AE_PROVIDER)));
+    store64(d + AGN_AE_MODEL, _agnosai_audit_str_own_a(a, load64(e + AGN_AE_MODEL)));
+    var md = load64(e + AGN_AE_METADATA);
+    if (md != 0) { md = agnosai_json_copy_a(a, md); }
+    store64(d + AGN_AE_METADATA, md);
+    store64(d + AGN_AE_SIGNATURE, _agnosai_audit_str_own_a(a, load64(e + AGN_AE_SIGNATURE)));
+    store64(d + AGN_AE_PREV_HASH, _agnosai_audit_str_own_a(a, load64(e + AGN_AE_PREV_HASH)));
+    return d;
+}
+
+# The last `n` entries, oldest first, as copies in `a`. Fewer when the chain is shorter.
+#
+# **Copies, taken under the lock (2.5.2)**: an entry lives in its ring slot, which the next record
+# past the cap resets, from whatever thread records it. Through 2.5.1 an entry was never given back,
+# so the chain could hand out its own; a copy keeps that promise, as an edit to one cannot reach the
+# chain either.
+fn agnosai_audit_chain_recent_a(a, c, n): i64 {
     var mtx = load64(c + AGN_AC_MUTEX);
     mutex_lock(mtx);
     var entries = load64(c + AGN_AC_ENTRIES);
     var len = vec_len(entries);
     var start = 0;
     if (len > n) { start = len - n; }
-    var out = vec_new();
-    for (var i = start; i < len; i = i + 1) { vec_push(out, vec_get(entries, i)); }
+    var out = vec_new_a(a);
+    for (var i = start; i < len; i = i + 1) {
+        vec_push_a(a, out, _agnosai_audit_entry_copy_a(a, _agnosai_audit_at_locked(c, i)));
+    }
     mutex_unlock(mtx);
     return out;
 }
 
-# Copy a Str the chain is about to keep, passing 0 through unchanged.
-#
-# A chain entry is process-lifetime; its caller's Str need not be. `str_clone`
-# would fault on the 0 that `provider` and `model` carry today, so the guard is
-# part of the contract rather than defensive noise.
+# Global-allocator form of `agnosai_audit_chain_recent_a`.
+fn agnosai_audit_chain_recent(c, n): i64 {
+    return agnosai_audit_chain_recent_a(default_alloc(), c, n);
+}
+
+# A scratch to build an entry's metadata in and record it with, from the chain's pool: the entry
+# keeps a copy, so the scratch goes back with `agnosai_audit_scratch_release` once it is recorded.
+fn agnosai_audit_scratch_acquire(): i64 {
+    return agnosai_arena_pool_acquire(_agnosai_audit_pool());
+}
+
+# Give back a scratch `agnosai_audit_scratch_acquire` took, reset, once its record is made.
+fn agnosai_audit_scratch_release(s): i64 {
+    return agnosai_arena_pool_release(_agnosai_audit_pool(), s);
+}
+
 # Initial scratch chunk. Small on purpose: it grows to whatever the first few
 # entries need and then stops, so the number is a starting point rather than a
 # ceiling to get right.
 var AGNOSAI_AUDIT_SCRATCH_BYTES = 4096;
 
-fn _agnosai_audit_str_own(s): i64 {
+# Pooled scratch for a record or a verify that has none of its caller's (2.5.2): a chain is written
+# from many threads, so one scratch could not serve them. ⚠ **Built eagerly, at module scope**, as
+# `src/arena_pool.cyr` requires: a lazy one races its first two threads.
+var _AGNOSAI_AUDIT_CHAIN_POOL = agnosai_arena_pool_new(4, AGNOSAI_AUDIT_SCRATCH_BYTES);
+
+fn _agnosai_audit_pool(): i64 {
+    return _AGNOSAI_AUDIT_CHAIN_POOL;
+}
+
+# Copy a Str the chain is about to keep, in `a`, passing 0 through unchanged.
+#
+# An entry outlives its caller's Str. `str_clone_a` would fault on the 0 that `provider` and
+# `model` carry today, so the guard is part of the contract rather than defensive noise.
+fn _agnosai_audit_str_own_a(a, s): i64 {
     if (s == 0) { return 0; }
-    return str_clone(s);
+    return str_clone_a(a, s);
 }
 
 # Append an event and return its entry.
@@ -322,50 +419,58 @@ fn _agnosai_audit_str_own(s): i64 {
 # time, and it is the same reasoning `server_state`'s `definition_insert`
 # already applies to its key.
 #
-# ⚠ **`metadata` is the exception and is stored by reference.** It is a bayan
-# value tree and bayan ships no deep-copy primitive; a `build`-then-`parse`
-# round trip would be one, at the cost of a full serialise per audit record on
-# the crew hot path. So the contract stands for metadata alone: **pass a tree
-# that outlives the chain.** Both callers build theirs with a bare
-# `bayan_json_v_obj_new()`, which does.
+# **So is `metadata`, since 2.5.2**: the entry keeps a copy (`agnosai_json_copy_a`, ADR 037's) in
+# its slot. Through 2.5.1 it kept the caller's tree, which had to outlive the chain and so lived on
+# the global heap for good; now a caller builds it in a scratch and gives the scratch back.
 fn agnosai_audit_record_a(scratch, c, event: Str, level: Str, message: Str, provider,
   model, metadata): i64 {
-    var e = alloc(AGN_AE_SIZE);
-    store64(e + AGN_AE_ID, agnosai_uuid_v4_str());
+    # The entry's data first, in the scratch and on the caller's strings, to hash outside the lock.
+    var t = alloc_via(scratch, AGN_AE_SIZE);
+    store64(t + AGN_AE_ID, agnosai_uuid_v4_str_a(scratch));
     # Wall clock: `clock_now_ns` is CLOCK_MONOTONIC, so the trail used to record
     # time since boot under a field documented as epoch milliseconds.
-    store64(e + AGN_AE_TIMESTAMP, clock_epoch_ns() / AGNOSAI_NS_PER_MS);
-    # **The entry owns its strings — see the header.** `_agnosai_audit_str_own`
-    # passes 0 through, which `provider` and `model` both are today.
-    store64(e + AGN_AE_EVENT, _agnosai_audit_str_own(event));
-    store64(e + AGN_AE_LEVEL, _agnosai_audit_str_own(level));
-    store64(e + AGN_AE_MESSAGE, _agnosai_audit_str_own(message));
-    store64(e + AGN_AE_PROVIDER, _agnosai_audit_str_own(provider));
-    store64(e + AGN_AE_MODEL, _agnosai_audit_str_own(model));
-    store64(e + AGN_AE_METADATA, metadata);
-    store64(e + AGN_AE_SIGNATURE, 0);
-    store64(e + AGN_AE_PREV_HASH, 0);
-
-    var entry_hash = _agnosai_audit_entry_hash_a(scratch, e);
+    store64(t + AGN_AE_TIMESTAMP, clock_epoch_ns() / AGNOSAI_NS_PER_MS);
+    store64(t + AGN_AE_EVENT, event);
+    store64(t + AGN_AE_LEVEL, level);
+    store64(t + AGN_AE_MESSAGE, message);
+    store64(t + AGN_AE_PROVIDER, provider);
+    store64(t + AGN_AE_MODEL, model);
+    store64(t + AGN_AE_METADATA, metadata);
+    # Not hashed, and set on the slot's copy: 0 here, as a scratch reset is not zeroed.
+    store64(t + AGN_AE_SIGNATURE, 0);
+    store64(t + AGN_AE_PREV_HASH, 0);
+    var entry_hash = _agnosai_audit_entry_hash_a(scratch, t);
 
     var mtx = load64(c + AGN_AC_MUTEX);
     mutex_lock(mtx);
-    var prev = load64(c + AGN_AC_LAST_HASH);
-    store64(e + AGN_AE_PREV_HASH, prev);
-    store64(e + AGN_AE_SIGNATURE,
-      _agnosai_audit_sign_a(scratch, load64(c + AGN_AC_KEY), entry_hash, prev));
-    store64(c + AGN_AC_LAST_HASH, entry_hash);
-
-    # Evict the oldest at capacity, carrying its hash forward so `verify` still
-    # has a valid anchor. Dropping this is what makes hoosh's Cyrius port report
-    # a full chain as invalid forever.
+    # The slot: a new one while the ring fills, else the oldest's. Evicting the oldest carries its
+    # hash forward, so `verify` still has a valid anchor. Dropping this is what makes hoosh's
+    # Cyrius port report a full chain as invalid forever.
     var entries = load64(c + AGN_AC_ENTRIES);
-    if (vec_len(entries) >= load64(c + AGN_AC_MAX_ENTRIES)) {
-        store64(c + AGN_AC_FIRST_VALID_HASH,
-          _agnosai_audit_entry_hash_a(scratch, vec_get(entries, 0)));
-        vec_remove(entries, 0);
+    var slots = load64(c + AGN_AC_SLOTS);
+    var at = vec_len(entries);
+    var sa = 0;
+    if (at < load64(c + AGN_AC_MAX_ENTRIES)) {
+        sa = arena_allocator_growable(AGNOSAI_AUDIT_SLOT_BYTES);
+        vec_push(slots, sa);
+        vec_push(entries, 0);
+    } else {
+        at = load64(c + AGN_AC_HEAD);
+        _agnosai_audit_hash_set(load64(c + AGN_AC_FIRST_VALID_HASH),
+          _agnosai_audit_entry_hash_a(scratch, vec_get(entries, at)));
+        store64(c + AGN_AC_HEAD, (at + 1) % vec_len(entries));
+        sa = vec_get(slots, at);
+        reset_via(sa);
     }
-    vec_push(entries, e);
+
+    # **The entry owns its strings — see above**, in its slot, and a copy of its metadata.
+    var e = _agnosai_audit_entry_copy_a(sa, t);
+    var prev = load64(c + AGN_AC_LAST_HASH);
+    store64(e + AGN_AE_PREV_HASH, str_clone_a(sa, prev));
+    store64(e + AGN_AE_SIGNATURE,
+      str_clone_a(sa, _agnosai_audit_sign_a(scratch, load64(c + AGN_AC_KEY), entry_hash, prev)));
+    _agnosai_audit_hash_set(prev, entry_hash);
+    vec_set(entries, at, e);
     mutex_unlock(mtx);
     return e;
 }
@@ -391,12 +496,14 @@ fn agnosai_audit_record_a(scratch, c, event: Str, level: Str, message: Str, prov
 # request-arena slot with it. So the lifetime is the caller's to state, which is
 # also what every other `_a` in this tree does.
 #
-# Passing 0 is not valid; this wrapper passes `default_alloc()`, which is
-# exactly the pre-existing behaviour.
+# Passing 0 is not valid. This wrapper takes a scratch from the chain's pool (2.5.2), where through
+# 2.5.1 it passed `default_alloc()` and every record left its hashing on the global heap.
 fn agnosai_audit_record(c, event: Str, level: Str, message: Str, provider, model,
   metadata): i64 {
-    return agnosai_audit_record_a(default_alloc(), c, event, level, message, provider,
-      model, metadata);
+    var s = agnosai_audit_scratch_acquire();
+    var e = agnosai_audit_record_a(s, c, event, level, message, provider, model, metadata);
+    agnosai_audit_scratch_release(s);
+    return e;
 }
 
 # The oracle's failure text: `Entry {i} ({id}): {reason}`.
@@ -422,24 +529,33 @@ fn agnosai_audit_verify(c): i64 {
     mutex_lock(mtx);
     var entries = load64(c + AGN_AC_ENTRIES);
     var key = load64(c + AGN_AC_KEY);
-    var prev = load64(c + AGN_AC_FIRST_VALID_HASH);
     var failure = 0;
+    # Each entry's working in a pooled scratch, reset as it goes (2.5.2): through 2.5.1 a verify left
+    # a hash tree and a signature on the global heap for every entry it read. The hash an entry is
+    # checked against next is kept in this stack cell, as the scratch it was made in is reset.
+    var s = agnosai_audit_scratch_acquire();
+    var cell[80];
+    store64(&cell, &cell + 16);
+    store64(&cell + 8, 64);
+    memcpy(&cell + 16, str_data(load64(c + AGN_AC_FIRST_VALID_HASH)), 64);
+    var prev = &cell;
 
     for (var i = 0; i < vec_len(entries); i = i + 1) {
-        var e = vec_get(entries, i);
+        var e = _agnosai_audit_at_locked(c, i);
         if (str_eq(load64(e + AGN_AE_PREV_HASH), prev) == 0) {
             failure = _agnosai_audit_failure(i, load64(e + AGN_AE_ID), "previous hash mismatch");
             break;
         }
-        var entry_hash = _agnosai_audit_entry_hash(e);
-        if (str_eq(load64(e + AGN_AE_SIGNATURE),
-            _agnosai_audit_sign(key, entry_hash, prev)) == 0) {
+        var entry_hash = _agnosai_audit_entry_hash_a(s, e);
+        if (str_eq(load64(e + AGN_AE_SIGNATURE), _agnosai_audit_sign_a(s, key, entry_hash, prev)) == 0) {
             failure = _agnosai_audit_failure(i, load64(e + AGN_AE_ID),
               "signature verification failed");
             break;
         }
-        prev = entry_hash;
+        memcpy(&cell + 16, str_data(entry_hash), 64);
+        reset_via(s);
     }
+    agnosai_audit_scratch_release(s);
     mutex_unlock(mtx);
     return failure;
 }

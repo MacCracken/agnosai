@@ -863,26 +863,24 @@ fn _agnosai_tool_span_capture(span, input, out): i64 {
 #
 # ⚠ **Its own scratch, for its own reasons.** An entry's hash tree is ~4.6 KiB of garbage, and a
 # turn can write 16 entries, so it does not go in the conversation's arena. The arguments and the
-# result stay out altogether: the chain is kept for good, and the record on the task is where a
+# result stay out altogether: the chain outlives the crew, and the record on the task is where a
 # call's content is.
 fn _agnosai_tool_audit(st, c, event, level): i64 {
     var chain = load64(load64(st + AGN_TT_LOOP) + AGN_TL_AUDIT);
     if (chain == 0) { return 0; }
 
-    # On the global heap, owning its strings: the entry keeps this for as long as the chain does.
-    var md = bayan_json_v_obj_new();
-    bayan_json_v_obj_set(md, str_from("crew_id"),
-      bayan_json_v_str_new(str_clone(agnosai_tool_call_crew_id(c))));
-    bayan_json_v_obj_set(md, str_from("task_id"),
-      bayan_json_v_str_new(str_clone(agnosai_task_id(load64(st + AGN_TT_TASK)))));
-    bayan_json_v_obj_set(md, str_from("call_id"),
-      bayan_json_v_str_new(str_clone(load64(c + AGN_TC_ID))));
-    bayan_json_v_obj_set(md, str_from("effect"), bayan_json_v_str_new(
-        str_from(agnosai_tool_effect_to_wire(agnosai_tool_call_effect(c)))));
-
+    # In the record's scratch: the entry keeps a copy (2.5.2), where through 2.5.1 this was built on
+    # the global heap, owning its strings, for every call.
     var scratch = _agnosai_tool_arena_acquire();
     var s = scratch;
     if (s == 0) { s = default_alloc(); }
+    var md = bayan_json_v_obj_new_a(s);
+    bayan_json_v_obj_set_a(s, md, str_from_a(s, "crew_id"), bayan_json_v_str_new_a(s, agnosai_tool_call_crew_id(c)));
+    bayan_json_v_obj_set_a(s, md, str_from_a(s, "task_id"),
+      bayan_json_v_str_new_a(s, agnosai_task_id(load64(st + AGN_TT_TASK))));
+    bayan_json_v_obj_set_a(s, md, str_from_a(s, "call_id"), bayan_json_v_str_new_a(s, load64(c + AGN_TC_ID)));
+    bayan_json_v_obj_set_a(s, md, str_from_a(s, "effect"), bayan_json_v_str_new_a(s,
+        str_from_a(s, agnosai_tool_effect_to_wire(agnosai_tool_call_effect(c)))));
     agnosai_audit_record_a(s, chain, str_from_a(s, event), str_from_a(s, level),
       load64(c + AGN_TC_NAME), 0, 0, md);
     if (scratch != 0) { _agnosai_tool_arena_release(scratch); }

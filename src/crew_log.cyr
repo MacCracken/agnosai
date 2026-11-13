@@ -78,14 +78,12 @@ enum AgnosaiCrewLogOff {
 }
 
 # Every line is rendered in an arena from here and handed back, so a crew's log costs its heap
-# nothing that outlives the write.
-var _AGNOSAI_CREW_LOG_POOL = 0;
+# nothing that outlives the write. ⚠ **Built eagerly, at module scope**, as `src/arena_pool.cyr`
+# requires (2.5.2): through 2.5.0 and 2.5.1 it was made on first use, which a wave's first two
+# workers could race, the loser's arenas left for good.
+var _AGNOSAI_CREW_LOG_POOL = agnosai_arena_pool_new(4, 8192);
 
 fn _agnosai_crew_log_pool(): i64 {
-    if (_AGNOSAI_CREW_LOG_POOL == 0) {
-        var p = agnosai_arena_pool_new(4, 8192);
-        if (atomic_cas(&_AGNOSAI_CREW_LOG_POOL, 0, p) == 0) { return load64(&_AGNOSAI_CREW_LOG_POOL); }
-    }
     return _AGNOSAI_CREW_LOG_POOL;
 }
 

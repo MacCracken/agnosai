@@ -1726,6 +1726,17 @@ fn _t_cost_suite(): i64 {
     _t_quiet_ask = _t_body("", _t_calls(_t_call("c1", "kept", "\"{}\""), 0, 0));
     assert_eq(_t_cost(_t_agent("kept", 0, 0), _t_loop(gated, 0, 0), 100), 0, "nor a gate's refusal");
 
+    # With the crew's audit chain on, a call's two entries are the ring's, and their metadata is built
+    # in the call's scratch (2.5.2): once a small ring is full, nothing stays.
+    var chain = agnosai_audit_chain_with_key(alloc(AGNOSAI_AUDIT_KEY_BYTES), 8);
+    _t_quiet_ask = _t_body("", _t_calls(_t_call("c1", "kept", "\"{}\""), 0, 0));
+    assert_eq(_t_cost(_t_agent("kept", 0, 0), _t_loop(reg, 0, chain), 100), 0,
+      "a call with the audit chain on leaves nothing, its entries the ring's");
+    assert_eq(agnosai_audit_chain_count(chain), 8, "the ring is full");
+    assert_eq(agnosai_audit_verify(chain), 0, "and verifies");
+    _t_quiet_ask = _t_body("", _t_calls(_t_call("c1", "nope", "\"{}\""), 0, 0));
+    assert_eq(_t_cost(_t_agent("kept", 0, 0), _t_loop(reg, 0, chain), 100), 0, "nor a refused one");
+
     # `execute_fp` is unchanged, so a tool that ignores its allocator still works, at its own cost.
     _t_quiet_ask = _t_body("", _t_calls(_t_call("c1", "double", "\"{\\\"x\\\":1}\""), 0, 0));
     var per_call = _t_cost(_t_agent("double", 0, 0), loop, 100) / 100;

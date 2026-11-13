@@ -1994,6 +1994,26 @@ fn main() {
     assert(str_eq(agnosai_audit_entry_event(vec_get(agnosai_audit_chain_recent(chain, 1), 0)),
         str_from("task_completed")) == 1, "under the task_completed event name");
 
+    # A reviewer's decision is built in a scratch of the chain's pool, which goes back (2.5.2): once
+    # a small ring is full, auditing one keeps nothing on the global heap.
+    var dchain = agnosai_audit_chain_with_key(alloc(AGNOSAI_AUDIT_KEY_BYTES), 4);
+    var dr = agnosai_crew_runner_with_audit(agnosai_crew_runner_new(au_spec), dchain);
+    var dtask = vec_get(seq_tasks, 0);
+    var why = str_from("looks right");
+    for (var dw = 0; dw < 16; dw = dw + 1) {
+        _agnosai_crew_audit_decided(dr, dtask, AGNOSAI_APPROVAL_APPROVED, why);
+        _agnosai_crew_audit_decided(dr, dtask, AGNOSAI_APPROVAL_REJECTED, why);
+    }
+    var dbefore = alloc_used();
+    for (var di = 0; di < 32; di = di + 1) {
+        _agnosai_crew_audit_decided(dr, dtask, AGNOSAI_APPROVAL_APPROVED, why);
+        _agnosai_crew_audit_decided(dr, dtask, AGNOSAI_APPROVAL_REJECTED, why);
+    }
+    assert_eq(alloc_used() - dbefore, 0, "a reviewer's decision, audited, keeps nothing on the global heap");
+    assert(str_eq_cstr(agnosai_audit_entry_event(vec_get(agnosai_audit_chain_recent(dchain, 1), 0)),
+        "approval_decided") == 1, "and is in the ring");
+    assert_eq(agnosai_audit_verify(dchain), 0, "which verifies");
+
     # the parallel path does NOT audit — the oracle's asymmetry, reproduced
     var au2 = agnosai_audit_chain_new();
     var au_par = agnosai_crew_new(str_from("audited-par"));
