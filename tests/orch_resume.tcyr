@@ -1,0 +1,813 @@
+# =========================================================================
+# orch_resume.tcyr — resuming a crew from its log (2.5.0, ADR 036).
+#
+# A stop is staged by cutting a finished crew's log back to a point in its run, as a process
+# that died there would have left it, and the crew is resumed from what is left. What a resume
+# must do, each checked here:
+#
+#   * a task the log finished keeps its result and is not run again, in every process mode;
+#   * an answer that waited on a reviewer is asked about again, and not paid for again;
+#   * a task whose earlier attempt made a call whose effect may stand waits for a reviewer before
+#     it runs again: rejected or with no gate it fails, naming the calls, and the tool does not
+#     run; approved it runs, and its result names them;
+#   * its events go on from the log's last `seq`, so the log has no gap across the stop;
+#   * what its finished tasks spent counts against its budget;
+#   * through the orchestrator, a crew whose log ended goes back as it ended, one whose log did
+#     not is resumed, a crew cancelled while it waited is not, and a forgotten crew's log goes.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/strcase.cyr"
+include "src/telemetry/mod.cyr"
+include "src/core/error.cyr"
+include "src/core/json.cyr"
+include "src/core/message.cyr"
+include "src/core/resource.cyr"
+include "src/core/task.cyr"
+include "src/core/agent.cyr"
+include "src/core/crew.cyr"
+include "src/orchestrator/scheduler.cyr"
+include "src/orchestrator/audit.cyr"
+include "src/llm/retry.cyr"
+include "src/llm/hoosh.cyr"
+include "src/llm/router.cyr"
+include "src/orchestrator/scoring.cyr"
+include "src/orchestrator/output_validation.cyr"
+include "src/server/prompt_guard.cyr"
+include "src/server/output_filter.cyr"
+include "src/chan_lossy.cyr"
+include "src/server/sse.cyr"
+include "src/server/prometheus.cyr"
+include "src/arena_pool.cyr"
+include "src/sandbox/policy.cyr"
+include "src/sandbox/kavach_bridge.cyr"
+include "src/server/ssrf.cyr"
+include "src/tools/native.cyr"
+include "src/tools/registry.cyr"
+include "src/tool_call.cyr"
+include "src/tool_loop.cyr"
+include "src/model_catalog.cyr"
+include "src/orchestrator/approval.cyr"
+include "src/orchestrator/crew_runner.cyr"
+include "src/crew_arena.cyr"
+include "src/orchestrator/orchestrator.cyr"
+include "tests/test_helpers.cyr"
+include "tests/test_tmp.cyr"
+
+var _T_DIR = _tt_tmp_path("resume", "");
+
+fn _t_store(): i64 {
+    return agnosai_state_store_new(str_from(_T_DIR));
+}
+
+# ── a stub gateway that numbers its answers ────────────────────────────────
+
+var _t_answers = 0;
+var _t_requests = 0;
+
+fn _t_body(text: Str, calls): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"model\":\"m\",\"choices\":[{\"message\":{\"content\":\"");
+    str_builder_add(sb, text);
+    str_builder_add_cstr(sb, "\"");
+    if (calls != 0) {
+        str_builder_add_cstr(sb, ",\"tool_calls\":");
+        str_builder_add_cstr(sb, calls);
+    }
+    str_builder_add_cstr(sb, "}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,");
+    str_builder_add_cstr(sb, "\"cost_micro_usd\":100,\"provider\":\"p\"}}");
+    return str_builder_build(sb);
+}
+
+# Answers `answer-<n>`, n counting every answer; a task with tools calls `note` once first.
+fn _t_chat(client, request, out_response, parent_sc): i64 {
+    var a = agnosai_inference_request_alloc(request);
+    vec_push(_t_requests, agnosai_inference_request_to_json(request));
+    var msgs = agnosai_inference_request_messages(request);
+    var last = vec_get(msgs, vec_len(msgs) - 1);
+    var tools = agnosai_inference_request_tools(request);
+    if (agnosai_chat_message_role(last) != AGNOSAI_ROLE_TOOL && tools != 0 && vec_len(tools) > 0) {
+        store64(out_response, agnosai_hoosh_response_from_body_a(a, _t_body(str_from(""),
+              "[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"note\",\"arguments\":\"{}\"}}]")));
+        return 0;
+    }
+    var n = atomic_fetch_add(&_t_answers, 1) + 1;
+    store64(out_response, agnosai_hoosh_response_from_body_a(a, _t_body(str_cat(str_from("answer-"),
+            str_from_int(n)), 0)));
+    return 0;
+}
+
+fn _t_client(): i64 {
+    return agnosai_hoosh_client_with_chat(agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"),
+        str_from("")), &_t_chat);
+}
+
+var _t_tool_runs = 0;
+
+fn _t_note_exec(ctx, input): i64 {
+    atomic_fetch_add(&_t_tool_runs, 1);
+    return agnosai_tool_output_ok(bayan_json_v_str_new(str_from("noted")));
+}
+
+fn _t_schema(a, ctx): i64 {
+    return agnosai_tool_schema_new_a(a, str_from_a(a, "ignored"), str_from_a(a, "a test tool"));
+}
+
+fn _t_registry(): i64 {
+    var r = agnosai_tool_registry_new();
+    agnosai_tool_registry_register(r, agnosai_tool_new(str_from("note"), str_from("writes a note"), &_t_schema,
+        &_t_note_exec, 0));
+    return r;
+}
+
+# ── crews ──────────────────────────────────────────────────────────────────
+
+fn _t_spec(name, n, process, tools): i64 {
+    var spec = agnosai_crew_new(str_from(name));
+    var agents = vec_new();
+    var ag = agnosai_agent_new(str_from("worker"), str_from("tester"), str_from("test things"));
+    if (tools == 1) {
+        var held = vec_new();
+        vec_push(held, str_from("note"));
+        agnosai_agent_with_tools(ag, held);
+    }
+    vec_push(agents, ag);
+    agnosai_crew_with_agents(spec, agents);
+    var tasks = vec_new();
+    for (var i = 0; i < n; i = i + 1) {
+        vec_push(tasks, agnosai_task_new(str_cat(str_from("task "), str_from_int(i))));
+    }
+    agnosai_crew_with_tasks(spec, tasks);
+    agnosai_crew_with_process(spec, process);
+    return spec;
+}
+
+# A runner for `spec` that keeps `log`, resumes from `rp` (or 0), with tools when `tools` is 1 and
+# `gate` (or 0) for its reviewer.
+fn _t_runner(spec, log, rp, tools, gate): i64 {
+    var r = agnosai_crew_runner_new(spec);
+    agnosai_crew_runner_with_llm(r, _t_client());
+    agnosai_crew_runner_with_log(r, log);
+    agnosai_crew_runner_with_replay(r, rp);
+    if (tools == 1) { agnosai_crew_runner_with_tools(r, _t_registry(), 0); }
+    agnosai_crew_runner_with_approval(r, gate, 0);
+    return r;
+}
+
+fn _t_run(r): i64 {
+    var err: i64[1];
+    store64(&err, 0);
+    return agnosai_crew_runner_run(r, &err);
+}
+
+# Run `spec` to the end with a log in `store`. Returns the state.
+fn _t_first_run(store, spec, tools, gate): i64 {
+    var err: i64[1];
+    var log = agnosai_crew_log_open_a(default_alloc(), store, spec, &err);
+    return _t_run(_t_runner(spec, log, 0, tools, gate));
+}
+
+# ── staging a stop ─────────────────────────────────────────────────────────
+
+fn _t_log_text(store, crew_id: Str): i64 {
+    var bytes = 0;
+    var len = 0;
+    if (agnosai_state_store_read_log(store, crew_id, &bytes, &len) != 0) { return 0; }
+    if (bytes == AGNOSAI_STATE_ABSENT) { return 0; }
+    return str_new(bytes, len);
+}
+
+# The log's lines, as Strs, in file order.
+fn _t_raw_lines(store, crew_id: Str): i64 {
+    var out = vec_new();
+    var text = _t_log_text(store, crew_id);
+    if (text == 0) { return out; }
+    var d = str_data(text);
+    var start = 0;
+    for (var i = 0; i < str_len(text); i = i + 1) {
+        if (load8(d + i) == 10) {
+            vec_push(out, str_new(d + start, i - start + 1));
+            start = i + 1;
+        }
+    }
+    return out;
+}
+
+# Cut a crew's log back to its lines up to and including the `nth` holding `marker`, as a process
+# that died just after writing it would leave it. Returns how many lines are kept.
+fn _t_stop_after(store, crew_id: Str, marker, nth): i64 {
+    var lines = _t_raw_lines(store, crew_id);
+    agnosai_state_store_remove(store, crew_id);
+    var seen = 0;
+    var kept = 0;
+    for (var i = 0; i < vec_len(lines); i = i + 1) {
+        var l = vec_get(lines, i);
+        agnosai_state_store_append(store, crew_id, str_data(l), str_len(l), 0);
+        kept = kept + 1;
+        if (str_contains(l, str_from(marker)) == 1) {
+            seen = seen + 1;
+            if (seen == nth) { return kept; }
+        }
+    }
+    return kept;
+}
+
+# Read a crew's log back and resume it in a runner. Returns the runner; its state through `out`.
+fn _t_resume(store, crew_id: Str, tools, gate, out_state): i64 {
+    var err: i64[1];
+    var rp = agnosai_crew_log_read(store, crew_id, &err);
+    assert(rp != 0, "the cut log reads back");
+    var spec = agnosai_crew_replay_spec(rp);
+    var log = agnosai_crew_log_reopen_a(default_alloc(), store, crew_id, agnosai_crew_replay_run(rp) + 1);
+    var r = _t_runner(spec, log, rp, tools, gate);
+    store64(out_state, _t_run(r));
+    return r;
+}
+
+fn _t_outputs(state): i64 {
+    var out = vec_new();
+    var results = agnosai_crew_state_results(state);
+    for (var i = 0; i < vec_len(results); i = i + 1) {
+        vec_push(out, agnosai_task_result_output(vec_get(results, i)));
+    }
+    return out;
+}
+
+fn _t_count_lines(store, crew_id: Str, marker): i64 {
+    var lines = _t_raw_lines(store, crew_id);
+    var n = 0;
+    for (var i = 0; i < vec_len(lines); i = i + 1) {
+        if (str_contains(vec_get(lines, i), str_from(marker)) == 1) { n = n + 1; }
+    }
+    return n;
+}
+
+# Whether the log's event seqs, put in order, are 1, 2, 3 … with no gap.
+fn _t_gapless(store, crew_id: Str): i64 {
+    var lines = _t_raw_lines(store, crew_id);
+    var seqs = vec_new();
+    for (var i = 0; i < vec_len(lines); i = i + 1) {
+        var l = vec_get(lines, i);
+        var v = bayan_json_v_parse_buf(str_data(l), str_len(l) - 1);
+        var sv = bayan_json_v_obj_get_by_cstr(v, "seq");
+        if (sv != 0) { vec_push(seqs, bayan_json_v_int(sv)); }
+    }
+    for (var want = 1; want <= vec_len(seqs); want = want + 1) {
+        var found = 0;
+        for (var j = 0; j < vec_len(seqs); j = j + 1) {
+            if (vec_get(seqs, j) == want) { found = found + 1; }
+        }
+        if (found != 1) { return 0; }
+    }
+    return 1;
+}
+
+fn _t_reset(): i64 {
+    _t_answers = 0;
+    _t_requests = vec_new();
+    _t_tool_runs = 0;
+    return 0;
+}
+
+# `s` with every `from` made `to`.
+fn _t_replace(s: Str, from, to): i64 {
+    var sb = str_builder_new();
+    var d = str_data(s);
+    var n = str_len(s);
+    var fl = strlen(from);
+    var i = 0;
+    while (i < n) {
+        if (i + fl <= n && memeq(d + i, from, fl) == 1) {
+            str_builder_add_cstr(sb, to);
+            i = i + fl;
+        } else {
+            var one = str_new(d + i, 1);
+            str_builder_add(sb, one);
+            i = i + 1;
+        }
+    }
+    return str_builder_build(sb);
+}
+
+# ── finished tasks stand ───────────────────────────────────────────────────
+
+fn test_sequential(): i64 {
+    _t_reset();
+    var store = _t_store();
+    var spec = _t_spec("seq", 4, agnosai_process_sequential(), 0);
+    var id = agnosai_crew_id(spec);
+    _t_first_run(store, spec, 0, 0);
+    assert_eq(_t_answers, 4, "the first run answers four tasks");
+    _t_stop_after(store, id, "\"event\":\"task_completed\"", 2);
+
+    _t_answers = 4;
+    var st: i64[1];
+    var r = _t_resume(store, id, 0, 0, &st);
+    var state = load64(&st);
+    assert_eq(agnosai_crew_state_status(state), AGNOSAI_CREW_COMPLETED, "the resumed crew completes");
+    assert_eq(_t_answers, 6, "having asked the model only for the two tasks its log had not finished");
+    var outs = _t_outputs(state);
+    assert_eq(vec_len(outs), 4, "with all four results");
+    assert(str_eq_cstr(vec_get(outs, 0), "answer-1") == 1 && str_eq_cstr(vec_get(outs, 1), "answer-2") == 1,
+      "the first two as the log has them");
+    assert(str_eq_cstr(vec_get(outs, 2), "answer-5") == 1 && str_eq_cstr(vec_get(outs, 3), "answer-6") == 1,
+      "the last two answered now, in order");
+    assert(_t_gapless(store, id) == 1, "its events go on from the log's last seq: no gap across the stop");
+    assert_eq(_t_count_lines(store, id, "\"resumed\":true"), 1, "and its crew_started says it resumed");
+    assert_eq(_t_count_lines(store, id, "\"run\":2"), 1, "as its second run");
+    var snap = agnosai_crew_runner_snapshot_a(default_alloc(), r);
+    assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(snap, "status")), "completed") == 1,
+      "its snapshot says it completed");
+    agnosai_state_store_remove(store, id);
+    return 0;
+}
+
+fn test_dag_and_parallel(): i64 {
+    _t_reset();
+    var store = _t_store();
+    # A DAG: b depends on a, and is handed a's answer from the log.
+    var spec = _t_spec("dag", 2, agnosai_process_dag(), 0);
+    var tasks = agnosai_crew_tasks(spec);
+    agnosai_task_with_dependency(vec_get(tasks, 1), agnosai_task_id(vec_get(tasks, 0)));
+    var id = agnosai_crew_id(spec);
+    _t_first_run(store, spec, 0, 0);
+    _t_stop_after(store, id, "\"event\":\"task_completed\"", 1);
+    _t_answers = 10;
+    _t_requests = vec_new();
+    var st: i64[1];
+    _t_resume(store, id, 0, 0, &st);
+    assert_eq(agnosai_crew_state_status(load64(&st)), AGNOSAI_CREW_COMPLETED, "a resumed DAG completes");
+    assert_eq(vec_len(_t_requests), 1, "running only the task its log had not finished");
+    assert(str_contains(vec_get(_t_requests, 0), str_from("answer-1")) == 1,
+      "which is handed its dependency's answer, from the log");
+    agnosai_state_store_remove(store, id);
+
+    # Parallel: what finished comes first, and the rest runs.
+    _t_reset();
+    var pspec = _t_spec("par", 6, agnosai_process_parallel(3), 0);
+    var pid = agnosai_crew_id(pspec);
+    _t_first_run(store, pspec, 0, 0);
+    _t_stop_after(store, pid, "\"event\":\"task_completed\"", 3);
+    _t_answers = 0;
+    var pst: i64[1];
+    _t_resume(store, pid, 0, 0, &pst);
+    assert_eq(agnosai_crew_state_status(load64(&pst)), AGNOSAI_CREW_COMPLETED, "a resumed parallel crew completes");
+    assert_eq(_t_answers, 3, "running the three its log had not finished");
+    assert_eq(vec_len(agnosai_crew_state_results(load64(&pst))), 6, "with six results");
+    agnosai_state_store_remove(store, pid);
+    return 0;
+}
+
+fn test_failed_stays_failed(): i64 {
+    _t_reset();
+    var store = _t_store();
+    var spec = _t_spec("fail", 2, agnosai_process_sequential(), 0);
+    var id = agnosai_crew_id(spec);
+    _t_first_run(store, spec, 0, 0);
+    # Rewrite the first task's completion as a failure, as a gateway refusing it would have left it.
+    var lines = _t_raw_lines(store, id);
+    agnosai_state_store_remove(store, id);
+    var done = 0;
+    for (var i = 0; i < vec_len(lines); i = i + 1) {
+        var l = vec_get(lines, i);
+        if (done == 0 && str_contains(l, str_from("\"event\":\"task_completed\"")) == 1) {
+            l = _t_replace(l, "\"status\":\"completed\"", "\"status\":\"failed\"");
+            agnosai_state_store_append(store, id, str_data(l), str_len(l), 0);
+            done = 1;
+            i = vec_len(lines);
+        } else { agnosai_state_store_append(store, id, str_data(l), str_len(l), 0); }
+    }
+    _t_answers = 0;
+    var st: i64[1];
+    _t_resume(store, id, 0, 0, &st);
+    assert_eq(_t_answers, 1, "a resume is not a retry: a task its log failed does not run again");
+    assert_eq(agnosai_crew_state_status(load64(&st)), AGNOSAI_CREW_FAILED, "and the crew fails, as it would have");
+    agnosai_state_store_remove(store, id);
+
+    # A DAG whose task failed before the stop: its dependent is stranded, as it was, and the crew
+    # fails for the task, not as a crew that cannot run.
+    var dspec = _t_spec("fail-dag", 2, agnosai_process_dag(), 0);
+    var dtasks = agnosai_crew_tasks(dspec);
+    agnosai_task_with_dependency(vec_get(dtasks, 1), agnosai_task_id(vec_get(dtasks, 0)));
+    var did = agnosai_crew_id(dspec);
+    _t_first_run(store, dspec, 0, 0);
+    var dlines = _t_raw_lines(store, did);
+    agnosai_state_store_remove(store, did);
+    for (var k = 0; k < vec_len(dlines); k = k + 1) {
+        var dl = vec_get(dlines, k);
+        if (str_contains(dl, str_from("\"event\":\"task_completed\"")) == 1) {
+            dl = _t_replace(dl, "\"status\":\"completed\"", "\"status\":\"failed\"");
+            agnosai_state_store_append(store, did, str_data(dl), str_len(dl), 0);
+            k = vec_len(dlines);
+        } else { agnosai_state_store_append(store, did, str_data(dl), str_len(dl), 0); }
+    }
+    _t_answers = 0;
+    var dst: i64[1];
+    var derr: i64[1];
+    var drp = agnosai_crew_log_read(store, did, &derr);
+    var dr = _t_runner(agnosai_crew_replay_spec(drp), agnosai_crew_log_reopen_a(default_alloc(), store, did, 2), drp,
+      0, 0);
+    store64(&derr, 0);
+    store64(&dst, agnosai_crew_runner_run(dr, &derr));
+    assert_eq(load64(&derr), 0, "a resumed DAG whose task failed is not an unrunnable crew");
+    assert_eq(_t_answers, 0, "its dependent does not run");
+    assert(load64(&dst) != 0 && agnosai_crew_state_status(load64(&dst)) == AGNOSAI_CREW_FAILED, "and it fails");
+    assert(str_eq_cstr(agnosai_crew_state_reason(load64(&dst)), "task_failed") == 1, "for its task");
+    agnosai_state_store_remove(store, did);
+    return 0;
+}
+
+# ── an answer that waited on its reviewer ──────────────────────────────────
+
+var _t_rv_gate = 0;
+var _t_rv_decision = 0;
+var _t_rv_done = 0;
+var _t_rv_output = 0;
+var _t_rv_resume = 0;
+
+fn _t_reviewer(arg): i64 {
+    var until = clock_now_ns() + 10000 * AGNOSAI_NS_PER_MS;
+    while (clock_now_ns() < until && agnosai_approval_gate_pending_count(_t_rv_gate) < 1) { sleep_ms(1); }
+    var pending = agnosai_approval_gate_pending_tasks(_t_rv_gate);
+    for (var i = 0; i < vec_len(pending); i = i + 1) {
+        agnosai_approval_submit_decision(_t_rv_gate, vec_get(pending, i), _t_rv_decision);
+    }
+    atomic_store(&_t_rv_done, 1);
+    return 0;
+}
+
+fn _t_review(gate, decision): i64 {
+    _t_rv_gate = gate;
+    _t_rv_decision = decision;
+    atomic_store(&_t_rv_done, 0);
+    return thread_create_detached(&_t_reviewer, 0);
+}
+
+fn _t_review_wait(): i64 {
+    while (atomic_load(&_t_rv_done) == 0) { sleep_ms(1); }
+    return 0;
+}
+
+fn test_answered(): i64 {
+    _t_reset();
+    var store = _t_store();
+    var spec = _t_spec("answered", 1, agnosai_process_sequential(), 0);
+    agnosai_task_with_risk(vec_get(agnosai_crew_tasks(spec), 0), AGNOSAI_RISK_HIGH);
+    var id = agnosai_crew_id(spec);
+    var gate = agnosai_approval_gate_new();
+    _t_review(gate, AGNOSAI_APPROVAL_APPROVED);
+    _t_first_run(store, spec, 0, gate);
+    _t_review_wait();
+    assert_eq(_t_answers, 1, "the first run answers once");
+    _t_stop_after(store, id, "\"event\":\"approval_requested\"", 1);
+    var aerr: i64[1];
+    var arp = agnosai_crew_log_read(store, id, &aerr);
+    var atid = agnosai_task_id(vec_get(agnosai_crew_tasks(agnosai_crew_replay_spec(arp)), 0));
+    assert(agnosai_crew_replay_answered(arp, atid) != 0, "the log holds the answer that waited on its reviewer");
+    assert_eq(agnosai_crew_replay_finished(arp, atid), 0, "and the task is not finished");
+
+    _t_answers = 0;
+    _t_review(gate, AGNOSAI_APPROVAL_APPROVED);
+    var st: i64[1];
+    _t_resume(store, id, 0, gate, &st);
+    _t_review_wait();
+    var state = load64(&st);
+    assert_eq(_t_answers, 0, "an answer that waited on its reviewer is not paid for again");
+    assert_eq(agnosai_crew_state_status(state), AGNOSAI_CREW_COMPLETED, "the reviewer is asked again, and approves");
+    var res = vec_get(agnosai_crew_state_results(state), 0);
+    assert(str_eq_cstr(agnosai_task_result_output(res), "answer-1") == 1, "the answer is the one the log kept");
+    var ap = map_get(agnosai_task_result_metadata(res), str_from("approval"));
+    assert(ap != 0 && str_eq_cstr(bayan_json_v_str(ap), "approved") == 1, "approved now");
+    agnosai_state_store_remove(store, id);
+    return 0;
+}
+
+# ── a call whose effect may stand ──────────────────────────────────────────
+
+fn _t_uncertain_first(store, spec): i64 {
+    _t_reset();
+    var id = agnosai_crew_id(spec);
+    _t_first_run(store, spec, 1, 0);
+    assert_eq(_t_tool_runs, 1, "the first run calls its tool once");
+    # Stopped after the intent went down, as if the tool had begun and the process died.
+    _t_stop_after(store, id, "\"journal\":\"intent\"", 1);
+    _t_tool_runs = 0;
+    _t_answers = 0;
+    return id;
+}
+
+fn test_uncertain(): i64 {
+    var store = _t_store();
+
+    # Rejected: the task fails, names the call, and its tool does not run.
+    var spec = _t_spec("uncertain-no", 1, agnosai_process_sequential(), 1);
+    var id = _t_uncertain_first(store, spec);
+    var gate = agnosai_approval_gate_new();
+    _t_review(gate, AGNOSAI_APPROVAL_REJECTED);
+    var st: i64[1];
+    _t_resume(store, id, 1, gate, &st);
+    _t_review_wait();
+    var state = load64(&st);
+    assert_eq(_t_tool_runs, 0, "a task whose call may have taken effect does not run again unasked");
+    assert_eq(_t_answers, 0, "nor asks the model");
+    assert_eq(agnosai_crew_state_status(state), AGNOSAI_CREW_FAILED, "rejected, its crew fails");
+    var res = vec_get(agnosai_crew_state_results(state), 0);
+    assert(str_contains(agnosai_task_result_output(res), str_from("not resumed")) == 1, "saying it was not resumed");
+    var calls = map_get(agnosai_task_result_metadata(res), str_from("uncertain_calls"));
+    assert(calls != 0 && bayan_json_v_arr_len(calls) == 1, "and naming the call");
+    var c0 = bayan_json_v_arr_get(calls, 0);
+    assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(c0, "tool")), "note") == 1, "by its tool");
+    assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(c0, "effect")), "unknown") == 1,
+      "an intent with no result: unknown");
+    assert(_t_count_lines(store, id, "\"resume\":true") == 1, "the reviewer was asked with `resume: true`");
+    assert(_t_count_lines(store, id, "may repeat them") == 1, "and told what may repeat");
+    agnosai_state_store_remove(store, id);
+
+    # With no gate: refused at once.
+    var nspec = _t_spec("uncertain-nogate", 1, agnosai_process_sequential(), 1);
+    var nid = _t_uncertain_first(store, nspec);
+    var nst: i64[1];
+    _t_resume(store, nid, 1, 0, &nst);
+    assert_eq(_t_tool_runs, 0, "with no gate it is refused at once");
+    var nres = vec_get(agnosai_crew_state_results(load64(&nst)), 0);
+    var why = map_get(agnosai_task_result_metadata(nres), str_from("approval_reason"));
+    assert(why != 0 && str_eq_cstr(bayan_json_v_str(why), "no_gate") == 1, "with no_gate");
+    agnosai_state_store_remove(store, nid);
+
+    # Approved: it runs again, and its result names the calls a reviewer let repeat.
+    var aspec = _t_spec("uncertain-yes", 1, agnosai_process_parallel(2), 1);
+    var aid = _t_uncertain_first(store, aspec);
+    _t_review(gate, AGNOSAI_APPROVAL_APPROVED);
+    var ast: i64[1];
+    _t_resume(store, aid, 1, gate, &ast);
+    _t_review_wait();
+    assert_eq(_t_tool_runs, 1, "approved, a wave's task runs again, its tool with it");
+    assert_eq(agnosai_crew_state_status(load64(&ast)), AGNOSAI_CREW_COMPLETED, "and completes");
+    var ares = vec_get(agnosai_crew_state_results(load64(&ast)), 0);
+    assert(map_get(agnosai_task_result_metadata(ares), str_from("uncertain_calls")) != 0,
+      "its result names the calls a reviewer let repeat");
+    agnosai_state_store_remove(store, aid);
+    return 0;
+}
+
+# What the replay makes of a hand-written log: a call whose result says `none` is not uncertain, and
+# one attempt's call id does not settle another attempt's.
+fn test_replay_fold(): i64 {
+    var store = _t_store();
+    var spec = _t_spec("fold", 1, agnosai_process_sequential(), 0);
+    var id = agnosai_crew_id(spec);
+    var err: i64[1];
+    agnosai_crew_log_open_a(default_alloc(), store, spec, &err);
+    var tid = agnosai_task_id(vec_get(agnosai_crew_tasks(spec), 0));
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"journal\":\"intent\",\"run\":1,\"task_id\":\"");
+    str_builder_add(sb, tid);
+    str_builder_add_cstr(sb, "\",\"call_id\":\"c1\",\"tool\":\"read\",\"arguments\":\"{}\"}\n");
+    str_builder_add_cstr(sb, "{\"journal\":\"result\",\"run\":1,\"task_id\":\"");
+    str_builder_add(sb, tid);
+    str_builder_add_cstr(sb, "\",\"call_id\":\"c1\",\"tool\":\"read\",\"effect\":\"none\"}\n");
+    str_builder_add_cstr(sb, "{\"journal\":\"intent\",\"run\":2,\"task_id\":\"");
+    str_builder_add(sb, tid);
+    str_builder_add_cstr(sb, "\",\"call_id\":\"c1\",\"tool\":\"write\",\"arguments\":\"{}\"}\n");
+    str_builder_add_cstr(sb, "{\"journal\":\"intent\",\"run\":2,\"task_id\":\"");
+    str_builder_add(sb, tid);
+    str_builder_add_cstr(sb, "\",\"call_id\":\"c2\",\"tool\":\"send\",\"arguments\":\"{}\"}\n");
+    str_builder_add_cstr(sb, "{\"journal\":\"result\",\"run\":2,\"task_id\":\"");
+    str_builder_add(sb, tid);
+    str_builder_add_cstr(sb, "\",\"call_id\":\"c2\",\"tool\":\"send\",\"effect\":\"committed\"}\n");
+    str_builder_add_cstr(sb, "{\"seq\":7,\"event\":\"token\",\"data\":{}}\n{\"torn");
+    var text = str_builder_build(sb);
+    agnosai_state_store_append(store, id, str_data(text), str_len(text), 0);
+
+    var rp = agnosai_crew_log_read(store, id, &err);
+    assert(rp != 0, "a log with a torn last line reads back");
+    assert_eq(agnosai_crew_replay_seq(rp), 7, "to its last seq");
+    assert_eq(agnosai_crew_replay_run(rp), 2, "and its last run");
+    assert_eq(agnosai_crew_replay_state(rp), 0, "a log with no end has no state: it resumes");
+    var calls = agnosai_crew_replay_uncertain_a(default_alloc(), rp, tid);
+    assert_eq(vec_len(calls), 2, "a call whose result said `none` is settled; run 2's same id is not");
+    var names = str_from("");
+    for (var i = 0; i < vec_len(calls); i = i + 1) {
+        names = str_cat(names, agnosai_replay_call_tool(vec_get(calls, i)));
+    }
+    assert(str_contains(names, str_from("write")) == 1 && str_contains(names, str_from("send")) == 1,
+      "an intent with no result, and a result that committed");
+    var effects = str_from("");
+    for (var e = 0; e < vec_len(calls); e = e + 1) {
+        var ce = vec_get(calls, e);
+        effects = str_cat(effects, agnosai_replay_call_effect(ce));
+        assert(str_eq_cstr(agnosai_replay_call_arguments(ce), "{}") == 1, "each with what it was asked");
+        assert(str_len(agnosai_replay_call_id(ce)) == 2, "and its call id");
+    }
+    assert(str_contains(effects, str_from("unknown")) == 1 && str_contains(effects, str_from("committed")) == 1,
+      "and what each did, as far as the log can say");
+    assert_eq(agnosai_crew_log_read(store, agnosai_uuid_v4_str(), &err), 0, "a crew with no log reads back as none");
+    assert_eq(load64(&err), 0, "which is not an error");
+    agnosai_state_store_remove(store, id);
+    return 0;
+}
+
+# ── what finished tasks spent ──────────────────────────────────────────────
+
+fn test_budget(): i64 {
+    _t_reset();
+    var store = _t_store();
+    var spec = _t_spec("budget", 3, agnosai_process_sequential(), 0);
+    var id = agnosai_crew_id(spec);
+    _t_first_run(store, spec, 0, 0);
+    _t_stop_after(store, id, "\"event\":\"task_completed\"", 2);
+    var err: i64[1];
+    var rp = agnosai_crew_log_read(store, id, &err);
+    var tokens = 0;
+    var tasks = agnosai_crew_tasks(agnosai_crew_replay_spec(rp));
+    for (var i = 0; i < 2; i = i + 1) {
+        tokens = tokens + _agnosai_crew_spent(agnosai_crew_replay_finished(rp, agnosai_task_id(vec_get(tasks, i))), 0);
+    }
+    assert(tokens > 0, "a finished task's result says what it spent");
+    var tenant = agnosai_budget_tracker_limits_a(default_alloc(), AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, 0, 0);
+    var crew = agnosai_budget_tracker_limits_a(default_alloc(), AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, tenant, 0);
+    var r = _t_runner(agnosai_crew_replay_spec(rp),
+      agnosai_crew_log_reopen_a(default_alloc(), store, id, 2), rp, 0, 0);
+    agnosai_crew_runner_with_budget(r, crew);
+    _t_run(r);
+    assert_eq(agnosai_budget_tracker_tokens_used(crew), tokens * 3 / 2,
+      "a resumed crew's budget counts what its finished tasks spent, and what it spends now");
+    assert_eq(agnosai_budget_tracker_tokens_used(tenant), tokens * 3 / 2, "and so does its tenant's");
+    agnosai_state_store_remove(store, id);
+    return 0;
+}
+
+# ── through the orchestrator ───────────────────────────────────────────────
+
+fn _t_wait_ended(o, id: Str): i64 {
+    var until = clock_now_ns() + 10000 * AGNOSAI_NS_PER_MS;
+    while (clock_now_ns() < until) {
+        var st = agnosai_orchestrator_crew(o, id);
+        if (st != 0) {
+            var s = agnosai_crew_state_status(st);
+            if (s == AGNOSAI_CREW_COMPLETED || s == AGNOSAI_CREW_FAILED || s == AGNOSAI_CREW_CANCELLED) {
+                if (map_get(load64(o + AGN_OR_CANCEL), id) == 0) { return st; }
+            }
+        }
+        sleep_ms(2);
+    }
+    return 0;
+}
+
+fn test_orchestrator(): i64 {
+    var store = _t_store();
+    # Placeholder crews: no gateway, so every task completes at once.
+    var o = agnosai_orchestrator_with_state_store(agnosai_orchestrator_new(0), store);
+    var done_spec = _t_spec("orch-done", 2, agnosai_process_sequential(), 0);
+    var done = agnosai_orchestrator_run_crew(o, done_spec);
+    assert_eq(agnosai_crew_state_status(done), AGNOSAI_CREW_COMPLETED, "a crew with a log runs");
+    var done_id = agnosai_crew_id(done_spec);
+    assert(_t_log_text(store, done_id) != 0, "and the orchestrator gave it one");
+
+    var cut_spec = _t_spec("orch-cut", 3, agnosai_process_sequential(), 0);
+    agnosai_orchestrator_run_crew(o, cut_spec);
+    var cut_id = agnosai_crew_id(cut_spec);
+    _t_stop_after(store, cut_id, "\"event\":\"task_completed\"", 1);
+
+    agnosai_state_store_append(store, str_from("not-a-crew"), "{}\n", 3, 0);
+
+    # A restart: a new orchestrator over the same store.
+    var o2 = agnosai_orchestrator_with_state_store(agnosai_orchestrator_new(0), store);
+    var restored: i64[1];
+    var resumed = agnosai_orchestrator_recover(o2, &restored);
+    assert_eq(agnosai_orchestrator_state_store(o2), store, "an orchestrator keeps its store");
+    assert_eq(resumed, 1, "recover resumes the crew whose log did not end");
+    assert_eq(load64(&restored), 1, "and puts back the one whose log did");
+    var back = agnosai_orchestrator_crew(o2, done_id);
+    assert(back != 0, "a finished crew answers after a restart");
+    assert_eq(agnosai_crew_state_status(back), AGNOSAI_CREW_COMPLETED, "as it ended");
+    assert_eq(vec_len(agnosai_crew_state_results(back)), 2, "with its results");
+    var snap = agnosai_orchestrator_crew_snapshot_a(default_alloc(), o2, done_id);
+    assert(snap != 0 && str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(snap, "status")), "completed") == 1,
+      "and its snapshot says so, from its state");
+    var done_snap = agnosai_orchestrator_crew_snapshot_a(default_alloc(), o, done_id);
+    assert_eq(bayan_json_v_int(bayan_json_v_obj_get_by_cstr(done_snap, "seq")),
+      _t_count_lines(store, done_id, "\"seq\":"), "a crew its runner still holds reads its last seq, its log's");
+    var cut = _t_wait_ended(o2, cut_id);
+    assert(cut != 0, "the resumed crew ends");
+    assert_eq(agnosai_crew_state_status(cut), AGNOSAI_CREW_COMPLETED, "completed");
+    assert_eq(vec_len(agnosai_crew_state_results(cut)), 3, "with every result");
+    assert_eq(_t_count_lines(store, cut_id, "\"event\":\"task_started\""), 3,
+      "having started only the two tasks its log had not finished");
+    assert_eq(_t_count_lines(store, cut_id, "\"event\":\"crew_completed\""), 1, "and ended its log");
+    assert_eq(_t_count_lines(store, cut_id, "\"run\":2"), 1, "as its second run");
+    var again = agnosai_orchestrator_resume_crew(o2, cut_id);
+    assert_eq(again, 0, "a crew the registry holds is not resumed twice");
+
+    # A third start finds both ended: nothing to resume.
+    var o3 = agnosai_orchestrator_with_state_store(agnosai_orchestrator_new(0), store);
+    var r3: i64[1];
+    assert_eq(agnosai_orchestrator_recover(o3, &r3), 0, "a crew that ended is never resumed");
+    assert_eq(load64(&r3), 2, "both are put back as they ended");
+
+    # Forgotten, a crew's log goes.
+    assert_eq(agnosai_orchestrator_forget_crew(o3, done_id), 0, "a finished crew is forgotten");
+    assert_eq(_t_log_text(store, done_id), 0, "and its log goes with it");
+    var miss: i64[1];
+    assert_eq(agnosai_orchestrator_resume_crew_err(o3, done_id, &miss), 0, "nothing is left to resume");
+    assert_eq(agnosai_error_kind(load64(&miss)), AGNOSAI_ERR_CREW_NOT_FOUND, "it is not found");
+    var none: i64[1];
+    assert_eq(agnosai_orchestrator_resume_crew_err(agnosai_orchestrator_new(0), cut_id, &none), 0,
+      "an orchestrator with no store resumes nothing");
+    assert(load64(&none) != 0, "and says so");
+    agnosai_state_store_remove(store, cut_id);
+    agnosai_state_store_remove(store, str_from("not-a-crew"));
+    return 0;
+}
+
+# A crew cancelled while it waited for its turn ends its log, so a restart does not run it.
+fn test_cancelled_while_queued(): i64 {
+    var store = _t_store();
+    var o = agnosai_orchestrator_with_state_store(agnosai_orchestrator_new(
+        agnosai_resource_budget_new(AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, 1)), store);
+    # The only turn is held here, so the crew waits for it.
+    var sem = load64(o + AGN_OR_CREW_SEM);
+    assert_eq(agnosai_semaphore_try_acquire(sem), 1, "the orchestrator's one turn is taken");
+    var spec = _t_spec("queued", 1, agnosai_process_sequential(), 0);
+    var id = agnosai_crew_id(spec);
+    agnosai_orchestrator_submit_crew(o, spec);
+    var until = clock_now_ns() + 5000 * AGNOSAI_NS_PER_MS;
+    while (clock_now_ns() < until && agnosai_semaphore_waiting(sem) < 1) { sleep_ms(1); }
+    assert_eq(agnosai_orchestrator_cancel_crew(o, id), 0, "the waiting crew is cancelled");
+    _t_wait_ended(o, id);
+    # Its run's last touch, after which its log has its end.
+    var until2 = clock_now_ns() + 5000 * AGNOSAI_NS_PER_MS;
+    while (clock_now_ns() < until2 && atomic_load(spec + AGN_CREW_RUNS) != 0) { sleep_ms(1); }
+    agnosai_semaphore_release(sem);
+    assert_eq(_t_count_lines(store, id, "\"state\":"), 1,
+      "a crew cancelled while it waited ends its log with its state");
+    assert_eq(_t_count_lines(store, id, "\"event\":"), 0, "having sent no event");
+    var o2 = agnosai_orchestrator_with_state_store(agnosai_orchestrator_new(0), store);
+    var restored: i64[1];
+    assert_eq(agnosai_orchestrator_recover(o2, &restored), 0, "so a restart resumes nothing");
+    var back = agnosai_orchestrator_crew(o2, id);
+    assert(back != 0 && agnosai_crew_state_status(back) == AGNOSAI_CREW_CANCELLED, "and it reads cancelled");
+    var snap = agnosai_orchestrator_crew_snapshot_a(default_alloc(), o, id);
+    assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(snap, "status")), "cancelled") == 1,
+      "a crew that ended before its run started reads as the registry has it, not pending");
+    agnosai_state_store_remove(store, id);
+    return 0;
+}
+
+# A crew's log goes when the crew leaves the registry, evicted or released.
+fn test_logs_leave_with_their_crews(): i64 {
+    var store = _t_store();
+    var o = agnosai_orchestrator_with_state_store(agnosai_orchestrator_new(0), store);
+    var cap = AGNOSAI_MAX_RETAINED_CREWS;
+    var low = AGNOSAI_CREWS_LOW_WATER;
+    AGNOSAI_MAX_RETAINED_CREWS = 3;
+    AGNOSAI_CREWS_LOW_WATER = 2;
+    var ids = vec_new();
+    for (var i = 0; i < 4; i = i + 1) {
+        var spec = _t_spec("evicted", 1, agnosai_process_sequential(), 0);
+        agnosai_orchestrator_run_crew(o, spec);
+        vec_push(ids, agnosai_crew_id(spec));
+    }
+    AGNOSAI_MAX_RETAINED_CREWS = cap;
+    AGNOSAI_CREWS_LOW_WATER = low;
+    assert_eq(agnosai_orchestrator_crew(o, vec_get(ids, 0)), 0, "past the cap the oldest crew is evicted");
+    assert_eq(_t_log_text(store, vec_get(ids, 0)), 0, "and its log goes with it");
+    assert(_t_log_text(store, vec_get(ids, 3)) != 0, "while the newest keeps its");
+
+    var rspec = _t_spec("released", 1, agnosai_process_sequential(), 0);
+    agnosai_orchestrator_run_crew(o, rspec);
+    var rid = str_clone(agnosai_crew_id(rspec));
+    assert(_t_log_text(store, rid) != 0, "a crew has its log");
+    assert_eq(agnosai_orchestrator_release_crew(o, rspec), 0, "until it is released");
+    assert_eq(_t_log_text(store, rid), 0, "when its log goes");
+    for (var j = 1; j < 4; j = j + 1) { agnosai_state_store_remove(store, vec_get(ids, j)); }
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+    agnosai_model_set_tier_override(AGNOSAI_TIER_FAST, str_from("stub-model"));
+    agnosai_model_set_tier_override(AGNOSAI_TIER_CAPABLE, str_from("stub-model"));
+    agnosai_model_set_tier_override(AGNOSAI_TIER_PREMIUM, str_from("stub-model"));
+    test_sequential();
+    test_dag_and_parallel();
+    test_failed_stays_failed();
+    test_answered();
+    test_uncertain();
+    test_replay_fold();
+    test_budget();
+    test_orchestrator();
+    test_cancelled_while_queued();
+    test_logs_leave_with_their_crews();
+    _tt_cleanup();
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+sys_exit_group(f);

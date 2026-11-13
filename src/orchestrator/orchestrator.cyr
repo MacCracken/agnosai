@@ -78,7 +78,13 @@ enum AgnosaiOrchestratorOff {
     AGN_OR_TENANT_USE = 128;
     # The most tasks a crew may have, or `AGNOSAI_NO_LIMIT` (ADR 033).
     AGN_OR_MAX_TASKS = 136;
-    AGN_OR_SIZE = 144;
+    # Each registered crew's runner, by id, for its snapshot (ADR 036). Unlike `CANCEL` it stays
+    # when the run ends, and goes as the crew leaves the registry, so a finished crew's snapshot
+    # says it finished.
+    AGN_OR_RUNNERS = 144;
+    # Where each crew's log goes, or 0 for none (ADR 036).
+    AGN_OR_STORE = 152;
+    AGN_OR_SIZE = 160;
 }
 
 # What a tenant has spent, through every crew it ran, and how many of its crews are admitted and
@@ -126,6 +132,8 @@ fn agnosai_orchestrator_new(budget): i64 {
     store64(o + AGN_OR_TENANTS, 0);
     store64(o + AGN_OR_TENANT_USE, map_new_str());
     store64(o + AGN_OR_MAX_TASKS, AGNOSAI_NO_LIMIT);
+    store64(o + AGN_OR_RUNNERS, map_new_str());
+    store64(o + AGN_OR_STORE, 0);
     return o;
 }
 
@@ -253,6 +261,20 @@ fn agnosai_orchestrator_with_tool_journal(o, journal): i64 {
     return o;
 }
 
+# Give every crew a log in `store` (ADR 036), or 0 for none, the default. Each crew it registers
+# writes its spec there first, then every event it sends and each tool call's intent before the
+# call runs; `agnosai_orchestrator_recover` reads them back after a restart. A crew's log goes when
+# the crew leaves the registry. Set it before any crew runs. Returns the orchestrator.
+fn agnosai_orchestrator_with_state_store(o, store): i64 {
+    store64(o + AGN_OR_STORE, store);
+    return o;
+}
+
+# The store crews' logs go to, or 0.
+fn agnosai_orchestrator_state_store(o): i64 {
+    return load64(o + AGN_OR_STORE);
+}
+
 # Replace the audit chain — the oracle's `with_audit`.
 fn agnosai_orchestrator_with_audit(o, chain): i64 {
     store64(o + AGN_OR_AUDIT, chain);
@@ -276,6 +298,54 @@ fn agnosai_orchestrator_crew(o, crew_id: Str): i64 {
     var s = map_get(load64(o + AGN_OR_CREWS), crew_id);
     mutex_unlock(mtx);
     return s;
+}
+
+# A snapshot of a crew from its state alone: its status, and each result's task and status.
+fn _agnosai_orch_state_snapshot_a(a, state): i64 {
+    var list = bayan_json_v_arr_new_a(a);
+    var results = agnosai_crew_state_results(state);
+    for (var i = 0; i < vec_len(results); i = i + 1) {
+        var res = vec_get(results, i);
+        var e = bayan_json_v_obj_new_a(a);
+        bayan_json_v_obj_set_a(a, e, str_from_a(a, "task_id"),
+          bayan_json_v_str_new_a(a, agnosai_task_result_task_id(res)));
+        bayan_json_v_obj_set_a(a, e, str_from_a(a, "status"),
+          bayan_json_v_str_new_a(a, agnosai_task_status_to_wire_a(a, agnosai_task_result_status(res))));
+        bayan_json_v_arr_push_a(a, list, e);
+    }
+    var v = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, v, str_from_a(a, "crew_id"),
+      bayan_json_v_str_new_a(a, agnosai_crew_state_crew_id(state)));
+    bayan_json_v_obj_set_a(a, v, str_from_a(a, "status"),
+      bayan_json_v_str_new_a(a, agnosai_crew_status_to_wire_a(a, agnosai_crew_state_status(state))));
+    bayan_json_v_obj_set_a(a, v, str_from_a(a, "seq"), bayan_json_v_int_new_a(a, 0));
+    bayan_json_v_obj_set_a(a, v, str_from_a(a, "tasks"), list);
+    return v;
+}
+
+# A snapshot of a registered crew (ADR 036), in `a`: `agnosai_crew_runner_snapshot_a`'s value, or 0
+# for a crew the registry does not hold. A reader that fell behind a crew's events reads this and
+# goes on from the first event after its `seq`. A finished crew's says it finished, until the crew
+# leaves the registry.
+#
+# ⚠ Read with no hold on the crew, as `agnosai_orchestrator_crew` is: a consumer that releases a
+# crew (ADR 028) does not ask for its snapshot after.
+fn agnosai_orchestrator_crew_snapshot_a(a, o, crew_id: Str): i64 {
+    var mtx = load64(o + AGN_OR_MUTEX);
+    mutex_lock(mtx);
+    var runner = map_get(load64(o + AGN_OR_RUNNERS), crew_id);
+    var state = map_get(load64(o + AGN_OR_CREWS), crew_id);
+    mutex_unlock(mtx);
+    if (runner == 0 && state == 0) { return 0; }
+    # A crew put back from its log after a restart (ADR 036) has no runner and sent no event in
+    # this process: its state is all there is, at `seq` 0.
+    if (runner == 0) { return _agnosai_orch_state_snapshot_a(a, state); }
+    # A crew that ended without its run starting, cancelled while it waited for its turn or with no
+    # thread to run on, sent no event to agree with: it reads as the registry has it, or a reader
+    # would wait on a `pending` crew for good.
+    var ended = 0 - 1;
+    if (state != 0 && _agnosai_orch_is_finished(state) == 1) { ended = agnosai_crew_state_status(state); }
+    return _agnosai_crew_runner_snapshot_ended_a(a, runner, ended);
 }
 
 # The ids of every crew the registry holds, as a vec of Str.
@@ -416,7 +486,7 @@ fn _agnosai_orch_note_ended_locked(o, state): i64 {
 # evicted and then come back as its runner stores the final state. A registry full of running
 # crews still grows past the cap, as the oracle's does, and costs one comparison per submit
 # rather than a walk of the map.
-fn _agnosai_orch_evict_locked(o): i64 {
+fn _agnosai_orch_evict_locked(o, out_ids): i64 {
     var crews = load64(o + AGN_OR_CREWS);
     var held = map_size(load64(o + AGN_OR_CANCEL));
     if (map_size(crews) - held < AGNOSAI_MAX_RETAINED_CREWS) { return 0; }
@@ -427,6 +497,10 @@ fn _agnosai_orch_evict_locked(o): i64 {
         var state = vec_get(ended, head);
         head = head + 1;
         if (_agnosai_orch_is_current_locked(o, state) == 1) {
+            # Its log goes with it, once the lock is given back (ADR 036): the id is copied, as
+            # the crew's arena may go back first.
+            if (out_ids != 0) { vec_push(out_ids, str_clone(agnosai_crew_state_crew_id(state))); }
+            map_delete(load64(o + AGN_OR_RUNNERS), agnosai_crew_state_crew_id(state));
             map_delete(crews, agnosai_crew_state_crew_id(state));
             evicted = evicted + 1;
         }
@@ -434,6 +508,23 @@ fn _agnosai_orch_evict_locked(o): i64 {
     store64(o + AGN_OR_ENDED_HEAD, head);
     _agnosai_orch_compact_ended_locked(o);
     return evicted;
+}
+
+# Remove the logs of crews that left the registry (ADR 036), outside its lock. A log that will not
+# go is a WARN: it is read again at the next start, as a finished crew.
+fn _agnosai_orch_drop_logs(o, ids): i64 {
+    var store = load64(o + AGN_OR_STORE);
+    if (store == 0 || ids == 0) { return 0; }
+    for (var i = 0; i < vec_len(ids); i = i + 1) {
+        var err = agnosai_state_store_remove(store, vec_get(ids, i));
+        if (err != 0 && sakshi_get_level() >= SK_WARN) {
+            var f[AGNOSAI_LOG_FIELDS_BYTES];
+            var n = agnosai_log_fields_start(&f, vec_get(ids, i));
+            n = agnosai_log_field_str(&f, n, "error", agnosai_error_message(err));
+            sakshi_log_kv(SK_WARN, "crew log could not be removed", 29, "crew_id", 7, &f, n);
+        }
+    }
+    return 0;
 }
 
 # Log an eviction, outside the registry lock. A consumer that polls should know its window.
@@ -485,6 +576,41 @@ fn _agnosai_orch_level_for(status): i64 {
     return str_from("info");
 }
 
+# Give a registered crew its log (ADR 036), when the orchestrator has a store: a new one, whose
+# spec goes down first, or for a resume the one it had, appended to. A spec that will not go down
+# leaves the crew with no log, with an ERROR: it runs as a crew with none would, and a restart
+# loses it, as one always did.
+fn _agnosai_orch_attach_log(o, runner, spec, rp): i64 {
+    var store = load64(o + AGN_OR_STORE);
+    if (store == 0) { return 0; }
+    var a = agnosai_crew_alloc(spec);
+    var log = 0;
+    if (rp != 0) {
+        log = agnosai_crew_log_reopen_a(a, store, agnosai_crew_id(spec), agnosai_crew_replay_run(rp) + 1);
+    } else {
+        var err: i64[1];
+        log = agnosai_crew_log_open_a(a, store, spec, &err);
+        if (log == 0 && sakshi_get_level() >= SK_ERROR) {
+            var f[AGNOSAI_LOG_FIELDS_BYTES];
+            var n = agnosai_log_fields_start(&f, agnosai_crew_id(spec));
+            n = agnosai_log_field_str(&f, n, "error", agnosai_error_message(load64(&err)));
+            sakshi_log_kv(SK_ERROR, "crew log could not be opened; the crew runs without one", 55, "crew_id", 7,
+              &f, n);
+        }
+    }
+    agnosai_crew_runner_with_log(runner, log);
+    agnosai_crew_runner_with_replay(runner, rp);
+    return 0;
+}
+
+# Write the end of a crew whose run never started into its log (ADR 036), so a restart does not
+# resume it: cancelled while it waited for its turn, or with no thread to run on.
+fn _agnosai_orch_close_log(runner, state): i64 {
+    var log = agnosai_crew_runner_log(runner);
+    if (log == 0 || state == 0) { return 0; }
+    return agnosai_crew_log_close(log, state);
+}
+
 # Accept a crew spec, run it, and return its final state.
 #
 # Order matters and is the oracle's: audit `crew_accepted` **before** the crew
@@ -513,6 +639,12 @@ fn _agnosai_orch_register(o, spec): i64 {
 # `_agnosai_orch_register`, with the crew's spending counted against `parent`, its tenant's
 # tracker or 0 (ADR 033).
 fn _agnosai_orch_register_under(o, spec, parent): i64 {
+    return _agnosai_orch_register_with(o, spec, parent, 0);
+}
+
+# `_agnosai_orch_register_under` for a crew `rp` resumes (ADR 036), what its log said, or 0 for a
+# first run.
+fn _agnosai_orch_register_with(o, spec, parent, rp): i64 {
     var crew_id = agnosai_crew_id(spec);
     var crew_name = agnosai_crew_name(spec);
     var tasks = agnosai_crew_tasks(spec);
@@ -541,17 +673,23 @@ fn _agnosai_orch_register_under(o, spec, parent): i64 {
     # The state and the cancel flag, published together. ⚠ A flag says a runner holds this
     # crew, and `cancel_crew` and `forget_crew` both go by it, so there can be no moment with
     # the state and no flag: a cancel there was lost, and queued a live crew as ended.
+    _agnosai_orch_attach_log(o, runner, spec, rp);
+
+    var dropped = 0;
+    if (load64(o + AGN_OR_STORE) != 0) { dropped = vec_new(); }
     var mtx = load64(o + AGN_OR_MUTEX);
     mutex_lock(mtx);
-    var evicted = _agnosai_orch_evict_locked(o);
+    var evicted = _agnosai_orch_evict_locked(o, dropped);
     var registered = agnosai_crew_state_new_a(a, crew_id, AGNOSAI_CREW_PENDING);
     # The runner moves this state's status while a task awaits a reviewer (ADR 032).
     _agnosai_crew_runner_with_state(runner, registered);
     map_set(load64(o + AGN_OR_CREWS), str_clone_a(a, crew_id), registered);
     map_set(load64(o + AGN_OR_CANCEL), str_clone_a(a, crew_id),
       agnosai_crew_runner_cancel_flag(runner));
+    map_set(load64(o + AGN_OR_RUNNERS), str_clone_a(a, crew_id), runner);
     mutex_unlock(mtx);
     _agnosai_orch_log_evicted(evicted);
+    _agnosai_orch_drop_logs(o, dropped);
 
     var rurl = load64(o + AGN_OR_LLM_URL);
     if (rurl != 0) {
@@ -829,7 +967,7 @@ fn _agnosai_orch_finish_err(o, runner, crew_id: Str, crew_name: Str, out_err): i
         agnosai_semaphore_release(sem);
         turn = 0;
     }
-    if (turn == 0) { return _agnosai_orch_end_queued(o, crew_id, crew_name, spec); }
+    if (turn == 0) { return _agnosai_orch_end_queued(o, runner, crew_id, crew_name, spec); }
 
     # Enforce the execution timeout from the budget, matching
     # `rust-old/src/orchestrator/orchestrator.rs:197-214`.
@@ -917,7 +1055,7 @@ fn _agnosai_orch_finish_err(o, runner, crew_id: Str, crew_name: Str, out_err): i
 # It never ran, so it has no events, and its channel closes (ADR 032's `pending` → `cancelled`).
 # `cancel_crew` stored CANCELLED with the flag; a flag raised on the runner alone left PENDING,
 # which ends CANCELLED here. Queued as ended and audited, as a finish would have.
-fn _agnosai_orch_end_queued(o, crew_id: Str, crew_name: Str, spec): i64 {
+fn _agnosai_orch_end_queued(o, runner, crew_id: Str, crew_name: Str, spec): i64 {
     var mtx = load64(o + AGN_OR_MUTEX);
     mutex_lock(mtx);
     map_delete(load64(o + AGN_OR_CANCEL), crew_id);
@@ -932,6 +1070,7 @@ fn _agnosai_orch_end_queued(o, crew_id: Str, crew_name: Str, spec): i64 {
     }
     mutex_unlock(mtx);
     if (state != 0) { _agnosai_orch_audit_finished(o, crew_id, crew_name, state); }
+    _agnosai_orch_close_log(runner, state);
     var bus = load64(o + AGN_OR_EVENTS);
     if (bus != 0) { agnosai_event_bus_remove(bus, crew_id); }
     _agnosai_orch_tenant_done(o, spec);
@@ -982,7 +1121,7 @@ fn _agnosai_orch_submit_thread(job): i64 {
 # Let go of a registered crew no runner will take: its flag and its event channel go, as a
 # finish would have taken them. Without this a flag says a runner holds it for good, so it could
 # not be forgotten, nothing would queue it, and a subscriber would wait on it forever.
-fn _agnosai_orch_abandon(o, crew_id: Str): i64 {
+fn _agnosai_orch_abandon(o, runner, crew_id: Str): i64 {
     var mtx = load64(o + AGN_OR_MUTEX);
     mutex_lock(mtx);
     map_delete(load64(o + AGN_OR_CANCEL), crew_id);
@@ -1000,6 +1139,7 @@ fn _agnosai_orch_abandon(o, crew_id: Str): i64 {
         if (_agnosai_orch_is_finished(state) == 1) { _agnosai_orch_note_ended_locked(o, state); }
     }
     mutex_unlock(mtx);
+    _agnosai_orch_close_log(runner, state);
     var bus = load64(o + AGN_OR_EVENTS);
     if (bus != 0) { agnosai_event_bus_remove(bus, crew_id); }
     return 0;
@@ -1054,9 +1194,13 @@ fn agnosai_orchestrator_submit_crew_err(o, spec, out_err): i64 {
         if (out_err != 0) { store64(out_err, refused); }
         return 0;
     }
-    var crew_id = agnosai_crew_id(spec);
-    var runner = _agnosai_orch_register_under(o, spec, load64(&parent));
+    return _agnosai_orch_launch(o, spec, _agnosai_orch_register_under(o, spec, load64(&parent)), out_err);
+}
 
+# Run a registered crew on a thread of its own. Returns its id, or 0 with the error through
+# `out_err` when no thread would start, and the crew then ends FAILED, `not_started`.
+fn _agnosai_orch_launch(o, spec, runner, out_err): i64 {
+    var crew_id = agnosai_crew_id(spec);
     var job = alloc_via(agnosai_crew_alloc(spec), AGN_OJ_SIZE);
     store64(job + AGN_OJ_ORCH, o);
     store64(job + AGN_OJ_RUNNER, runner);
@@ -1064,13 +1208,141 @@ fn agnosai_orchestrator_submit_crew_err(o, spec, out_err): i64 {
     store64(job + AGN_OJ_NAME, agnosai_crew_name(spec));
 
     if (thread_create_detached(&_agnosai_orch_submit_thread, job) == 0) {
-        _agnosai_orch_abandon(o, crew_id);
+        _agnosai_orch_abandon(o, runner, crew_id);
         _agnosai_orch_tenant_done(o, spec);
         if (out_err != 0) { store64(out_err, agnosai_error_scheduling(str_from("could not start the crew's thread"))); }
         atomic_fetch_add(spec + AGN_CREW_RUNS, 0 - 1);
         return 0;
     }
     return crew_id;
+}
+
+# ── resuming a crew from its log (2.5.0, ADR 036) ──────────────────────────
+
+# Put a crew that ended before a restart back in the registry, as it ended: what its log's last
+# state says, with no runner. Nothing if the registry holds the id already.
+fn _agnosai_orch_restore_ended(o, state): i64 {
+    var crew_id = agnosai_crew_state_crew_id(state);
+    var mtx = load64(o + AGN_OR_MUTEX);
+    var dropped = 0;
+    if (load64(o + AGN_OR_STORE) != 0) { dropped = vec_new(); }
+    mutex_lock(mtx);
+    if (map_get(load64(o + AGN_OR_CREWS), crew_id) != 0) {
+        mutex_unlock(mtx);
+        return 0;
+    }
+    var evicted = _agnosai_orch_evict_locked(o, dropped);
+    map_set(load64(o + AGN_OR_CREWS), str_clone(crew_id), state);
+    _agnosai_orch_note_ended_locked(o, state);
+    mutex_unlock(mtx);
+    _agnosai_orch_log_evicted(evicted);
+    _agnosai_orch_drop_logs(o, dropped);
+    return 1;
+}
+
+# Resume crew `crew_id` from its log in the orchestrator's store (ADR 036). A crew whose log ended
+# goes back in the registry as it ended, and runs nothing. One whose log did not end is registered
+# and run on a thread of its own, as `agnosai_orchestrator_submit_crew` runs one, from where its log
+# left off: what it finished stands, an answer that waited on a reviewer is asked about again, a
+# task whose earlier attempt made calls whose effect may stand waits for a reviewer before it runs
+# again, and the rest runs. Its events go on from its log's last `seq`.
+#
+# Returns the crew's id, or 0 with the error through `out_err`: no store, no log for the crew, a log
+# that cannot be read, a crew the registry already holds, or one admission refuses, as a new crew's
+# would be refused (its tenant unknown or spent). A refused crew's log is left as it was, to try
+# again.
+fn agnosai_orchestrator_resume_crew_err(o, crew_id: Str, out_err): i64 {
+    if (out_err != 0) { store64(out_err, 0); }
+    var store = load64(o + AGN_OR_STORE);
+    if (store == 0) {
+        if (out_err != 0) { store64(out_err, agnosai_error_other(str_from("no state store to resume from"))); }
+        return 0;
+    }
+    var rerr: i64[1];
+    var rp = agnosai_crew_log_read(store, crew_id, &rerr);
+    if (rp == 0) {
+        var why = load64(&rerr);
+        if (why == 0) { why = agnosai_error_crew_not_found(crew_id); }
+        if (out_err != 0) { store64(out_err, why); }
+        return 0;
+    }
+    var spec = agnosai_crew_replay_spec(rp);
+    var mtx = load64(o + AGN_OR_MUTEX);
+    mutex_lock(mtx);
+    var held = map_get(load64(o + AGN_OR_CREWS), agnosai_crew_id(spec));
+    mutex_unlock(mtx);
+    if (held != 0) {
+        if (out_err != 0) { store64(out_err, agnosai_error_other(str_from("crew is already registered"))); }
+        return 0;
+    }
+    var ended = agnosai_crew_replay_state(rp);
+    if (ended != 0) {
+        _agnosai_orch_restore_ended(o, ended);
+        return agnosai_crew_id(spec);
+    }
+    var parent: i64[1];
+    var refused = _agnosai_orch_admit(o, spec, &parent);
+    if (refused != 0) {
+        _agnosai_orch_refused(o, spec, refused);
+        if (out_err != 0) { store64(out_err, refused); }
+        return 0;
+    }
+    return _agnosai_orch_launch(o, spec, _agnosai_orch_register_with(o, spec, load64(&parent), rp), out_err);
+}
+
+# `agnosai_orchestrator_resume_crew_err` without the error.
+fn agnosai_orchestrator_resume_crew(o, crew_id: Str): i64 {
+    return agnosai_orchestrator_resume_crew_err(o, crew_id, 0);
+}
+
+# After a restart, read back every crew log in the orchestrator's store (ADR 036): each crew whose
+# log ended goes back in the registry as it ended, and each whose log did not is resumed. Returns
+# how many were resumed, and how many restored through `out_restored`, or 0 for none. A crew that
+# cannot be read back or resumed is a WARN, and its log is left as it was.
+#
+# What `src/main.cyr` runs before the server listens, when `AGNOSAI_STATE_DIR` is set.
+fn agnosai_orchestrator_recover(o, out_restored): i64 {
+    if (out_restored != 0) { store64(out_restored, 0); }
+    var store = load64(o + AGN_OR_STORE);
+    if (store == 0) { return 0; }
+    var ids = vec_new();
+    var lerr = agnosai_state_store_list(store, ids);
+    if (lerr != 0 && sakshi_get_level() >= SK_WARN) {
+        var lf[AGNOSAI_LOG_FIELDS_BYTES];
+        var ln = agnosai_log_fields_start(&lf, agnosai_error_message(lerr));
+        sakshi_log_kv(SK_WARN, "crew logs could not be listed", 29, "error", 5, &lf, ln);
+    }
+    var resumed = 0;
+    var restored = 0;
+    for (var i = 0; i < vec_len(ids); i = i + 1) {
+        var id = vec_get(ids, i);
+        var rerr: i64[1];
+        var rp = agnosai_crew_log_read(store, id, &rerr);
+        var err = load64(&rerr);
+        if (rp != 0 && agnosai_crew_replay_state(rp) != 0) {
+            if (_agnosai_orch_restore_ended(o, agnosai_crew_replay_state(rp)) == 1) { restored = restored + 1; }
+        } elif (rp != 0) {
+            var serr: i64[1];
+            if (agnosai_orchestrator_resume_crew_err(o, id, &serr) != 0) { resumed = resumed + 1; }
+            else { err = load64(&serr); }
+        } elif (err == 0) {
+            err = agnosai_error_other(str_from("its log holds no spec to run"));
+        }
+        if (err != 0 && sakshi_get_level() >= SK_WARN) {
+            var f[AGNOSAI_LOG_FIELDS_BYTES];
+            var n = agnosai_log_fields_start(&f, id);
+            n = agnosai_log_field_str(&f, n, "error", agnosai_error_message(err));
+            sakshi_log_kv(SK_WARN, "crew could not be recovered from its log", 40, "crew_id", 7, &f, n);
+        }
+    }
+    if (out_restored != 0) { store64(out_restored, restored); }
+    if (sakshi_get_level() >= SK_INFO && resumed + restored > 0) {
+        var g[AGNOSAI_LOG_FIELDS_BYTES];
+        var m = agnosai_log_fields_start_int(&g, resumed);
+        m = agnosai_log_field_int(&g, m, "restored", restored);
+        sakshi_log_kv(SK_INFO, "crews recovered from their logs", 31, "resumed", 7, &g, m);
+    }
+    return resumed;
 }
 
 # Cancel a crew by id. Returns 0, a CrewNotFound error, or — for a crew that
@@ -1157,8 +1429,16 @@ fn agnosai_orchestrator_forget_crew(o, crew_id: Str): i64 {
         return agnosai_error_other(str_from("crew is still running and cannot be forgotten"));
     }
     map_delete(crews, crew_id);
+    map_delete(load64(o + AGN_OR_RUNNERS), crew_id);
     _agnosai_orch_compact_ended_locked(o);
     mutex_unlock(mtx);
+    # Its log goes with it (ADR 036).
+    var store = load64(o + AGN_OR_STORE);
+    if (store != 0) {
+        var ids = vec_new();
+        vec_push(ids, crew_id);
+        _agnosai_orch_drop_logs(o, ids);
+    }
     return 0;
 }
 
@@ -1231,12 +1511,19 @@ fn agnosai_orchestrator_release_crew(o, spec): i64 {
     }
     atomic_fence();
     map_delete(load64(o + AGN_OR_CREWS), crew_id);
+    map_delete(load64(o + AGN_OR_RUNNERS), crew_id);
     if (a != 0) { _agnosai_orch_purge_ended_locked(o, a); }
     _agnosai_orch_compact_ended_locked(o);
     mutex_unlock(mtx);
 
     var bus = load64(o + AGN_OR_EVENTS);
     if (bus != 0) { agnosai_event_bus_remove(bus, crew_id); }
+    # Its log goes with it (ADR 036), while its id is still the crew's.
+    if (load64(o + AGN_OR_STORE) != 0) {
+        var ids = vec_new();
+        vec_push(ids, str_clone(crew_id));
+        _agnosai_orch_drop_logs(o, ids);
+    }
     if (a != 0) { agnosai_crew_arena_give_back(a); }
     return 0;
 }

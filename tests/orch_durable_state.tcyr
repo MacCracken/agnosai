@@ -89,6 +89,143 @@ fn _t_bytes_eq(p, len, want: Str): i64 {
     return 1;
 }
 
+# ── 2.5.0: the log's verbs, and a backend of a consumer's own (ADR 036) ────
+
+# A whole log read back, as a Str, or 0 when the crew has none.
+fn _t_log_of(store, crew_id: Str): i64 {
+    var bytes = 0;
+    var len = 0;
+    if (agnosai_state_store_read_log(store, crew_id, &bytes, &len) != 0) { return 0; }
+    if (bytes == AGNOSAI_STATE_ABSENT) { return 0; }
+    return str_new(bytes, len);
+}
+
+# Whether `ids` holds `id`.
+fn _t_has_id(ids, id): i64 {
+    for (var i = 0; i < vec_len(ids); i = i + 1) {
+        if (str_eq(vec_get(ids, i), str_from(id)) == 1) { return 1; }
+    }
+    return 0;
+}
+
+fn _t_log_verbs(): i64 {
+    # A directory that does not exist yet: the first append makes it.
+    var dir = _t_under("/log/deeper");
+    var store = agnosai_state_store_new(dir);
+    var ids = vec_new();
+    assert_eq(agnosai_state_store_list(store, ids), 0, "a store with no directory yet lists without error");
+    assert_eq(vec_len(ids), 0, "and lists no crew");
+    assert_eq(_t_log_of(store, str_from("crew-a")), 0, "a crew with no log reads as none");
+
+    assert_eq(agnosai_state_store_append(store, str_from("crew-a"), "one\n", 4, 1), 0,
+      "the first append, synced, makes the directory and the log");
+    assert_eq(agnosai_state_store_append(store, str_from("crew-a"), "two\n", 4, 0), 0,
+      "a second, not synced, appends");
+    assert(str_eq(_t_log_of(store, str_from("crew-a")), str_from("one\ntwo\n")) == 1,
+      "the log reads back both records, in the order they were written");
+    var st[144];
+    assert_eq(xstat(str_data(agnosai_state_log_path_for(store, str_from("crew-a"))), &st), 0,
+      "the log is a file beside where its snapshot would be");
+    assert_eq(load32(&st + STAT_MODE) & 0x1FF, 0x180, "and only its owner may read it: 0600");
+    # A log made in a directory that is already there takes the other open, and is 0600 too.
+    agnosai_state_store_append(store, str_from("crew-c"), "c\n", 2, 0);
+    var st2[144];
+    xstat(str_data(agnosai_state_log_path_for(store, str_from("crew-c"))), &st2);
+    assert_eq(load32(&st2 + STAT_MODE) & 0x1FF, 0x180, "a log made where the directory is already there is 0600");
+    agnosai_state_store_remove(store, str_from("crew-c"));
+    # A write the disk refuses is an error, not a record the log thinks it has.
+    var full = agnosai_state_log_path_for(store, str_from("crew-full"));
+    if (xsymlink("/dev/full", str_data(full)) == 0) {
+        var ferr = agnosai_state_store_append(store, str_from("crew-full"), "x\n", 2, 0);
+        assert(ferr != 0, "an append the disk refuses is an error");
+        assert(str_contains(agnosai_error_detail(ferr), str_from("no space left")) == 1, "saying why");
+        sys_unlink(str_data(full));
+    }
+
+    agnosai_state_store_append(store, str_from("crew-b"), "b\n", 2, 0);
+    var raw = str_from("{}");
+    agnosai_state_store_save(store, str_from("crew-b"), str_data(raw), str_len(raw));
+    var listed = vec_new();
+    assert_eq(agnosai_state_store_list(store, listed), 0, "listing a store with logs");
+    assert_eq(vec_len(listed), 2, "lists each crew that has a log, once, and no snapshot");
+    assert(_t_has_id(listed, "crew-a") == 1 && _t_has_id(listed, "crew-b") == 1,
+      "by its crew id, without the extension");
+
+    var evil = str_from("../escape");
+    assert(agnosai_state_store_append(store, evil, "x", 1, 0) != 0, "append refuses an unsafe id (ADR 008)");
+    var eb = 0;
+    var el = 0;
+    assert(agnosai_state_store_read_log(store, evil, &eb, &el) != 0, "and so does read_log");
+    assert(agnosai_state_store_remove(store, evil) != 0, "and remove");
+
+    assert_eq(agnosai_state_store_remove(store, str_from("crew-b")), 0, "remove takes a crew's log and snapshot");
+    var lb = 0;
+    var ll = 0;
+    agnosai_state_store_load(store, str_from("crew-b"), &lb, &ll);
+    assert_eq(lb, AGNOSAI_STATE_ABSENT, "its snapshot is gone");
+    assert_eq(_t_log_of(store, str_from("crew-b")), 0, "and its log");
+    assert_eq(agnosai_state_store_remove(store, str_from("crew-b")), 0, "removing what is gone is not an error");
+    assert_eq(agnosai_state_store_remove(store, str_from("crew-a")), 0, "the other crew's log goes too");
+    var left = vec_new();
+    agnosai_state_store_list(store, left);
+    assert_eq(vec_len(left), 0, "and the store lists none");
+
+    # A directory where the log should be: the append is an error that names it.
+    var as_dir = agnosai_state_log_path_for(store, str_from("crew-d"));
+    sys_mkdir(str_data(as_dir), 0x1FF);
+    var derr = agnosai_state_store_append(store, str_from("crew-d"), "x", 1, 0);
+    assert(derr != 0, "an append that cannot open its log is an error");
+    assert(str_contains(agnosai_error_detail(derr), str_from("crew-d.log")) == 1, "naming the log");
+    sys_rmdir(str_data(as_dir));
+    sys_rmdir(str_data(dir));
+    sys_rmdir(str_data(_t_under("/log")));
+    return 0;
+}
+
+# A backend of a consumer's own: it counts what each verb is handed.
+var _t_calls = 0;
+var _t_last_sync = 0 - 1;
+
+fn _t_b_save(ctx, id, buf, len): i64 { _t_calls = _t_calls + 1; return 0; }
+fn _t_b_load(ctx, id, out_bytes, out_len): i64 { _t_calls = _t_calls + 10; return 0; }
+fn _t_b_append(ctx, id, buf, len, sync): i64 {
+    _t_calls = _t_calls + 100;
+    _t_last_sync = sync;
+    if (ctx != 7) { return agnosai_error_io(str_from("wrong context")); }
+    return 0;
+}
+fn _t_b_read(ctx, id, out_bytes, out_len): i64 { _t_calls = _t_calls + 1000; return 0; }
+fn _t_b_list(ctx, out_ids): i64 {
+    _t_calls = _t_calls + 10000;
+    vec_push(out_ids, str_from("ok-id"));
+    vec_push(out_ids, str_from("../bad"));
+    return 0;
+}
+fn _t_b_remove(ctx, id): i64 { _t_calls = _t_calls + 100000; return 0; }
+
+fn _t_custom_backend(): i64 {
+    var s = agnosai_state_store_backend(7, &_t_b_save, &_t_b_load, &_t_b_append, &_t_b_read,
+      &_t_b_list, &_t_b_remove);
+    assert_eq(agnosai_state_store_base_dir(s), 0, "a backend of a consumer's own has no base directory");
+    agnosai_state_store_save(s, str_from("c"), "x", 1);
+    var b = 0;
+    var l = 0;
+    agnosai_state_store_load(s, str_from("c"), &b, &l);
+    assert_eq(b, AGNOSAI_STATE_ABSENT, "a load the backend answered nothing to reads as none");
+    assert_eq(agnosai_state_store_append(s, str_from("c"), "x", 1, 1), 0,
+      "append reaches the backend with its context");
+    assert_eq(_t_last_sync, 1, "and its sync flag");
+    agnosai_state_store_read_log(s, str_from("c"), &b, &l);
+    var ids = vec_new();
+    agnosai_state_store_list(s, ids);
+    assert_eq(vec_len(ids), 1, "an unsafe id a backend lists is left out");
+    agnosai_state_store_remove(s, str_from("c"));
+    assert_eq(_t_calls, 111111, "each verb reached its own fnptr, once");
+    agnosai_state_store_append(s, str_from("../x"), "x", 1, 0);
+    assert_eq(_t_calls, 111111, "and an unsafe id reaches none");
+    return 0;
+}
+
 fn main() {
     alloc_init();
 
@@ -377,6 +514,9 @@ fn main() {
     var cbytes = _agnosai_read_file_exact(cut, &clen);
     assert(_t_bytes_eq(cbytes, load64(&clen), str_from("named")) == 1,
       "a path cut from a longer one reads the file it names, not the one its bytes run on into");
+
+    _t_log_verbs();
+    _t_custom_backend();
 
     # --- teardown ---
     _t_rm(named);

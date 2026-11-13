@@ -62,6 +62,7 @@ Regenerate rather than hand-edit — this index read _"No ADRs yet"_ until
 | [033](033-budgets-caps-and-crew-concurrency-are-enforced.md) | Budgets, caps and crew concurrency are enforced | Accepted — shipped in 2.4.1 |
 | [034](034-a-dependent-task-is-handed-its-dependencies-answers.md) | A dependent task is handed its dependencies' answers, as data | Accepted — shipped in 2.4.2 |
 | [035](035-a-manager-assigns-its-workers-and-writes-the-crews-answer.md) | A manager assigns its workers and writes the crew's answer | Accepted — shipped in 2.4.3 |
+| [036](036-a-crew-keeps-a-log-and-resumes-from-it.md) | A crew keeps a log, and resumes from it | Accepted — shipped in 2.5.0 |
 
 ADRs 001-005 predate the current heading convention (`ADR-00N: Title` rather
 than `00N — Title`). The headings are left as written — renumbering accepted

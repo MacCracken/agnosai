@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.0] — 2026-11-13
+
+Durable execution: a crew keeps a log and resumes from it, and a reader that fell behind its events resyncs from a
+snapshot ([ADR 036](docs/adr/036-a-crew-keeps-a-log-and-resumes-from-it.md)).
+
+### ⚠ Behaviour changes
+
+- **A crew with a log builds and numbers every event**, whether or not anyone subscribed, as its log receives each
+  one: a subscriber's first `seq` is then wherever the crew had reached, not 1 for the first event it was sent.
+  Without a log nothing changes.
+- **A wave's task reads `running` from its dispatch**, with its `task_started`, where through 2.4.3 it stayed
+  `queued` until it ended. Nothing read it until the snapshot.
+- **A hierarchical worker's `assigned_by` and `withheld_tools`, and the manager's `role`, are on its result when its
+  `task_completed` goes out**, where they were added after.
+- **With `AGNOSAI_STATE_DIR` set, the server resumes, before it listens, every crew a stopped process left mid-run**,
+  and refuses to start on a directory another server holds. Unset, nothing changes.
+
+### Added
+
+- **The crew log** (`src/crew_log.cyr`, port-local): one JSON line a record, the spec first, then every event the crew
+  sends, numbered, a finished task's whole result beside its `task_completed` and beside `approval_requested`, the
+  crew's state beside `crew_completed`, and each tool call's intent, synced, before the call runs, ahead of any
+  consumer's journal. `agnosai_crew_log_open_a`, `agnosai_crew_runner_with_log`, `agnosai_crew_log_journal_a`,
+  `agnosai_crew_log_close`, `agnosai_crew_log_spec_value_a` and `agnosai_crew_log_spec_from_value`. A crew with a log
+  and no bus gets a sender of its own.
+- **Resuming**: `agnosai_crew_log_read` folds a log into a replay, and `agnosai_crew_runner_with_replay` runs from it.
+  A task its log finished keeps its result and does not run again, in every process mode; an answer that waited on a
+  reviewer is asked about again and not paid for again; **a task whose earlier attempt made a call whose effect may
+  stand waits for a reviewer before it runs again** (`approval_requested` with `resume: true`, its calls in `output`):
+  approved it runs, and its result's `uncertain_calls` names them; rejected, timed out or with no gate it fails as
+  `not resumed: re-running it was rejected (<reason>)`, and the call does not repeat. Its events go on from the log's
+  last `seq`, `crew_started` says `resumed: true`, and what its finished tasks spent counts against its budget.
+- **The orchestrator keeps logs**: `agnosai_orchestrator_with_state_store`, `agnosai_orchestrator_resume_crew_err`, and
+  `agnosai_orchestrator_recover`, which puts back each crew whose log ended as it ended and resumes each whose log did
+  not. A log goes when its crew leaves the registry, forgotten, evicted or released; a crew cancelled while it waited
+  for its turn, or with no thread to run on, ends its log so it is not resumed.
+- **The snapshot**: `agnosai_orchestrator_crew_snapshot_a`, `agnosai_crew_runner_snapshot_a`, and
+  `GET /api/v1/crews/{id}/snapshot`: the crew's status, each task's, and the `seq` of its last event, read in one step
+  under the bus lock that every status move now goes through with its event, so a reader takes each task as it says
+  and goes on from the first event after `seq`.
+- **`StateStore` is a backend table** (`agnosai_state_store_backend`), the file store its first backend: the oracle's
+  `save` and `load`, and `append`, `read_log`, `list` and `remove` for the log. Every verb refuses an unsafe crew id
+  (ADR 008). The file backend writes `{dir}/{crew_id}.log`, `0600`, `O_CLOEXEC`.
+- **The server**: `AGNOSAI_STATE_DIR` gives every crew a log there and recovers them at start-up, after claiming the
+  directory with a lock on `<dir>/.owner`, held for the process's life, so a second server on it refuses to start.
+- On the sender: `agnosai_event_sender_send_set`, `agnosai_event_sender_with_tap`, `agnosai_event_sender_with_seq`,
+  `agnosai_event_sender_wanted` and `agnosai_event_sender_new_a`; on the event, `agnosai_crew_event_with_extra`.
+
+### Changed
+
+- `_agnosai_crew_emit_review_a` and `_emit_decided_a` became the payload builders `_agnosai_crew_review_data_a` and
+  `_decided_data_a`, as the move that sends them is `_agnosai_crew_move_task`.
+- A log line is rendered by the log's own JSON writer, byte-identical to `bayan_json_v_build`, which copies each run of
+  plain bytes whole where bayan appends one byte a call: 4 KiB of prose 148 → 14 µs. Filed with bayan, and listed under
+  *Waiting on another project*.
+
+### Performance
+
+- **The interleaved A/B against a 2.4.3 build on the same `lib/`:** four rounds of `orch`, `server`, `core`, `tools`,
+  `manager` and `handoff` at a mean load of 3.78, median +0.1% across 181 rows, 145 of them within 5%. No crew without
+  a log is slower: every `run_crew_*` row reads 2–6% faster, which is not claimed, as the 2.4.3 side's rounds carried
+  the load's spikes (its slowest round of `run_crew_10_tasks_sequential` 699 µs against a median of 415).
+- **What a log costs** (`benches/crew_log.bcyr`, new, a file of its own as roadmap 2.7.1 asks of crew rows), a four-task
+  crew on the stub model, medians of three at a load near 5: **unlogged 199 µs; with a log whose store keeps nothing
+  380 µs**, what the log costs the crew, every event built, numbered and rendered, about 6.5 KB of JSON; **with the file
+  store 490 µs**, that and its writes and fsyncs, on a tmpfs, where an fsync is nearly free. On ext4 the six fsyncs a
+  crew of four makes are most of it. A real crew's model calls take seconds.
+- **`crew_snapshot_4_tasks` 1.4 µs**; **`crew_log_read_4_tasks` 277 µs**, a four-task crew's log read back and folded,
+  once a resume.
+- **The log's JSON writer**: 4 KiB of prose 148 µs through `bayan_json_v_build_a`, 14 µs through the log's own, which
+  tests eight bytes at a time and copies each plain run whole. A crew's 2 KiB spec, short strings, built and rendered,
+  gains less, 74.6 → 44.4 µs, as its cost is per value.
+- Not claimed: `pubsub_subscribe_at_cap` +52.8% (108 → 165 ns), `tool_registry_has_50_*` ±13–22% and `message_to_json`
+  +12.9%, code nothing here touched, in the same files and rounds.
+
 ## [2.4.3] — 2026-11-12
 
 Hierarchical crews: a manager assigns its workers and writes the crew's answer, and authority only narrows

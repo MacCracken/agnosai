@@ -125,6 +125,20 @@ The W3C spec leaves to a receiving service whether an inbound trace crossing a
 trust boundary is honoured or restarted. agnosai honours it unconditionally
 today; that is a recorded choice, not an oversight.
 
+### 8. Crew logs on disk (`AGNOSAI_STATE_DIR`, [ADR 036](../adr/036-a-crew-keeps-a-log-and-resumes-from-it.md))
+
+Since 2.5.0 a crew can keep a log, and the server keeps one for every crew when `AGNOSAI_STATE_DIR` is set. It holds
+the crew's spec, every answer, and every tool call's arguments, and a start resumes what it finds there.
+
+| Threat | Mitigation |
+|--------|------------|
+| Another local user reads a crew's answers or tool arguments | Each log is created `0600`, and opened `O_CLOEXEC`, so a sandboxed tool's child does not inherit it. The directory is the operator's: agnosai creates it only when it is missing, with the process's umask |
+| A crew id names a path outside the directory | Every store verb refuses an id with a separator, a `.` component or a leading `.`, before a backend sees it ([ADR 008](../adr/008-durable-state-crew-id-validation.md), 2.5.0 note), and `list` drops one a backend hands back |
+| A planted or edited log makes a start run a crew | ⚠ **Not mitigated: the directory is trusted.** Whoever can write it can have the next start run any crew, with the server's tools and gateway. Keep it as private as the binary's own configuration |
+| A resume repeats a side effect | A task whose earlier attempt made a call that may have taken effect waits for a reviewer before it runs again; with no gate, or without a decision in five minutes, it fails and the call does not repeat. A call's intent is on disk, synced, before the call runs, and a call whose intent will not go down does not run |
+| A torn or corrupt line | A line that does not parse is passed over, and a log with no spec it can rebuild is not run: a WARN at start |
+| Two processes on one directory, the second resuming the first's live crews | The server claims its directory with an exclusive, non-blocking `flock` on `<dir>/.owner`, held for its life and dropped by the kernel however it exits, and a second refuses to start. A library caller that keeps logs (`agnosai_orchestrator_with_state_store`) claims its own store |
+
 ## Trust Boundaries
 
 ```

@@ -6,7 +6,7 @@
 > [`cyrius-port-plan.md`](cyrius-port-plan.md) is the port's reasoning archive, and
 > [`known-unreachable.md`](known-unreachable.md) records code kept for oracle shape.
 
-**Status as of 2.4.3 (2026-11-12).**
+**Status as of 2.5.0 (2026-11-12).**
 
 **How releases are ordered.** A release holds only work that can ship now. Work that waits on another project is not
 given a number: it is listed under [*Waiting on another project*](#waiting-on-another-project), with its filed issue,
@@ -50,7 +50,6 @@ Carried from the Rust line as *goals*, not as comparisons: the Cyrius baseline s
 
 | Release | What it does |
 |---|---|
-| **2.5.0** | Durable execution: a crew log that resumes from its last finished task |
 | **2.5.1** | The server's own crews in arenas |
 | **2.6.0** | MCP 2026-07-28 on `/mcp`, and A2A 1.0 |
 | **2.6.1** | Server edges: SSE, shutdown, paths, config, JWT keys |
@@ -94,21 +93,11 @@ crew it starts by its caller's tools and what its task has left
 
 ### 2.5.x — durable execution
 
-#### 2.5.0 — durable execution: a crew log that resumes from its last finished task
-
-**An event-sourced crew log, resumable from the last completed task.** `orchestrator/durable_state.cyr` has zero
-callers. This is baseline in the field now: LangGraph checkpointers, Pydantic AI on Temporal, MAF's Durable Task,
-OpenHands' event sourcing. Build on 2.4.0's `seq` stream. Today agnostic answers a restart by marking crews
-`interrupted`; this is what would let it resume them. `durable_state` is on `lib/io.cyr`, not patra, and an
-event-sourced log may want patra's jsonl mode, which opens `O_APPEND` without `O_TRUNC`. The tool journal ADR 029 gives
-a consumer becomes agnosai's own here, so a resume can name its unknown effects.
-
-**A snapshot to resync from mid-run,** which agnostic waits on: a reader that fell behind the event ring reads each
-task's state and the crew's `seq`, and goes on from there. It needs a task's status and the crew's `seq` written under
-one lock (ADR 032), and the log is the record it reads.
-
-**The pluggable persistence trait (`StateStore`),** ported for the log to build on. `src/orchestrator/durable_state.cyr`'s
-header records why it is flat today: one implementor, no callers.
+2.5.0 gave a crew a log it resumes from: its spec, every event numbered, each tool call journaled before it runs and
+each finished task's result, through a `StateStore` that is now a table of a backend's verbs. A resume keeps what
+finished, asks a reviewer before re-running a task whose calls may have taken effect, and goes on numbering where the
+log stopped; the server resumes at start-up with `AGNOSAI_STATE_DIR`; and a snapshot read under the bus lock lets a
+reader that fell behind its events resync ([ADR 036](../adr/036-a-crew-keeps-a-log-and-resumes-from-it.md)).
 
 #### 2.5.1 — the server's own crews in arenas
 
@@ -214,6 +203,11 @@ rebase of their history.
   at build time, explicit entries only. All embeds share cycc's 2 MiB string pool, and every binary of the project
   carries every declared embed. One entry per preset, in order, so `_AGNOSAI_PRESET_JSON_NN` and
   `agnosai_preset_json(i)` become those calls. **Stays ours:** compaction, as `[embed]` takes the bytes verbatim.
+- **`durable_state` hand-rolls a recursive mkdir the stdlib now has.** Its `_agnosai_mkdir_one` and `_agnosai_mkdir_p`
+  were written because `lib/io.cyr` had no portable `xmkdir` (filed upstream in 2026-07); it now has `xmkdir` and
+  `xmkdir_p`. Move to them, keeping the two behaviours its tests hold: an existing directory is success, and a
+  component that exists as a file is `-ENOTDIR`. The module header's "Three places the stdlib does not reach" goes with
+  them. Found at 2.5.0, which made `durable_state` the crew log's store.
 
 ## Waiting on another project
 
@@ -229,6 +223,7 @@ The *Issue* column says where each stands.
 | **An HTTP exchange leaves nothing behind** | sandhi keeps 408–480 B a request on the global heap: about 40 B a response header, and 120 B for the host header | sandhi `docs/development/issues/2026-11-05-agnostic-outbound-calls-keep-bytes-on-the-global-heap.md` (agnostic's, with agnosai's addendum), ⚠ **written, not committed** | Tighten the per-exchange bounds to 0: `tests/orch_crew_arena.tcyr`, `tools_agnos`, `tools_gate`, `telemetry_otlp`, `llm_hoosh` |
 | **Accept a chunked request body** | sandhi answers 501 (`sandhi_server_request_has_unsupported_te`) | sandhi `docs/development/issues/2026-11-05-agnosai-server-cannot-receive-a-chunked-request-body.md`, ⚠ **written, not committed** | Nothing: out of scope until it lands |
 | **Offer a model the tools of a remote MCP server** | bote has no MCP client, **and its roadmap lists one as a non-goal**, so this needs a decision first (*Decisions for the user*) | bote `docs/development/issues/2026-11-07-agnosai-no-mcp-client-to-call-a-hosts-tools.md`, ⚠ **written 2026-11-07, not committed** | Register each remote tool with `agnosai_tool_new`: the registry and the loop need nothing else (ADR 029, rule 4) |
+| **Render a crew's log with bayan's own JSON writer** | bayan escapes a string with one builder call per byte: 148 µs for 4 KiB of prose, where copying runs takes 14 µs | bayan `docs/development/issues/2026-11-12-agnosai-json-build-escapes-one-byte-a-call.md`, ⚠ **written 2026-11-12, not committed** | Drop `_agnosai_crew_log_value_a` and its string and word helpers from `src/crew_log.cyr`, and render with `bayan_json_v_build_a`; `test_writer_matches_bayan` in `tests/orch_crew_log.tcyr` goes with them |
 | **A kept connection costs what a new one costs, or less** | sandhi allocates a pooled connection from the request's allocator, builds the pool's route key on the global heap for each take and put, 256 B a request, resolves the host before it asks the pool, and cannot end a blocked read with `total_ms` alone | sandhi `docs/development/issues/2026-11-08-agnosai-a-pooled-connection-lives-in-the-requests-allocator.md`, ⚠ **written 2026-11-08, not committed** | Drop the load tester's third arena, and lower `_T_SANDHI_BYTES_PER_KEPT_REQUEST` in `tests/tools_builtin_load_testing.tcyr` |
 
 bayan's refusals of block scalars, flow mappings, anchors and tags are deliberate (its ADR 0008), so that is a scope
@@ -237,8 +232,8 @@ request to raise only if a definition file needs one, and it is not owed.
 ### Deleting `rust-old/` — the release after `personality`
 
 **The Rust port is not done while bhava is missing** (*Settled decisions*), so this has no number until bhava lands.
-Everything else the Rust line had is pinned above: `StateStore` at 2.5.0, the
-certificate JWT key at 2.6.1 and the spans at 2.6.2. Every Rust spec stays reachable after:
+Everything else the Rust line had is pinned above: the
+certificate JWT key at 2.6.1 and the spans at 2.6.2 (`StateStore` shipped in 2.5.0). Every Rust spec stays reachable after:
 `git show 2.1.0:rust-old/src/<path>`.
 
 - [ ] `git rm -r rust-old`, then delete the ignored `rust-old/target/` (~13 GB) from disk, which `git rm` leaves.
@@ -399,7 +394,7 @@ and log fields at 2.3.6.
 | B10, B11 | 2.3.7, JSON forms and log fields |
 | B12, B14 | 2.7.0, tests and benchmarks |
 | B13, B36 | 2.3.6, network tools |
-| B15 | `StateStore` at 2.5.0; the rest at 2.7.2, housekeeping |
+| B15 | `StateStore` shipped in 2.5.0 (ADR 036); the rest at 2.7.2, housekeeping |
 | B16 | chunked request bodies (*Waiting on another project*) |
 | B18, B20, B27 | 2.7.1, benchmark levels |
 | B25 | 2.6.1, server edges |
@@ -413,8 +408,8 @@ and log fields at 2.3.6.
 | C | the rows of *Waiting on another project* |
 | D1–D9, F7 | *Settled decisions* and *Decisions for the user*, by their titles |
 | F2 | shipped in 2.4.3, hierarchical crews (ADR 035) |
-| F3 | shipped in 2.4.0, the crew lifecycle (ADR 032); its resync snapshot at 2.5.0 |
-| F4 | 2.5.0, durable execution |
+| F3 | shipped in 2.4.0, the crew lifecycle (ADR 032); its resync snapshot in 2.5.0 (ADR 036) |
+| F4 | shipped in 2.5.0, durable execution (ADR 036) |
 | F5 | shipped in 2.4.1, budgets and caps (ADR 033); the delegated worker's level in 2.4.3 (ADR 035) |
 | F8 | 2.6.0, MCP 2026-07-28 and A2A 1.0 |
 | F9 | shipped in 2.4.2, the hand-off of a dependency's answer (ADR 034) |

@@ -112,6 +112,7 @@ include "src/log_fields.cyr"
 include "src/orchestrator/budget.cyr"
 include "src/handoff.cyr"
 include "src/orchestrator/hierarchical.cyr"
+include "src/crew_log.cyr"
 
 # Pick the highest-scoring agent for a task, or 0 when the roster is empty.
 #
@@ -1351,7 +1352,7 @@ fn _agnosai_crew_worker(job): i64 {
         return 0;
     }
     var runner = load64(job + AGN_CJ_RUNNER);
-    var result = agnosai_execute_task_budgeted_a(a, task,
+    var result = _agnosai_crew_attempt_a(a, runner, task,
       load64(job + AGN_CJ_AGENT), load64(job + AGN_CJ_CLIENT), load64(job + AGN_CJ_EVENT_TX),
       load64(job + AGN_CJ_CREW_ID), load64(job + AGN_CJ_TRACE), load64(job + AGN_CJ_LOOP),
       agnosai_crew_runner_budget(runner));
@@ -1404,7 +1405,22 @@ enum AgnosaiCrewRunnerOff {
     # a loop head found it spent and stopped dispatching, as `TIMED_OUT` is for the deadline.
     AGN_CR_BUDGET = 136;
     AGN_CR_BUDGET_OUT = 144;
-    AGN_CR_SIZE = 152;
+    # Where the run is, for its snapshot (ADR 036): PENDING until `crew_started` goes out, RUNNING
+    # from then, and the crew's terminal status from `crew_completed`. Each moves under the bus lock
+    # with its event. And a hierarchical crew's manager task, once it has one, as the snapshot
+    # lists it beside the spec's.
+    AGN_CR_PHASE = 152;
+    AGN_CR_MANAGER_TASK = 160;
+    # The crew's log (ADR 036), or 0 for none: a tap on its sender, and the journal its tools write
+    # through ahead of a consumer's.
+    AGN_CR_LOG = 168;
+    # A hierarchical crew's manager and the tools it withheld from each worker, by key, while its
+    # workers run (ADR 035), else 0: each result is marked with them before its `task_completed`.
+    AGN_CR_MANAGER = 176;
+    AGN_CR_WITHHELD = 184;
+    # What the crew's log said when this run resumed it (ADR 036), or 0 for a first run.
+    AGN_CR_REPLAY = 192;
+    AGN_CR_SIZE = 200;
 }
 
 # Initial chunk for the sequential run's audit scratch.
@@ -1441,6 +1457,12 @@ fn agnosai_crew_runner_new(spec): i64 {
     store64(r + AGN_CR_AWAITING, 0);
     store64(r + AGN_CR_BUDGET, 0);
     store64(r + AGN_CR_BUDGET_OUT, 0);
+    store64(r + AGN_CR_PHASE, AGNOSAI_CREW_PENDING);
+    store64(r + AGN_CR_MANAGER_TASK, 0);
+    store64(r + AGN_CR_LOG, 0);
+    store64(r + AGN_CR_MANAGER, 0);
+    store64(r + AGN_CR_WITHHELD, 0);
+    store64(r + AGN_CR_REPLAY, 0);
     return r;
 }
 
@@ -1512,7 +1534,197 @@ fn agnosai_crew_runner_with_llm(r, client): i64 {
 # Attach an event sender for `crew_started` / `task_*` / `crew_completed`.
 fn agnosai_crew_runner_with_events(r, event_tx): i64 {
     store64(r + AGN_CR_EVENT_TX, event_tx);
+    _agnosai_crew_tap_log(r);
     return r;
+}
+
+# Keep the crew's log (ADR 036): `agnosai_crew_log_open_a`'s, or a reopened one for a resume, or 0.
+# Every event the crew sends goes in it, numbered, and each tool call's intent before the call
+# runs. A crew with a log and no bus gets a sender of its own when it runs. Returns the runner.
+fn agnosai_crew_runner_with_log(r, log): i64 {
+    store64(r + AGN_CR_LOG, log);
+    _agnosai_crew_tap_log(r);
+    return r;
+}
+
+# The crew's log, or 0.
+fn agnosai_crew_runner_log(r): i64 {
+    return load64(r + AGN_CR_LOG);
+}
+
+# Resume from `rp`, what the crew's log says (`agnosai_crew_log_read`), or 0 for a first run (ADR
+# 036). A task its log has finished is not run again, and keeps its result; one whose answer waited
+# on a reviewer is asked about again with that answer; one whose earlier attempt made calls whose
+# effect may stand waits for a reviewer before it runs again; the rest run. Its events go on from
+# the log's last `seq`, and what its finished tasks spent counts against its budget. Returns the
+# runner.
+fn agnosai_crew_runner_with_replay(r, rp): i64 {
+    store64(r + AGN_CR_REPLAY, rp);
+    return r;
+}
+
+# The result `task` finished with before this run resumed it, or 0.
+fn _agnosai_crew_carried(r, task): i64 {
+    var rp = load64(r + AGN_CR_REPLAY);
+    if (rp == 0) { return 0; }
+    return agnosai_crew_replay_finished(rp, agnosai_task_id(task));
+}
+
+# Take a carried result as `task`'s: its status, with no event, as it finished before this run.
+fn _agnosai_crew_carry(r, task, result): i64 {
+    return _agnosai_crew_move_task(r, task, agnosai_task_result_status(result), 0, 0);
+}
+
+# The calls an earlier attempt made, as the result keeps them: tool, call id and effect.
+fn _agnosai_crew_uncertain_value_a(a, calls): i64 {
+    var arr = bayan_json_v_arr_new_a(a);
+    for (var i = 0; i < vec_len(calls); i = i + 1) {
+        var c = vec_get(calls, i);
+        var e = bayan_json_v_obj_new_a(a);
+        bayan_json_v_obj_set_a(a, e, str_from_a(a, "tool"), bayan_json_v_str_new_a(a, agnosai_replay_call_tool(c)));
+        bayan_json_v_obj_set_a(a, e, str_from_a(a, "call_id"), bayan_json_v_str_new_a(a, agnosai_replay_call_id(c)));
+        bayan_json_v_obj_set_a(a, e, str_from_a(a, "effect"), bayan_json_v_str_new_a(a, agnosai_replay_call_effect(c)));
+        bayan_json_v_arr_push_a(a, arr, e);
+    }
+    return arr;
+}
+
+# What a reviewer reads of a task that would run again: the calls that may repeat.
+fn _agnosai_crew_rerun_text_a(a, calls): i64 {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "This task is resuming after its crew stopped. Its earlier attempt made ");
+    str_builder_add_cstr_a(a, sb, "these tool calls, and what they did may stand, so running it again may ");
+    str_builder_add_cstr_a(a, sb, "repeat them:");
+    for (var i = 0; i < vec_len(calls); i = i + 1) {
+        var c = vec_get(calls, i);
+        str_builder_add_cstr_a(a, sb, "\n- ");
+        str_builder_add_a(a, sb, agnosai_replay_call_tool(c));
+        str_builder_add_cstr_a(a, sb, " (call ");
+        str_builder_add_a(a, sb, agnosai_replay_call_id(c));
+        str_builder_add_cstr_a(a, sb, "): ");
+        str_builder_add_a(a, sb, agnosai_replay_call_effect(c));
+        var args = agnosai_replay_call_arguments(c);
+        if (args != 0) {
+            str_builder_add_cstr_a(a, sb, ", arguments ");
+            str_builder_add_a(a, sb, args);
+        }
+    }
+    str_builder_add_cstr_a(a, sb, "\nApprove to run the task again; reject to fail it.");
+    return str_builder_build_a(a, sb);
+}
+
+# Ask the crew's reviewer whether `task` runs again, its earlier attempt having made `calls`, whose
+# effect may stand (ADR 036). Returns 0 to run it, or the failed result that stands instead. The
+# task waits as an answer does: `awaiting_approval`, `approval_requested` with the calls as its
+# `output` and `resume: true`, until a reviewer decides, the gate times out, or the crew stops; and
+# with no gate it is refused at once. Only a reviewer's approval runs it.
+#
+# ⚠ **A wave's task holds its slot while it waits here**, where an answer's review gives it back
+# (ADR 033): approved, it runs at once, and a slot given back would let it run past the crew's
+# limit. A resume is rare, and a task with such calls rarer.
+fn _agnosai_crew_review_rerun_a(a, r, task, agent, calls, tx): i64 {
+    var task_id = agnosai_task_id(task);
+    _agnosai_crew_rollup(r, 1);
+    var gate = load64(r + AGN_CR_GATE);
+    var ch = 0;
+    if (gate != 0) { ch = agnosai_approval_request(gate, task_id); }
+    var text = _agnosai_crew_rerun_text_a(a, calls);
+    var data = 0;
+    if (tx != 0 && agnosai_event_sender_wanted(tx) == 1) {
+        var key = 0;
+        if (agent != 0) { key = agnosai_agent_key(agent); }
+        var req = alloc_via(a, AGN_AR_SIZE);
+        store64(req + AGN_AR_TASK_ID, task_id);
+        store64(req + AGN_AR_OUTPUT, text);
+        store64(req + AGN_AR_RISK, agnosai_task_risk(task));
+        store64(req + AGN_AR_AGENT, key);
+        data = agnosai_approval_request_to_value_a(a, req);
+        bayan_json_v_obj_set_a(a, data, str_from_a(a, "resume"), bayan_json_v_bool_new_a(a, 1));
+    }
+    _agnosai_crew_move_task(r, task, AGNOSAI_STATUS_AWAITING_APPROVAL, str_from_a(a, "approval_requested"), data);
+
+    var why: i64[1];
+    store64(&why, AGNOSAI_APPROVAL_REASON_NO_GATE);
+    var decision = AGNOSAI_APPROVAL_REJECTED;
+    if (gate != 0) {
+        decision = agnosai_approval_wait_until(gate, ch, task_id, load64(r + AGN_CR_CANCELLED),
+          load64(r + AGN_CR_DEADLINE_NS), &why);
+    }
+    var reason = load64(&why);
+    if (reason == AGNOSAI_APPROVAL_REASON_DEADLINE) { store64(r + AGN_CR_TIMED_OUT, 1); }
+    _agnosai_crew_rollup(r, 0 - 1);
+    _agnosai_crew_move_task(r, task, AGNOSAI_STATUS_RUNNING, str_from_a(a, "approval_decided"),
+      _agnosai_crew_decided_data_a(a, tx, task, decision, reason));
+    _agnosai_crew_audit_decided(r, task, decision, reason);
+    if (decision == AGNOSAI_APPROVAL_APPROVED) { return 0; }
+
+    if (sakshi_get_level() >= SK_WARN) {
+        var f[AGNOSAI_LOG_FIELDS_BYTES];
+        var n = agnosai_log_fields_start(&f, task_id);
+        n = agnosai_log_field_str(&f, n, "reason", reason);
+        sakshi_log_kv(SK_WARN, "task not resumed: re-running it was rejected", 44, "task_id", 7, &f, n);
+    }
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "not resumed: re-running it was rejected (");
+    str_builder_add_a(a, sb, reason);
+    str_builder_add_cstr_a(a, sb, ")");
+    var result = agnosai_task_result_new_a(a, task_id, str_builder_build_a(a, sb), AGNOSAI_STATUS_FAILED);
+    agnosai_task_result_with_metadata_a(a, result, str_from_a(a, "approval"),
+      bayan_json_v_str_new_a(a, agnosai_approval_decision_to_wire(decision)));
+    agnosai_task_result_with_metadata_a(a, result, str_from_a(a, "approval_reason"), bayan_json_v_str_new_a(a, reason));
+    agnosai_task_result_with_metadata_a(a, result, str_from_a(a, "uncertain_calls"),
+      _agnosai_crew_uncertain_value_a(a, calls));
+    return result;
+}
+
+# Run `task` once, or, in a resumed crew (ADR 036), what its log says to: hand back its answer that
+# waited on a reviewer, or ask a reviewer before it runs again over calls whose effect may stand.
+# `r` may be 0, for a task run outside a runner.
+fn _agnosai_crew_attempt_a(a, r, task, agent, client, tx, crew_id: Str, trace, loop, budget): i64 {
+    var rp = 0;
+    if (r != 0) { rp = load64(r + AGN_CR_REPLAY); }
+    if (rp == 0) {
+        return agnosai_execute_task_budgeted_a(a, task, agent, client, tx, crew_id, trace, loop, budget);
+    }
+    var task_id = agnosai_task_id(task);
+    var answered = agnosai_crew_replay_answered(rp, task_id);
+    if (answered != 0) { return answered; }
+    var calls = agnosai_crew_replay_uncertain_a(a, rp, task_id);
+    if (vec_len(calls) > 0) {
+        var refused = _agnosai_crew_review_rerun_a(a, r, task, agent, calls, tx);
+        if (refused != 0) { return refused; }
+    }
+    var result = agnosai_execute_task_budgeted_a(a, task, agent, client, tx, crew_id, trace, loop, budget);
+    if (vec_len(calls) > 0) {
+        agnosai_task_result_with_metadata_a(a, result, str_from_a(a, "uncertain_calls"),
+          _agnosai_crew_uncertain_value_a(a, calls));
+    }
+    return result;
+}
+
+# Put the crew's log on its sender, when it has both.
+fn _agnosai_crew_tap_log(r): i64 {
+    var tx = load64(r + AGN_CR_EVENT_TX);
+    var log = load64(r + AGN_CR_LOG);
+    if (tx == 0 || log == 0) { return 0; }
+    agnosai_event_sender_with_tap(tx, &_agnosai_crew_log_tap, log);
+    return 0;
+}
+
+# What the crew's log keeps beside an event (ADR 036): `{key: value}` when it has a log, else 0, so
+# a crew without one builds nothing for it. In the crew's allocator.
+fn _agnosai_crew_log_extra_a(r, key, value): i64 {
+    if (load64(r + AGN_CR_LOG) == 0) { return 0; }
+    var a = load64(r + AGN_CR_ALLOC);
+    var x = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, x, str_from_a(a, key), value);
+    return x;
+}
+
+# A finished or answered task's `result`, for its event's line in the log, or 0 without one.
+fn _agnosai_crew_log_result_a(r, result): i64 {
+    if (load64(r + AGN_CR_LOG) == 0) { return 0; }
+    return _agnosai_crew_log_extra_a(r, "result", agnosai_task_result_to_value_a(load64(r + AGN_CR_ALLOC), result));
 }
 
 # Attach an audit chain.
@@ -1638,7 +1850,7 @@ fn agnosai_crew_runner_is_cancelled(r): i64 {
 fn _agnosai_crew_wants_events(r): i64 {
     var tx = load64(r + AGN_CR_EVENT_TX);
     if (tx == 0) { return 0; }
-    if (agnosai_event_sender_receiver_count(tx) == 0) { return 0; }
+    if (agnosai_event_sender_wanted(tx) == 0) { return 0; }
     return 1;
 }
 
@@ -1647,6 +1859,37 @@ fn _agnosai_crew_emit(r, event_type: Str, data): i64 {
     if (tx == 0) { return 0; }
     return agnosai_event_sender_send(tx, agnosai_crew_event_new_a(load64(r + AGN_CR_ALLOC),
         agnosai_crew_id(load64(r + AGN_CR_SPEC)), event_type, data));
+}
+
+# Store `value` at `word` and send `event`, or nothing for 0, as one step (ADR 036): under the crew's
+# bus lock when it has a sender, which is what its snapshot reads under. **Every move of a task's
+# status, or of the run's phase, goes through here**, with the event that reports it, so a reader
+# that resyncs from a snapshot never meets a status its events have not reached, or one they have
+# passed.
+fn _agnosai_crew_move(r, word, value, event): i64 {
+    var tx = load64(r + AGN_CR_EVENT_TX);
+    if (tx == 0) {
+        store64(word, value);
+        return 0;
+    }
+    return agnosai_event_sender_send_set(tx, event, word, value);
+}
+
+# `_agnosai_crew_move` for `task`'s status, with an event of `event_type` carrying `data`, or none
+# for `data` 0.
+fn _agnosai_crew_move_task(r, task, status, event_type: Str, data): i64 {
+    return _agnosai_crew_move_task_x(r, task, status, event_type, data, 0);
+}
+
+# `_agnosai_crew_move_task`, with what the crew's log keeps beside the event, or 0 (ADR 036).
+fn _agnosai_crew_move_task_x(r, task, status, event_type: Str, data, extra): i64 {
+    var event = 0;
+    if (data != 0) {
+        event = agnosai_crew_event_new_a(load64(r + AGN_CR_ALLOC), agnosai_crew_id(load64(r + AGN_CR_SPEC)),
+          event_type, data);
+        agnosai_crew_event_with_extra(event, extra);
+    }
+    return _agnosai_crew_move(r, task + AGN_TASK_STATUS, status, event);
 }
 
 # Record an audit event, when a chain is attached.
@@ -1773,10 +2016,11 @@ fn _agnosai_crew_needs_review(r, task, result): i64 {
     return agnosai_requires_approval(agnosai_task_risk(task), load64(r + AGN_CR_APPROVE_MEDIUM));
 }
 
-# Send `approval_requested` on `tx`, when someone is subscribed: the answer a reviewer judges.
-fn _agnosai_crew_emit_review_a(a, r, tx, task, agent, result): i64 {
+# The `approval_requested` payload, the answer a reviewer judges, when someone is subscribed on
+# `tx`, else 0.
+fn _agnosai_crew_review_data_a(a, tx, task, agent, result): i64 {
     if (tx == 0) { return 0; }
-    if (agnosai_event_sender_receiver_count(tx) == 0) { return 0; }
+    if (agnosai_event_sender_wanted(tx) == 0) { return 0; }
     var key = 0;
     if (agent != 0) { key = agnosai_agent_key(agent); }
     var req = alloc_via(a, AGN_AR_SIZE);
@@ -1784,22 +2028,19 @@ fn _agnosai_crew_emit_review_a(a, r, tx, task, agent, result): i64 {
     store64(req + AGN_AR_OUTPUT, agnosai_task_result_output(result));
     store64(req + AGN_AR_RISK, agnosai_task_risk(task));
     store64(req + AGN_AR_AGENT, key);
-    return agnosai_event_sender_send(tx, agnosai_crew_event_new_a(a,
-        agnosai_crew_id(load64(r + AGN_CR_SPEC)), str_from_a(a, "approval_requested"),
-        agnosai_approval_request_to_value_a(a, req)));
+    return agnosai_approval_request_to_value_a(a, req);
 }
 
-# Send `approval_decided` on `tx`, when someone is subscribed.
-fn _agnosai_crew_emit_decided_a(a, r, tx, task, decision, reason: Str): i64 {
+# The `approval_decided` payload, when someone is subscribed on `tx`, else 0.
+fn _agnosai_crew_decided_data_a(a, tx, task, decision, reason: Str): i64 {
     if (tx == 0) { return 0; }
-    if (agnosai_event_sender_receiver_count(tx) == 0) { return 0; }
+    if (agnosai_event_sender_wanted(tx) == 0) { return 0; }
     var d = bayan_json_v_obj_new_a(a);
     bayan_json_v_obj_set_a(a, d, str_from_a(a, "task_id"), bayan_json_v_str_new_a(a, agnosai_task_id(task)));
     bayan_json_v_obj_set_a(a, d, str_from_a(a, "decision"),
       bayan_json_v_str_new_a(a, agnosai_approval_decision_to_wire(decision)));
     bayan_json_v_obj_set_a(a, d, str_from_a(a, "reason"), bayan_json_v_str_new_a(a, reason));
-    return agnosai_event_sender_send(tx, agnosai_crew_event_new_a(a,
-        agnosai_crew_id(load64(r + AGN_CR_SPEC)), str_from_a(a, "approval_decided"), d));
+    return d;
 }
 
 # Audit a decision, when a chain is attached: who decided what is the trail's business. On the
@@ -1824,14 +2065,15 @@ fn _agnosai_crew_audit_decided(r, task, decision, reason: Str): i64 {
 fn _agnosai_crew_review_a(a, r, task, agent, result, tx): i64 {
     if (_agnosai_crew_needs_review(r, task, result) == 0) { return result; }
     var task_id = agnosai_task_id(task);
-    agnosai_task_with_status(task, AGNOSAI_STATUS_AWAITING_APPROVAL);
     _agnosai_crew_rollup(r, 1);
 
-    # Registered before it is announced, so a reviewer acting on the event finds it pending.
+    # Registered before it is announced, so a reviewer acting on the event finds it pending. The
+    # task moves to AWAITING_APPROVAL with the event, under one lock (ADR 036).
     var gate = load64(r + AGN_CR_GATE);
     var ch = 0;
     if (gate != 0) { ch = agnosai_approval_request(gate, task_id); }
-    _agnosai_crew_emit_review_a(a, r, tx, task, agent, result);
+    _agnosai_crew_move_task_x(r, task, AGNOSAI_STATUS_AWAITING_APPROVAL, str_from_a(a, "approval_requested"),
+      _agnosai_crew_review_data_a(a, tx, task, agent, result), _agnosai_crew_log_result_a(r, result));
 
     var why: i64[1];
     store64(&why, AGNOSAI_APPROVAL_REASON_NO_GATE);
@@ -1845,8 +2087,8 @@ fn _agnosai_crew_review_a(a, r, task, agent, result, tx): i64 {
     if (reason == AGNOSAI_APPROVAL_REASON_DEADLINE) { store64(r + AGN_CR_TIMED_OUT, 1); }
 
     _agnosai_crew_rollup(r, 0 - 1);
-    agnosai_task_with_status(task, AGNOSAI_STATUS_RUNNING);
-    _agnosai_crew_emit_decided_a(a, r, tx, task, decision, reason);
+    _agnosai_crew_move_task(r, task, AGNOSAI_STATUS_RUNNING, str_from_a(a, "approval_decided"),
+      _agnosai_crew_decided_data_a(a, tx, task, decision, reason));
     _agnosai_crew_audit_decided(r, task, decision, reason);
     agnosai_task_result_with_metadata_a(a, result, str_from_a(a, "approval"),
       bayan_json_v_str_new_a(a, agnosai_approval_decision_to_wire(decision)));
@@ -1899,6 +2141,8 @@ fn _agnosai_crew_run_in_order(r, pool, manager, withheld): i64 {
     var tasks = agnosai_crew_tasks(spec);
     var a = load64(r + AGN_CR_ALLOC);
     var results = vec_new_a(a);
+    store64(r + AGN_CR_MANAGER, manager);
+    store64(r + AGN_CR_WITHHELD, withheld);
     # Each result by its task's id, for a later task that depends on it (ADR 034). A sequential
     # crew runs its tasks in the order they are listed, so a task is handed the answers of the
     # dependencies listed before it that completed, and says of any other that it has none.
@@ -1914,10 +2158,14 @@ fn _agnosai_crew_run_in_order(r, pool, manager, withheld): i64 {
             break;
         }
         var task = vec_get(tasks, i);
-        var agent = _agnosai_crew_pick_best_agent_a(a, pool, task);
-        var result = _agnosai_crew_run_one_a(r, task, agent, by_id, load64(r + AGN_CR_LOOP), ev_started,
-          ev_completed);
-        if (manager != 0) { _agnosai_crew_note_assignment_a(a, result, manager, agent, withheld); }
+        # A task its log finished keeps its result and does not run again (ADR 036).
+        var result = _agnosai_crew_carried(r, task);
+        if (result != 0) { _agnosai_crew_carry(r, task, result); }
+        else {
+            var agent = _agnosai_crew_pick_best_agent_a(a, pool, task);
+            result = _agnosai_crew_run_one_a(r, task, agent, by_id, load64(r + AGN_CR_LOOP), ev_started,
+              ev_completed);
+        }
         if (agnosai_task_result_status(result) != AGNOSAI_STATUS_COMPLETED) { all_done = 0; }
         map_set_a(a, by_id, agnosai_task_id(task), result);
         vec_push_a(a, results, result);
@@ -1927,10 +2175,10 @@ fn _agnosai_crew_run_in_order(r, pool, manager, withheld): i64 {
     # a crew that failed fails without it, and pays for no call it would have wasted.
     if (manager != 0 && all_done == 1 && _agnosai_crew_should_stop(r) == 0) {
         var mt = _agnosai_crew_manager_task_a(a, tasks);
+        # Under the lock, so a snapshot lists it from here on (ADR 036).
+        _agnosai_crew_move(r, r + AGN_CR_MANAGER_TASK, mt, 0);
         var answer = _agnosai_crew_run_one_a(r, mt, _agnosai_crew_writer_a(a, manager), by_id, 0,
           ev_started, ev_completed);
-        agnosai_task_result_with_metadata_a(a, answer, str_from_a(a, "role"),
-          bayan_json_v_str_new_a(a, str_from_a(a, "manager")));
         vec_push_a(a, results, answer);
     }
     store64(r + AGN_CR_SCRATCH, 0);
@@ -1957,22 +2205,30 @@ fn _agnosai_crew_run_one_a(r, task, agent, by_id, loop, ev_started, ev_completed
     var wants_events = _agnosai_crew_wants_events(r);
     var task_tx = 0;
     if (wants_events == 1) { task_tx = load64(r + AGN_CR_EVENT_TX); }
-    agnosai_task_with_status(task, AGNOSAI_STATUS_QUEUED);
-    if (wants_events == 1) {
-        _agnosai_crew_emit(r, ev_started, _agnosai_crew_started_data_a(a, task, agent));
-    }
-
-    agnosai_task_with_status(task, AGNOSAI_STATUS_RUNNING);
+    _agnosai_crew_move_task(r, task, AGNOSAI_STATUS_QUEUED, 0, 0);
+    var started = 0;
+    if (wants_events == 1) { started = _agnosai_crew_started_data_a(a, task, agent); }
+    _agnosai_crew_move_task(r, task, AGNOSAI_STATUS_RUNNING, ev_started, started);
     agnosai_task_with_handoff(task, agnosai_handoff_render_a(a, task, by_id));
-    var result = agnosai_execute_task_budgeted_a(a, task, agent, load64(r + AGN_CR_CLIENT),
+    var result = _agnosai_crew_attempt_a(a, r, task, agent, load64(r + AGN_CR_CLIENT),
       task_tx, agnosai_crew_id(spec), load64(r + AGN_CR_TRACE), loop, load64(r + AGN_CR_BUDGET));
     result = _agnosai_crew_review_a(a, r, task, agent, result, task_tx);
     agnosai_task_with_handoff(task, 0);
-    agnosai_task_with_status(task, agnosai_task_result_status(result));
-
-    if (wants_events == 1) {
-        _agnosai_crew_emit(r, ev_completed, _agnosai_crew_completed_data_a(a, result));
+    # A hierarchical crew's marks go on before the result is out (ADR 035, ADR 036): its log keeps
+    # the result whole as `task_completed` goes, and a watcher may read it from then.
+    var manager = load64(r + AGN_CR_MANAGER);
+    if (manager != 0) {
+        if (task == load64(r + AGN_CR_MANAGER_TASK)) {
+            agnosai_task_result_with_metadata_a(a, result, str_from_a(a, "role"),
+              bayan_json_v_str_new_a(a, str_from_a(a, "manager")));
+        } else {
+            _agnosai_crew_note_assignment_a(a, result, manager, agent, load64(r + AGN_CR_WITHHELD));
+        }
     }
+    var completed = 0;
+    if (wants_events == 1) { completed = _agnosai_crew_completed_data_a(a, result); }
+    _agnosai_crew_move_task_x(r, task, agnosai_task_result_status(result), ev_completed, completed,
+      _agnosai_crew_log_result_a(r, result));
     _agnosai_crew_audit_task(r, task, result, agent);
     return result;
 }
@@ -2123,7 +2379,7 @@ fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
     for (var i = 0; i < vec_len(tasks); i = i + 1) {
         var task = vec_get(tasks, i);
         var agent = _agnosai_crew_pick_best_agent_a(a, agents, task);
-        agnosai_task_with_status(task, AGNOSAI_STATUS_QUEUED);
+        _agnosai_crew_move_task(r, task, AGNOSAI_STATUS_QUEUED, 0, 0);
 
         var job = alloc_via(a, AGN_CJ_SIZE);
         store64(job + AGN_CJ_TASK, task);
@@ -2185,11 +2441,16 @@ fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
             # `task_completed` goes out only if its `task_started` did.
             var job = vec_get(jobs, next);
             var worker_tx = 0;
+            var started = 0;
             if (_agnosai_crew_wants_events(r) == 1) {
                 worker_tx = load64(r + AGN_CR_EVENT_TX);
-                _agnosai_crew_emit(r, ev_started, _agnosai_crew_started_data_a(a,
-                    load64(job + AGN_CJ_TASK), load64(job + AGN_CJ_AGENT)));
+                started = _agnosai_crew_started_data_a(a, load64(job + AGN_CJ_TASK),
+                  load64(job + AGN_CJ_AGENT));
             }
+            # ⚠ **RUNNING at dispatch, with its `task_started` (ADR 036).** Through 2.4.3 a wave's
+            # task stayed QUEUED until it ended, which nothing read until a snapshot did.
+            _agnosai_crew_move_task(r, load64(job + AGN_CJ_TASK), AGNOSAI_STATUS_RUNNING, ev_started,
+              started);
             store64(job + AGN_CJ_EVENT_TX, worker_tx);
             store64(job + AGN_CJ_SLOTS, slots);
             store64(job + AGN_CJ_TAIL, tail);
@@ -2217,10 +2478,10 @@ fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
             reported = reported + 1;
             var res = load64(jb + AGN_CJ_RESULT);
             if (res != 0) {
-                agnosai_task_with_status(load64(jb + AGN_CJ_TASK), agnosai_task_result_status(res));
-                if (load64(jb + AGN_CJ_EVENT_TX) != 0) {
-                    _agnosai_crew_emit(r, ev_completed, _agnosai_crew_completed_data_a(a, res));
-                }
+                var completed = 0;
+                if (load64(jb + AGN_CJ_EVENT_TX) != 0) { completed = _agnosai_crew_completed_data_a(a, res); }
+                _agnosai_crew_move_task_x(r, load64(jb + AGN_CJ_TASK), agnosai_task_result_status(res),
+                  ev_completed, completed, _agnosai_crew_log_result_a(r, res));
             }
         }
     }
@@ -2236,8 +2497,23 @@ fn _agnosai_crew_run_wave(r, tasks, agents, results): i64 {
 # The oracle's `run_parallel` — every task at once, bounded by max_concurrency.
 fn _agnosai_crew_run_parallel(r): i64 {
     var spec = load64(r + AGN_CR_SPEC);
-    return _agnosai_crew_run_wave(r, agnosai_crew_tasks(spec), agnosai_crew_agents(spec),
-      vec_new_a(load64(r + AGN_CR_ALLOC)));
+    var a = load64(r + AGN_CR_ALLOC);
+    var tasks = agnosai_crew_tasks(spec);
+    var results = vec_new_a(a);
+    if (load64(r + AGN_CR_REPLAY) == 0) {
+        return _agnosai_crew_run_wave(r, tasks, agnosai_crew_agents(spec), results);
+    }
+    # Resumed (ADR 036): what its log finished comes first, in the spec's order, and the rest runs.
+    var left = vec_new_a(a);
+    for (var i = 0; i < vec_len(tasks); i = i + 1) {
+        var t = vec_get(tasks, i);
+        var done = _agnosai_crew_carried(r, t);
+        if (done != 0) {
+            _agnosai_crew_carry(r, t, done);
+            vec_push_a(a, results, done);
+        } else { vec_push_a(a, left, t); }
+    }
+    return _agnosai_crew_run_wave(r, left, agnosai_crew_agents(spec), results);
 }
 
 # Whether every dependency of `task` is in the completed set.
@@ -2292,6 +2568,25 @@ fn _agnosai_crew_run_dag(r, out_err): i64 {
     var results = vec_new_a(a);
     var remaining = order;
     var any_failed = 0;
+    # Resumed (ADR 036): what its log finished keeps its result and does not run again, in sorted
+    # order, and a dependent of one that failed is stranded as it was.
+    if (load64(r + AGN_CR_REPLAY) != 0) {
+        remaining = vec_new_a(a);
+        for (var c = 0; c < vec_len(order); c = c + 1) {
+            var cid = vec_get(order, c);
+            var ct = map_get(by_id, cid);
+            var done = 0;
+            if (ct != 0) { done = _agnosai_crew_carried(r, ct); }
+            if (done != 0) {
+                _agnosai_crew_carry(r, ct, done);
+                vec_push_a(a, results, done);
+                if (agnosai_task_result_status(done) == AGNOSAI_STATUS_COMPLETED) {
+                    map_set_a(a, completed, cid, done);
+                }
+                else { any_failed = 1; }
+            } else { vec_push_a(a, remaining, cid); }
+        }
+    }
 
     while (vec_len(remaining) > 0) {
         if (agnosai_crew_runner_is_cancelled(r) == 1) { break; }
@@ -2517,8 +2812,9 @@ fn _agnosai_crew_span_done(span, self_sc, parent_sc, t0, err_type): i64 {
 # Send `crew_completed`: the crew's terminal `status`, why when it did not complete (`reason`, a
 # `AGNOSAI_CREW_REASON_*` word, or 0 to leave it out), its result count and its wall time. The
 # crew's last event on every exit (ADR 032).
-fn _agnosai_crew_emit_completed(r, status, reason, task_count, wall_ms): i64 {
-    if (_agnosai_crew_wants_events(r) == 0) { return 0; }
+fn _agnosai_crew_emit_completed(r, status, reason, task_count, wall_ms, state): i64 {
+    # The run's phase moves to its end with the event, or alone with no one to tell (ADR 036).
+    if (_agnosai_crew_wants_events(r) == 0) { return _agnosai_crew_move(r, r + AGN_CR_PHASE, status, 0); }
     var a = load64(r + AGN_CR_ALLOC);
     var done = bayan_json_v_obj_new_a(a);
     bayan_json_v_obj_set_a(a, done, str_from_a(a, "status"),
@@ -2528,7 +2824,87 @@ fn _agnosai_crew_emit_completed(r, status, reason, task_count, wall_ms): i64 {
     }
     bayan_json_v_obj_set_a(a, done, str_from_a(a, "task_count"), bayan_json_v_int_new_a(a, task_count));
     bayan_json_v_obj_set_a(a, done, str_from_a(a, "wall_ms"), bayan_json_v_int_new_a(a, wall_ms));
-    return _agnosai_crew_emit(r, str_from_a(a, "crew_completed"), done);
+    var ev = agnosai_crew_event_new_a(a, agnosai_crew_id(load64(r + AGN_CR_SPEC)), str_from_a(a, "crew_completed"),
+      done);
+    # The crew's state goes in its log beside its last event (ADR 036), so a finished crew answers
+    # after a restart. A crew that could not run has none, and its log is given one.
+    if (load64(r + AGN_CR_LOG) != 0) {
+        var end = state;
+        if (end == 0) {
+            end = agnosai_crew_state_new_a(a, agnosai_crew_id(load64(r + AGN_CR_SPEC)), status);
+            if (reason != 0) { agnosai_crew_state_with_reason(end, reason); }
+        }
+        agnosai_crew_event_with_extra(ev, _agnosai_crew_log_extra_a(r, "state", agnosai_crew_state_to_value_a(a, end)));
+    }
+    var n = _agnosai_crew_move(r, r + AGN_CR_PHASE, status, ev);
+    # Nothing follows `crew_completed`, so the log comes off the sender: a bus's sender can outlive
+    # this run and serve the next run of its id, and must not write into this one's log.
+    var tx = load64(r + AGN_CR_EVENT_TX);
+    if (tx != 0 && load64(r + AGN_CR_LOG) != 0) { agnosai_event_sender_with_tap(tx, 0, 0); }
+    return n;
+}
+
+# Where the run is (ADR 036): PENDING before `crew_started`, RUNNING, then its terminal status.
+fn agnosai_crew_runner_phase(r): i64 {
+    return load64(r + AGN_CR_PHASE);
+}
+
+# A snapshot of the run (ADR 036): where the crew is, each task's status and the `seq` of the last
+# event it delivered, read in one step under its bus lock, so they agree with its events. A reader
+# that fell behind its event ring takes every task as this says and goes on from the first event
+# after `seq`: no event at or before it is missing from what it read, and none after it is in it.
+#
+# `{"crew_id", "status", "seq", "tasks": [{"task_id", "status"}]}`: the spec's tasks in order, then a
+# hierarchical crew's manager task once it has one. The crew reads `awaiting_approval` while any of
+# its tasks does, as the registry's roll-up says. A runner with no sender has no `seq` to agree
+# with and reads 0. In `a`.
+fn agnosai_crew_runner_snapshot_a(a, r): i64 {
+    return _agnosai_crew_runner_snapshot_ended_a(a, r, 0 - 1);
+}
+
+# `agnosai_crew_runner_snapshot_a`, reading `ended`, a terminal crew status, for a run that never
+# started, or -1 for none: the registry's word for a crew that ended before its run did.
+fn _agnosai_crew_runner_snapshot_ended_a(a, r, ended): i64 {
+    var spec = load64(r + AGN_CR_SPEC);
+    var tasks = agnosai_crew_tasks(spec);
+    var n = vec_len(tasks);
+    var statuses = alloc_via(a, (n + 1) * 8);
+    var tx = load64(r + AGN_CR_EVENT_TX);
+    var seq = 0;
+    if (tx != 0) {
+        _agnosai_event_sender_lock(tx);
+        seq = _agnosai_event_sender_seq_locked(tx);
+    }
+    var phase = load64(r + AGN_CR_PHASE);
+    for (var i = 0; i < n; i = i + 1) { store64(statuses + i * 8, agnosai_task_status(vec_get(tasks, i))); }
+    var mt = load64(r + AGN_CR_MANAGER_TASK);
+    if (mt != 0) { store64(statuses + n * 8, agnosai_task_status(mt)); }
+    if (tx != 0) { _agnosai_event_sender_unlock(tx); }
+
+    var list = bayan_json_v_arr_new_a(a);
+    var waiting = 0;
+    var count = n;
+    if (mt != 0) { count = n + 1; }
+    for (var j = 0; j < count; j = j + 1) {
+        var t = mt;
+        if (j < n) { t = vec_get(tasks, j); }
+        var status = load64(statuses + j * 8);
+        if (status == AGNOSAI_STATUS_AWAITING_APPROVAL) { waiting = 1; }
+        var e = bayan_json_v_obj_new_a(a);
+        bayan_json_v_obj_set_a(a, e, str_from_a(a, "task_id"), bayan_json_v_str_new_a(a, agnosai_task_id(t)));
+        bayan_json_v_obj_set_a(a, e, str_from_a(a, "status"),
+          bayan_json_v_str_new_a(a, agnosai_task_status_to_wire_a(a, status)));
+        bayan_json_v_arr_push_a(a, list, e);
+    }
+    if (phase == AGNOSAI_CREW_RUNNING && waiting == 1) { phase = AGNOSAI_CREW_AWAITING_APPROVAL; }
+    if (phase == AGNOSAI_CREW_PENDING && ended >= 0) { phase = ended; }
+    var v = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, v, str_from_a(a, "crew_id"), bayan_json_v_str_new_a(a, agnosai_crew_id(spec)));
+    bayan_json_v_obj_set_a(a, v, str_from_a(a, "status"),
+      bayan_json_v_str_new_a(a, agnosai_crew_status_to_wire_a(a, phase)));
+    bayan_json_v_obj_set_a(a, v, str_from_a(a, "seq"), bayan_json_v_int_new_a(a, seq));
+    bayan_json_v_obj_set_a(a, v, str_from_a(a, "tasks"), list);
+    return v;
 }
 
 # How many tasks a run of `spec` holds: its own, and a hierarchical crew's manager's answer.
@@ -2536,6 +2912,57 @@ fn _agnosai_crew_task_count(spec): i64 {
     var n = vec_len(agnosai_crew_tasks(spec));
     if (agnosai_process_kind(agnosai_crew_process(spec)) == AGNOSAI_PROCESS_HIERARCHICAL) { return n + 1; }
     return n;
+}
+
+# The `crew_started` payload: the crew's name and how many tasks its run holds, and for a resumed
+# crew (ADR 036) `resumed: true`.
+fn _agnosai_crew_started_payload_a(a, r): i64 {
+    var spec = load64(r + AGN_CR_SPEC);
+    var started = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, started, str_from_a(a, "name"), bayan_json_v_str_new_a(a, agnosai_crew_name(spec)));
+    bayan_json_v_obj_set_a(a, started, str_from_a(a, "task_count"),
+      bayan_json_v_int_new_a(a, _agnosai_crew_task_count(spec)));
+    if (load64(r + AGN_CR_REPLAY) != 0) {
+        bayan_json_v_obj_set_a(a, started, str_from_a(a, "resumed"), bayan_json_v_bool_new_a(a, 1));
+    }
+    return started;
+}
+
+# What a result says it spent: its `tokens.total`, or with `cost` 1 its `cost_micro_usd`, or 0.
+fn _agnosai_crew_spent(result, cost): i64 {
+    var md = agnosai_task_result_metadata(result);
+    var v = 0;
+    if (cost == 1) { v = map_get(md, _AGN_CREW_K_COST); }
+    else {
+        var tok = map_get(md, _AGN_CREW_K_TOKENS);
+        if (tok != 0 && bayan_json_v_is_obj(tok) == 1) { v = bayan_json_v_obj_get_by_cstr(tok, "total"); }
+    }
+    if (v == 0 || bayan_json_v_is_int(v) == 0) { return 0; }
+    return bayan_json_v_int(v);
+}
+
+# Start a resumed run where its log left off (ADR 036): its events numbered on from the log's last
+# `seq`, and what its finished tasks spent, and the answers it still holds, counted against its
+# budget, and so its tenant's, before it spends any more. Nothing for a first run.
+fn _agnosai_crew_resume_start(r): i64 {
+    var rp = load64(r + AGN_CR_REPLAY);
+    if (rp == 0) { return 0; }
+    var tx = load64(r + AGN_CR_EVENT_TX);
+    if (tx != 0) { agnosai_event_sender_with_seq(tx, agnosai_crew_replay_seq(rp)); }
+    var budget = load64(r + AGN_CR_BUDGET);
+    if (budget == 0) { return 0; }
+    var tasks = agnosai_crew_tasks(load64(r + AGN_CR_SPEC));
+    for (var i = 0; i < vec_len(tasks); i = i + 1) {
+        var id = agnosai_task_id(vec_get(tasks, i));
+        var res = agnosai_crew_replay_finished(rp, id);
+        if (res == 0) { res = agnosai_crew_replay_answered(rp, id); }
+        if (res != 0) {
+            agnosai_budget_tracker_record_tokens(budget, _agnosai_crew_spent(res, 0));
+            var cost = _agnosai_crew_spent(res, 1);
+            if (cost > 0) { agnosai_budget_tracker_record_cost(budget, cost); }
+        }
+    }
+    return 0;
 }
 
 # Run the crew end to end — the oracle's `run`.
@@ -2588,9 +3015,21 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
     }
     store64(r + AGN_CR_TRACE, self_sc);
 
+    # A crew with a log and no bus gets a sender of its own, which the log alone receives: its events
+    # are numbered all the same, and its snapshot agrees with them (ADR 036).
+    var log = load64(r + AGN_CR_LOG);
+    if (log != 0 && load64(r + AGN_CR_EVENT_TX) == 0) {
+        agnosai_crew_runner_with_events(r, agnosai_event_sender_new_a(a));
+    }
+    _agnosai_crew_resume_start(r);
+
     if (load64(r + AGN_CR_TOOLS) != 0) {
+        # With a log, each call's intent goes in it before the call runs, ahead of the consumer's
+        # journal, which it still asks.
+        var journal = load64(r + AGN_CR_JOURNAL);
+        if (log != 0) { journal = agnosai_crew_log_journal_a(a, log, journal); }
         var loop = agnosai_tool_loop_new_a(a, load64(r + AGN_CR_TOOLS),
-          load64(r + AGN_CR_JOURNAL), load64(r + AGN_CR_AUDIT), load64(r + AGN_CR_CANCELLED),
+          journal, load64(r + AGN_CR_AUDIT), load64(r + AGN_CR_CANCELLED),
           load64(r + AGN_CR_DEADLINE_NS), r + AGN_CR_TIMED_OUT, agnosai_crew_id(spec));
         # The crew's own limits, which only tighten the process's (ADR 033).
         var tl = agnosai_crew_tool_limits(spec);
@@ -2600,14 +3039,17 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
         store64(r + AGN_CR_LOOP, loop);
     }
 
+    var started = 0;
     if (_agnosai_crew_wants_events(r) == 1) {
-        var started = bayan_json_v_obj_new_a(a);
-        bayan_json_v_obj_set_a(a, started, str_from_a(a, "name"),
-          bayan_json_v_str_new_a(a, agnosai_crew_name(spec)));
-        bayan_json_v_obj_set_a(a, started, str_from_a(a, "task_count"),
-          bayan_json_v_int_new_a(a, _agnosai_crew_task_count(spec)));
-        _agnosai_crew_emit(r, str_from_a(a, "crew_started"), started);
+        started = agnosai_crew_event_new_a(a, agnosai_crew_id(spec), str_from_a(a, "crew_started"),
+          _agnosai_crew_started_payload_a(a, r));
+        # Which run this is goes in the log beside it, so the next resume numbers its own after it.
+        if (log != 0) {
+            agnosai_crew_event_with_extra(started, _agnosai_crew_log_extra_a(r, "run",
+                bayan_json_v_int_new_a(a, agnosai_crew_log_run(log))));
+        }
     }
+    _agnosai_crew_move(r, r + AGN_CR_PHASE, AGNOSAI_CREW_RUNNING, started);
     # Bumps crews_total and the crews_active gauge. **Every exit below must
     # balance the gauge**, including the DAG-cycle error return — that path does
     # not emit a `crew_completed` *event* (a cyclic spec is an error, not a crew
@@ -2643,7 +3085,7 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
                 end_reason = AGNOSAI_CREW_REASON_CANCELLED;
             }
             _agnosai_crew_emit_completed(r, end_status, end_reason, 0,
-              _agnosai_crew_elapsed_ms(start_ns));
+              _agnosai_crew_elapsed_ms(start_ns), 0);
             store64(out_err, load64(&run_err));
             return 0;
         }
@@ -2726,7 +3168,7 @@ fn agnosai_crew_runner_run(r, out_err): i64 {
     # `task_count` is the STATE's result count, not the run's, so a timed-out
     # crew reports 0 — what the stored state holds. `wall_ms` stays the real one.
     _agnosai_crew_emit_completed(r, status, reason, vec_len(agnosai_crew_state_results(state)),
-      wall_ms);
+      wall_ms, state);
 
     # ⚠ CANCELLED is an ERROR span, not OK. A collector's error rate is what an
     # operator alerts on, and a cancelled crew did not do what was asked — the

@@ -795,6 +795,23 @@ fn agnosai_route_get_crew(state, id: Str): i64 {
     return agnosai_route_get_crew_a(default_alloc(), state, id);
 }
 
+# `GET /api/v1/crews/{id}/snapshot` — where a crew is, each task's status and the `seq` of its last
+# event, read in one step (2.5.0, ADR 036). A client whose stream fell behind (it lagged, or it
+# reconnected) reads this and takes the events after `seq`. 404 for a crew the registry does not
+# hold, 422 for an id that is not a UUID, as `GET /api/v1/crews/{id}` answers.
+fn agnosai_route_crew_snapshot_a(a, state, id: Str): i64 {
+    var key = _agnosai_uuid_key_a(a, id);
+    if (key == 0) {
+        return agnosai_route_error_a(a, AGNOSAI_HTTP_UNPROCESSABLE,
+          str_from_a(a, "crew id is not a valid UUID"));
+    }
+    var v = agnosai_orchestrator_crew_snapshot_a(a, agnosai_app_state_orchestrator(state), key);
+    if (v == 0) {
+        return agnosai_route_error_a(a, HTTP_NOT_FOUND, str_from_a(a, "crew not found"));
+    }
+    return agnosai_route_json_a(a, HTTP_OK, v);
+}
+
 # `POST /api/v1/crews/{id}/cancel` — cancel a running crew.
 #
 # 200 with `{"status":"cancelled","crew_id":"<id>"}`, 404 when the orchestrator

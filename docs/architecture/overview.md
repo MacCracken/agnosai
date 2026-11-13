@@ -93,6 +93,24 @@ CrewRunner::new(spec), with a budget tracker under its tenant's
 CrewState { crew_id, status, results, profile }
 ```
 
+### The crew log and resuming (2.5.0, [ADR 036](../adr/036-a-crew-keeps-a-log-and-resumes-from-it.md))
+
+```
+register ─▶ log: {"crew": spec}                      synced, through a StateStore backend
+run      ─▶ every event: a tap on the crew's sender  numbered; task_completed carries its result
+         ─▶ each tool call: the log's journal first  synced before the call runs
+         ─▶ crew_completed carries the crew's state  synced
+restart  ─▶ agnosai_orchestrator_recover: each log
+            ├── ended      → back in the registry as it ended
+            └── not ended  → resumed: finished tasks stand, an answer is asked about again,
+                             a task with calls whose effect may stand waits for a reviewer,
+                             the rest runs, its events numbered on from the log's last seq
+```
+
+Every move of a task's status goes with the event that reports it under the bus lock, and a snapshot
+(`GET /api/v1/crews/{id}/snapshot`) reads them under it, so a reader that fell behind takes each task as
+the snapshot says and goes on from the first event after its `seq`.
+
 ### Agent Scoring
 
 Five weighted factors (0.0–1.0 each):

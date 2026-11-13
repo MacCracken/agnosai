@@ -215,6 +215,9 @@ Applied to the six:
 - **Neutral:** F3 builds its state machine and `seq` on these semantics rather
   than replacing them.
 
+> **2.5.0 note** ([ADR 036](036-a-crew-keeps-a-log-and-resumes-from-it.md)): a crew with a log builds and logs every
+> event, as the log receives each one, so this ADR's guard on construction holds only for a crew without one.
+
 ## Alternatives considered
 
 - **Stamp `crew_id` into each task's context instead of passing it.** Rejected.

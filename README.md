@@ -23,6 +23,7 @@ AgnosAI replaces Python/CrewAI orchestration with a compiled Cyrius binary -- re
 | Sequential or hierarchical only | Arbitrary task DAGs with priority + preemption, each task handed its dependencies' answers as data |
 | A manager that can grant what it lacks | A hierarchical crew's workers, and an agent the `delegate` tool starts, hold at most their manager's tools and budget |
 | No ceiling on what a crew spends | Token and cost budgets per tenant, crew and task, checked before every model call, and a cap on crews at once |
+| A restart loses the crew | A crew keeps a log and resumes from it after a restart; a task whose tool call may already have taken effect waits for a reviewer before it runs again |
 
 ## Architecture
 
@@ -86,15 +87,15 @@ cyrius coverage --min 80
 ## Usage as a Library
 
 AgnosAI ships **both** a binary and a bundle. `cyrius.cyml` carries a `[lib]`
-stanza of **121** modules, and `cyrius distlib` concatenates them into
-`dist/agnosai.cyr` (**49,219 lines** at 2.4.3, stamped with the release) plus a
+stanza of **122** modules, and `cyrius distlib` concatenates them into
+`dist/agnosai.cyr` (**50,921 lines** at 2.5.0, stamped with the release) plus a
 `dist/agnosai.deps` sidecar naming the **6** stdlib leaves the fold needs in
 scope — so a `[deps.agnosai]` block resolves like any other dependency:
 
 ```cyml
 [deps.agnosai]
 git = "https://github.com/MacCracken/agnosai.git"
-tag = "2.4.3"
+tag = "2.5.0"
 modules = ["dist/agnosai.cyr"]
 ```
 
@@ -244,7 +245,7 @@ First-class multi-node support:
 ```
 $ cyrius test tests
 ...
-114 passed, 0 failed
+116 passed, 0 failed
 ```
 
 ```

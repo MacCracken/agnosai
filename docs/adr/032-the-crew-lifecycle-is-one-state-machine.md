@@ -155,6 +155,10 @@ the turn's, as a subscriber may hold one after the turn's arena goes back.
   - **Event volume rises** by two events per tool call and two per reviewed task.
 - **Neutral.** A snapshot to resync from mid-run, which agnostic asks for, is not here: it needs a task's status and
   the crew's `seq` written under one lock. 2.5.0's crew log is where it belongs.
+  **2.5.0 note** ([ADR 036](036-a-crew-keeps-a-log-and-resumes-from-it.md)): it is there. Every move of a task's
+  status goes with its event under the bus lock, and `GET /api/v1/crews/{id}/snapshot` reads them under it. A wave's
+  task goes `running` at dispatch, with its `task_started`, where it stayed `queued` until it ended. With a log, every
+  event is numbered, as the log receives every one.
 
 ## Alternatives considered
 

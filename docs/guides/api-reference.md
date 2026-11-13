@@ -9,7 +9,7 @@ AgnosAI exposes a REST API from the `agnosai` binary, served by
 
 ## Endpoints
 
-⚠ This table listed **6** of the **19** routes the router serves. The rest were
+⚠ This table listed **6** of the **19** routes the router served (20 since 2.5.0's snapshot). The rest were
 undocumented, and `/api/v1/crews/{id}` was marked "(placeholder)" long after it
 started returning real state. Until 2.1.7 it still named 18: it listed a `GET`
 on `/api/v1/tools/{name}`, which the router has never served (it is `DELETE`, as
@@ -24,6 +24,7 @@ in the oracle), and left out `GET /api/v1/approvals`.
 | GET | `/api/v1/crews/{id}` | yes | The crew's state |
 | POST | `/api/v1/crews/{id}/cancel` | yes | Request cancellation |
 | GET | `/api/v1/crews/{id}/stream` | yes | SSE event stream for one crew |
+| GET | `/api/v1/crews/{id}/snapshot` | yes | Each task's status and the crew's `seq`, to resync a stream from (2.5.0) |
 | GET | `/api/v1/agents/definitions` | yes | List agent definitions |
 | POST | `/api/v1/agents/definitions` | yes | Register an agent definition |
 | GET | `/api/v1/tools` | yes | List registered tools |
@@ -419,12 +420,12 @@ had reached. The stream's own `connected` and `error` frames have no `seq` and n
 
 | `event_type` | When | `data` |
 |---|---|---|
-| `crew_started` | the run begins | `name`, `task_count` |
+| `crew_started` | the run begins | `name`, `task_count`, and `resumed: true` for a crew resumed from its log (2.5.0) |
 | `task_started` | the task is dispatched — for a parallel or DAG crew, when its batch starts | `task_id`, `description`, `agent` (key or null) |
 | `tool_call_started` | a tool call is about to run | `task_id`, `call_id`, `tool` |
 | `tool_call_completed` | a tool call's result is delivered | `task_id`, `call_id`, `tool`, `status` (`ok`, `error`, `refused`), `asked` for a tool the agent does not hold |
 | `token` | an LLM-answered task succeeds — one per task, in every process mode | `task_id`, `token` (the whole output), `complete: true` |
-| `approval_requested` | the task's answer waits for a reviewer | `task_id`, `output`, `risk`, `agent` |
+| `approval_requested` | the task's answer waits for a reviewer, or, with `resume: true`, a resumed task waits to run again over calls whose effect may stand (2.5.0) | `task_id`, `output`, `risk`, `agent`, `resume` |
 | `approval_decided` | the wait ends | `task_id`, `decision` (`approved`, `rejected`), `reason` (`reviewer`, `timeout`, `cancelled`, `deadline`, `capacity`, `no_gate`) |
 | `task_completed` | the task finishes | `task_id`, `status` |
 | `crew_completed` | the run ends — the last event, on every exit | `status`, `reason` (unless `completed`), `task_count`, `wall_ms` |
@@ -447,6 +448,33 @@ had reached. The stream's own `connected` and `error` frames have no `seq` and n
   (`stream lagged, N events dropped`) and the stream closes. Events sent before a client subscribed are not replayed.
   The runner checks for a subscriber per task (sequential) and per batch (parallel, DAG), so a client that subscribes
   mid-run is told about the tasks after it (2.4.0; through 2.3.8 it heard nothing until `crew_completed`).
+- A crew with a log (2.5.0, `AGNOSAI_STATE_DIR`) numbers every event, as its log receives each one, so `seq` counts
+  from the crew's start whoever is watching; a resumed crew's go on from its log's last.
+
+### Crew snapshot — GET /api/v1/crews/:id/snapshot
+
+Where a crew is, read in one step with its events (2.5.0,
+[ADR 036](../adr/036-a-crew-keeps-a-log-and-resumes-from-it.md)). A client whose stream fell behind, or that
+reconnected, reads this, takes each task's status as it says, and then takes the events after `seq`: no event at or
+before `seq` is missing from it, and none after is in it.
+
+```json
+{
+  "crew_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+  "status": "running",
+  "seq": 7,
+  "tasks": [
+    {"task_id": "…", "status": "completed"},
+    {"task_id": "…", "status": "running"},
+    {"task_id": "…", "status": "pending"}
+  ]
+}
+```
+
+`status` is the crew's: `pending` before `crew_started`, `running`, `awaiting_approval` while a task waits on a
+reviewer, then its end with `crew_completed`. The tasks are the crew's in order, then a hierarchical crew's manager
+task once it has one. A crew put back from its log after a restart has no events in this process and reads its state,
+at `seq` 0. 404 for a crew the registry does not hold, 422 for an id that is not a UUID.
 
 ---
 
@@ -564,6 +592,26 @@ cyrius build src/main.cyr build/agnosai
 ```
 
 The server binds to `0.0.0.0:8080` by default. Use `PORT` or `AGNOSAI_PORT` to change the port.
+
+### Durable crews — `AGNOSAI_STATE_DIR`
+
+With `AGNOSAI_STATE_DIR` set, every crew keeps a log there, `<crew_id>.log`, one JSON line a record: its spec, every
+event it sends, each tool call before it runs, and each finished task's result
+([ADR 036](../adr/036-a-crew-keeps-a-log-and-resumes-from-it.md)). A start reads them back before the server listens:
+
+- a crew whose log ended answers `GET /api/v1/crews/{id}` as it ended;
+- a crew whose log did not, because the last process stopped mid-run, is **resumed**: what it finished stands and is
+  not run again, an answer that waited on a reviewer is asked about again, and the rest runs, its events numbered on
+  from its log's last;
+- **a task whose earlier attempt made a tool call that may have taken effect waits for a reviewer** before it runs
+  again (`approval_requested` with `resume: true`, decided through `POST /api/v1/approvals`): approved, it runs; rejected,
+  timed out after five minutes, or with no gate, it fails as `not resumed: …`, and its result's `uncertain_calls`
+  names each call.
+
+A log is written `0600`, as it holds answers and tool arguments, and is removed when its crew leaves the registry.
+Unset or empty, crews keep no log and a restart loses them, as through 2.4.3. A server claims its directory as it
+starts, a lock on `<dir>/.owner`, so a second on the same directory refuses to start rather than resume the first's
+live crews.
 
 ## Content Type
 

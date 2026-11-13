@@ -1,0 +1,641 @@
+# =========================================================================
+# crew_log — a crew's durable log: every event it sends, each tool call
+# journaled before it runs, and what a resume needs (ADR 036).
+#
+# Port-local, with no `rust-old/` counterpart: the Rust line could snapshot a
+# crew state (`orchestrator/durable_state`) and nothing ever did. This is the
+# log `durable_state`'s store was waiting for.
+#
+# ## The record
+#
+# One JSON object a line, appended through a store (`agnosai_state_store_append`):
+#
+#   {"crew":{...}}                       the spec, the first line, written as the crew registers
+#   {"seq":3,"event":"task_completed","data":{...},"result":{...}}
+#   {"journal":"intent","task_id":"..","call_id":"..","tool":"..","arguments":".."}
+#   {"journal":"result","task_id":"..","call_id":"..","tool":"..","effect":"committed"}
+#   {"state":{...}}                      a crew that ended before its run started (`agnosai_crew_log_close`)
+#
+# Each journal line, and `crew_started`'s, carries `run`: 1, and one more for each resume, as a
+# model's call ids repeat from one attempt at a task to the next.
+#
+# **Every event the crew sends is a line, numbered.** The log is a tap on the crew's
+# sender (`agnosai_event_sender_with_tap`), so with a log every event is built and
+# numbered whoever else is subscribed: ADR 032 numbers an event when something
+# receives it, and the log receives every one. Its `seq` is the one a subscriber
+# sees, so a reader of the log and a reader of the stream agree on one order.
+#
+# What a resume needs beside the events goes on their lines and reaches no
+# subscriber (`agnosai_crew_event_with_extra`): a finished task's whole `result`
+# on `task_completed`, and on `approval_requested`, so an answer waiting on a
+# reviewer is asked about again rather than paid for again; the crew's `state` on
+# `crew_completed`, so a finished crew answers after a restart; and the run on `crew_started`.
+#
+# **A tool call is journaled before it runs** (ADR 029's rule 1), synced, by the
+# journal this log hands its crew's tools (`agnosai_crew_log_journal_a`), ahead of
+# any consumer's. A call it cannot write down does not run. A crash after that
+# leaves an intent with no result, which a resume names as an unknown effect.
+#
+# ## What is on disk when
+#
+# A line is written before the send that made it returns, so a crew's next step
+# never runs ahead of its log. Some are synced as well, each something a resume
+# would otherwise pay for again, decide again or run again: the spec, a tool
+# call's intent, `task_completed`, `approval_requested`, `approval_decided`,
+# `crew_completed` and a close line. The rest, progress, are in the page cache: a crash of the
+# process keeps them, and a power cut may lose them, which a resume reads as
+# work still to do.
+#
+# Two threads' lines may land in either order (a wave's workers send at once), and
+# a reader puts them back by `seq`. A journal line has no `seq`: it is read by its
+# task and call id.
+#
+# ⚠ **A log holds a crew's answers and its tool calls' arguments.** The file
+# backend writes it 0600, and it is removed with the crew (`agnosai_state_store_remove`).
+#
+# ## When the disk refuses
+#
+# A spec that cannot be written leaves the crew with no log: it runs as a crew
+# with none would, and its caller is told. An event that cannot be written is
+# logged at ERROR, once a crew, and the crew goes on: its log is then short, and a
+# resume re-runs what it cannot see finished. An intent that cannot be written
+# refuses its call, as a consumer's journal would.
+# =========================================================================
+
+include "src/log_fields.cyr"
+include "src/orchestrator/durable_state.cyr"
+
+# A crew's log: where it goes and whose it is.
+enum AgnosaiCrewLogOff {
+    AGN_CLOG_STORE = 0;
+    AGN_CLOG_CREW_ID = 8;
+    # 1 once a line could not be written, so the ERROR goes out once a crew.
+    AGN_CLOG_FAILED = 16;
+    # Which run of the crew this is: 1, and one more for each resume. A journal line says its run,
+    # as a model's call ids repeat from one attempt at a task to the next.
+    AGN_CLOG_RUN = 24;
+    AGN_CLOG_SIZE = 32;
+}
+
+# Every line is rendered in an arena from here and handed back, so a crew's log costs its heap
+# nothing that outlives the write.
+var _AGNOSAI_CREW_LOG_POOL = 0;
+
+fn _agnosai_crew_log_pool(): i64 {
+    if (_AGNOSAI_CREW_LOG_POOL == 0) {
+        var p = agnosai_arena_pool_new(4, 8192);
+        if (atomic_cas(&_AGNOSAI_CREW_LOG_POOL, 0, p) == 0) { return load64(&_AGNOSAI_CREW_LOG_POOL); }
+    }
+    return _AGNOSAI_CREW_LOG_POOL;
+}
+
+# The store a log writes to.
+fn agnosai_crew_log_store(log): i64 {
+    return load64(log + AGN_CLOG_STORE);
+}
+
+# The crew a log is for.
+fn agnosai_crew_log_crew_id(log): i64 {
+    return load64(log + AGN_CLOG_CREW_ID);
+}
+
+# A log over `store` for crew `crew_id`, writing nothing yet, for its `run`: 1 for a crew's first,
+# and a resume's is `agnosai_crew_replay_run` plus one. What a resume appends to. In `a`.
+fn agnosai_crew_log_reopen_a(a, store, crew_id: Str, run): i64 {
+    var log = alloc_via(a, AGN_CLOG_SIZE);
+    store64(log + AGN_CLOG_STORE, store);
+    store64(log + AGN_CLOG_CREW_ID, str_clone_a(a, crew_id));
+    store64(log + AGN_CLOG_FAILED, 0);
+    store64(log + AGN_CLOG_RUN, run);
+    return log;
+}
+
+# Which run of its crew a log is writing: 1, and one more for each resume.
+fn agnosai_crew_log_run(log): i64 {
+    return load64(log + AGN_CLOG_RUN);
+}
+
+# Say once a crew that its log fell short.
+fn _agnosai_crew_log_failed(log, err): i64 {
+    if (atomic_cas(log + AGN_CLOG_FAILED, 0, 1) == 0) { return 0; }
+    if (sakshi_get_level() < SK_ERROR) { return 0; }
+    var f[AGNOSAI_LOG_FIELDS_BYTES];
+    var n = agnosai_log_fields_start(&f, load64(log + AGN_CLOG_CREW_ID));
+    n = agnosai_log_field_str(&f, n, "error", agnosai_error_message(err));
+    sakshi_log_kv(SK_ERROR, "crew log write failed; a resume re-runs what it cannot see", 58, "crew_id", 7,
+      &f, n);
+    return 0;
+}
+
+# ── rendering a line ───────────────────────────────────────────────────────
+#
+# ⚠ **A log line is rendered here, not by `bayan_json_v_build_a`**, which escapes a string with one
+# builder call per byte: 4 KiB of prose, what a task's answer is, takes it 148 µs, and this walker
+# 14 µs, as it tests eight bytes at a time and copies each run that needs no escape whole. A log
+# writes an answer three times over a crew's run (its `token`, its `task_completed`, the crew's
+# state). It writes the same compact JSON, byte for byte (`tests/orch_crew_log.tcyr`), and a float
+# goes to bayan, as its shortest round-trip printer is the one to have. Filed with bayan
+# (`2026-11-12-agnosai-json-build-escapes-one-byte-a-call.md`); this goes when its escape copies
+# runs.
+
+# Append `len` bytes at `p`.
+fn _agnosai_crew_log_bytes_a(a, sb, p, len): i64 {
+    if (len <= 0) { return 0; }
+    var t[16];
+    store64(&t, p);
+    store64(&t + 8, len);
+    return str_builder_add_a(a, sb, &t);
+}
+
+# Whether none of the eight bytes of `w` needs an escape: no `"` (34), no `\\` (92), and none below
+# 32. The word tests are the usual ones: a byte is zero in `x` when `(x - 0x01..) & ~x & 0x80..` has
+# its top bit, and below 32 likewise against `0x20..`. A byte of 128 or more never reads as below
+# 32, so UTF-8 passes. A test can name the wrong byte of the eight, never miss one, and a word it
+# names is scanned a byte at a time.
+fn _agnosai_crew_log_plain8(w): i64 {
+    var ones = 0x0101010101010101;
+    var high = 0x8080808080808080;
+    var not_w = w ^ (0 - 1);
+    if (((w - ones * 32) & not_w & high) != 0) { return 0; }
+    var q = w ^ (ones * 34);
+    if (((q - ones) & (q ^ (0 - 1)) & high) != 0) { return 0; }
+    var b = w ^ (ones * 92);
+    if (((b - ones) & (b ^ (0 - 1)) & high) != 0) { return 0; }
+    return 1;
+}
+
+# Append `s` as a JSON string: RFC 8259's escapes for `"`, `\` and the control bytes, every other
+# byte as it is.
+fn _agnosai_crew_log_string_a(a, sb, s: Str): i64 {
+    str_builder_add_cstr_a(a, sb, "\"");
+    var d = str_data(s);
+    var n = str_len(s);
+    var run = 0;
+    var i = 0;
+    while (i < n) {
+        # Eight bytes at a time while none of them needs an escape: the common case, prose.
+        while (i + 8 <= n && _agnosai_crew_log_plain8(load64(d + i)) == 1) { i = i + 8; }
+        if (i >= n) { break; }
+        var c = load8(d + i) & 255;
+        if (c == 34 || c == 92 || c < 32) {
+            _agnosai_crew_log_bytes_a(a, sb, d + run, i - run);
+            run = i + 1;
+            if (c == 34) { str_builder_add_cstr_a(a, sb, "\\\""); }
+            elif (c == 92) { str_builder_add_cstr_a(a, sb, "\\\\"); }
+            elif (c == 10) { str_builder_add_cstr_a(a, sb, "\\n"); }
+            elif (c == 13) { str_builder_add_cstr_a(a, sb, "\\r"); }
+            elif (c == 9) { str_builder_add_cstr_a(a, sb, "\\t"); }
+            elif (c == 8) { str_builder_add_cstr_a(a, sb, "\\b"); }
+            elif (c == 12) { str_builder_add_cstr_a(a, sb, "\\f"); }
+            else {
+                var hx[8];
+                store8(&hx, 92);
+                store8(&hx + 1, 117);
+                store8(&hx + 2, 48);
+                store8(&hx + 3, 48);
+                var hi = c >> 4;
+                var lo = c & 15;
+                if (hi < 10) { store8(&hx + 4, 48 + hi); } else { store8(&hx + 4, 87 + hi); }
+                if (lo < 10) { store8(&hx + 5, 48 + lo); } else { store8(&hx + 5, 87 + lo); }
+                _agnosai_crew_log_bytes_a(a, sb, &hx, 6);
+            }
+        }
+        i = i + 1;
+    }
+    _agnosai_crew_log_bytes_a(a, sb, d + run, n - run);
+    return str_builder_add_cstr_a(a, sb, "\"");
+}
+
+# Append `v` as compact JSON, as `bayan_json_v_build_a` writes it.
+fn _agnosai_crew_log_value_a(a, sb, v): i64 {
+    if (v == 0 || bayan_json_v_is_null(v) == 1) { return str_builder_add_cstr_a(a, sb, "null"); }
+    if (bayan_json_v_is_str(v) == 1) { return _agnosai_crew_log_string_a(a, sb, bayan_json_v_str(v)); }
+    if (bayan_json_v_is_int(v) == 1) { return str_builder_add_int_a(a, sb, bayan_json_v_int(v)); }
+    if (bayan_json_v_is_bool(v) == 1) {
+        if (bayan_json_v_bool(v) == 1) { return str_builder_add_cstr_a(a, sb, "true"); }
+        return str_builder_add_cstr_a(a, sb, "false");
+    }
+    if (bayan_json_v_is_arr(v) == 1) {
+        str_builder_add_cstr_a(a, sb, "[");
+        for (var i = 0; i < bayan_json_v_arr_len(v); i = i + 1) {
+            if (i > 0) { str_builder_add_cstr_a(a, sb, ","); }
+            _agnosai_crew_log_value_a(a, sb, bayan_json_v_arr_get(v, i));
+        }
+        return str_builder_add_cstr_a(a, sb, "]");
+    }
+    if (bayan_json_v_is_obj(v) == 1) {
+        str_builder_add_cstr_a(a, sb, "{");
+        for (var j = 0; j < bayan_json_v_obj_len(v); j = j + 1) {
+            if (j > 0) { str_builder_add_cstr_a(a, sb, ","); }
+            _agnosai_crew_log_string_a(a, sb, bayan_json_v_obj_key(v, j));
+            str_builder_add_cstr_a(a, sb, ":");
+            _agnosai_crew_log_value_a(a, sb, bayan_json_v_obj_val(v, j));
+        }
+        return str_builder_add_cstr_a(a, sb, "}");
+    }
+    # A float, bayan's printer.
+    return str_builder_add_a(a, sb, bayan_json_v_build_a(a, v));
+}
+
+# Write `v` as one line, synced when `sync` is 1. Returns 0 or the store's error. `v` is in `ra`,
+# which the line is rendered in too.
+fn _agnosai_crew_log_put_a(ra, log, v, sync): i64 {
+    var sb = str_builder_new_a(ra);
+    _agnosai_crew_log_value_a(ra, sb, v);
+    str_builder_add_cstr_a(ra, sb, "\n");
+    var text = str_builder_build_a(ra, sb);
+    return agnosai_state_store_append(load64(log + AGN_CLOG_STORE), load64(log + AGN_CLOG_CREW_ID),
+      str_data(text), str_len(text), sync);
+}
+
+# ── the spec ───────────────────────────────────────────────────────────────
+
+# The spec as a log keeps it: its JSON (`agnosai_crew_to_value_a`), and what that leaves out and a
+# run needs, `tenant`, `tool_limits`, `delegated` and `trace_parent`.
+fn agnosai_crew_log_spec_value_a(a, spec): i64 {
+    var v = agnosai_crew_to_value_a(a, spec);
+    var tenant = agnosai_crew_tenant(spec);
+    if (tenant != 0) { bayan_json_v_obj_set_a(a, v, str_from_a(a, "tenant"), bayan_json_v_str_new_a(a, tenant)); }
+    var tl = agnosai_crew_tool_limits(spec);
+    if (tl != 0) {
+        var lim = bayan_json_v_arr_new_a(a);
+        for (var i = 0; i < 4; i = i + 1) {
+            bayan_json_v_arr_push_a(a, lim, bayan_json_v_int_new_a(a, load64(tl + i * 8)));
+        }
+        bayan_json_v_obj_set_a(a, v, str_from_a(a, "tool_limits"), lim);
+    }
+    if (agnosai_crew_delegated(spec) == 1) {
+        bayan_json_v_obj_set_a(a, v, str_from_a(a, "delegated"), bayan_json_v_bool_new_a(a, 1));
+    }
+    var tp = agnosai_crew_trace_parent(spec);
+    if (tp != 0) { bayan_json_v_obj_set_a(a, v, str_from_a(a, "trace_parent"), bayan_json_v_str_new_a(a, tp)); }
+    return v;
+}
+
+# Global-allocator form of `agnosai_crew_log_spec_value_a`.
+fn agnosai_crew_log_spec_value(spec): i64 {
+    return agnosai_crew_log_spec_value_a(default_alloc(), spec);
+}
+
+# The spec a log keeps, rebuilt, or 0 when it is not one. On the global heap, as a crew from a
+# request is (`agnosai_crew_from_value`).
+fn agnosai_crew_log_spec_from_value(v): i64 {
+    var spec = agnosai_crew_from_value(v);
+    if (spec == 0) { return 0; }
+    var tv = bayan_json_v_obj_get_by_cstr(v, "tenant");
+    if (tv != 0 && bayan_json_v_is_str(tv) == 1) { agnosai_crew_with_tenant(spec, str_clone(bayan_json_v_str(tv))); }
+    var lv = bayan_json_v_obj_get_by_cstr(v, "tool_limits");
+    if (lv != 0 && bayan_json_v_is_arr(lv) == 1 && bayan_json_v_arr_len(lv) == 4) {
+        agnosai_crew_with_tool_limits(spec, bayan_json_v_int(bayan_json_v_arr_get(lv, 0)),
+          bayan_json_v_int(bayan_json_v_arr_get(lv, 1)), bayan_json_v_int(bayan_json_v_arr_get(lv, 2)),
+          bayan_json_v_int(bayan_json_v_arr_get(lv, 3)));
+    }
+    var dv = bayan_json_v_obj_get_by_cstr(v, "delegated");
+    if (dv != 0 && bayan_json_v_is_bool(dv) == 1 && bayan_json_v_bool(dv) == 1) {
+        agnosai_crew_with_delegated(spec, 1);
+    }
+    var pv = bayan_json_v_obj_get_by_cstr(v, "trace_parent");
+    if (pv != 0 && bayan_json_v_is_str(pv) == 1) {
+        agnosai_crew_with_trace_parent(spec, str_clone(bayan_json_v_str(pv)));
+    }
+    return spec;
+}
+
+# Open a log for `spec` over `store` and write its first line, the spec, synced. Returns the log,
+# or 0 with the store's error through `out_err`: a crew whose spec is not on disk has no log, as a
+# resume could not run it. In `a`.
+fn agnosai_crew_log_open_a(a, store, spec, out_err): i64 {
+    store64(out_err, 0);
+    var log = agnosai_crew_log_reopen_a(a, store, agnosai_crew_id(spec), 1);
+    var ra = agnosai_arena_pool_acquire(_agnosai_crew_log_pool());
+    var line = bayan_json_v_obj_new_a(ra);
+    bayan_json_v_obj_set_a(ra, line, str_from_a(ra, "crew"), agnosai_crew_log_spec_value_a(ra, spec));
+    var err = _agnosai_crew_log_put_a(ra, log, line, 1);
+    agnosai_arena_pool_release(_agnosai_crew_log_pool(), ra);
+    if (err != 0) {
+        store64(out_err, err);
+        return 0;
+    }
+    return log;
+}
+
+# ── events ─────────────────────────────────────────────────────────────────
+
+# Whether an event of this type is on disk before its send returns: those a resume would otherwise
+# pay for or decide again.
+fn _agnosai_crew_log_syncs(type: Str): i64 {
+    if (str_eq_cstr(type, "task_completed") == 1) { return 1; }
+    if (str_eq_cstr(type, "approval_requested") == 1) { return 1; }
+    if (str_eq_cstr(type, "approval_decided") == 1) { return 1; }
+    if (str_eq_cstr(type, "crew_completed") == 1) { return 1; }
+    return 0;
+}
+
+# The sender's tap (`agnosai_event_sender_with_tap`): write `event` as a line, with what its crew's
+# log keeps beside it. On the sending thread, outside the bus lock.
+fn _agnosai_crew_log_tap(log, event): i64 {
+    var ra = agnosai_arena_pool_acquire(_agnosai_crew_log_pool());
+    var line = bayan_json_v_obj_new_a(ra);
+    bayan_json_v_obj_set_a(ra, line, str_from_a(ra, "seq"), bayan_json_v_int_new_a(ra, agnosai_crew_event_seq(event)));
+    var type = agnosai_crew_event_event_type(event);
+    bayan_json_v_obj_set_a(ra, line, str_from_a(ra, "event"), bayan_json_v_str_new_a(ra, type));
+    var data = agnosai_crew_event_data(event);
+    if (data == 0) { data = bayan_json_v_null_a(ra); }
+    bayan_json_v_obj_set_a(ra, line, str_from_a(ra, "data"), data);
+    var extra = agnosai_crew_event_extra(event);
+    if (extra != 0) {
+        for (var i = 0; i < bayan_json_v_obj_len(extra); i = i + 1) {
+            bayan_json_v_obj_set_a(ra, line, bayan_json_v_obj_key(extra, i), bayan_json_v_obj_val(extra, i));
+        }
+    }
+    var err = _agnosai_crew_log_put_a(ra, log, line, _agnosai_crew_log_syncs(type));
+    agnosai_arena_pool_release(_agnosai_crew_log_pool(), ra);
+    if (err != 0) { _agnosai_crew_log_failed(log, err); }
+    return 0;
+}
+
+# ── the journal ────────────────────────────────────────────────────────────
+
+# What a crew's tools journal through: this log, then the consumer's journal, or 0 for none.
+enum AgnosaiCrewLogJournalOff {
+    AGN_CLJ_LOG = 0;
+    AGN_CLJ_INNER = 8;
+    AGN_CLJ_SIZE = 16;
+}
+
+# The journal a crew's tools write through when the crew has a log (ADR 036): each call's intent
+# goes in the log, synced, before the call runs and before `inner`, a consumer's journal or 0, is
+# asked; its result goes in the log, and then to `inner`. In `a`.
+fn agnosai_crew_log_journal_a(a, log, inner): i64 {
+    var ctx = alloc_via(a, AGN_CLJ_SIZE);
+    store64(ctx + AGN_CLJ_LOG, log);
+    store64(ctx + AGN_CLJ_INNER, inner);
+    var j = alloc_via(a, AGN_TJ_SIZE);
+    store64(j + AGN_TJ_FP, &_agnosai_crew_log_record);
+    store64(j + AGN_TJ_CTX, ctx);
+    return j;
+}
+
+# Write one journal line for `c`: its intent, synced, or its result. Returns 0 or the store's error.
+fn _agnosai_crew_log_journal_line(log, phase, c): i64 {
+    var ra = agnosai_arena_pool_acquire(_agnosai_crew_log_pool());
+    var line = bayan_json_v_obj_new_a(ra);
+    var word = "result";
+    if (phase == AGNOSAI_TOOL_PHASE_INTENT) { word = "intent"; }
+    bayan_json_v_obj_set_a(ra, line, str_from_a(ra, "journal"), bayan_json_v_str_new_a(ra, str_from_a(ra, word)));
+    bayan_json_v_obj_set_a(ra, line, str_from_a(ra, "run"), bayan_json_v_int_new_a(ra, load64(log + AGN_CLOG_RUN)));
+    bayan_json_v_obj_set_a(ra, line, str_from_a(ra, "task_id"),
+      bayan_json_v_str_new_a(ra, agnosai_task_id(agnosai_tool_call_task(c))));
+    bayan_json_v_obj_set_a(ra, line, str_from_a(ra, "call_id"), bayan_json_v_str_new_a(ra, agnosai_tool_call_id(c)));
+    bayan_json_v_obj_set_a(ra, line, str_from_a(ra, "tool"), bayan_json_v_str_new_a(ra, agnosai_tool_call_name(c)));
+    var sync = 0;
+    if (phase == AGNOSAI_TOOL_PHASE_INTENT) {
+        bayan_json_v_obj_set_a(ra, line, str_from_a(ra, "arguments"),
+          bayan_json_v_str_new_a(ra, agnosai_tool_call_arguments(c)));
+        sync = 1;
+    } else {
+        bayan_json_v_obj_set_a(ra, line, str_from_a(ra, "effect"),
+          bayan_json_v_str_new_a(ra, str_from_a(ra, agnosai_tool_effect_to_wire(agnosai_tool_call_effect(c)))));
+    }
+    var err = _agnosai_crew_log_put_a(ra, log, line, sync);
+    agnosai_arena_pool_release(_agnosai_crew_log_pool(), ra);
+    return err;
+}
+
+# The journal's `record_fp` (ADR 029): the log first, and a call whose intent it cannot write does
+# not run, and the consumer is not asked about it.
+fn _agnosai_crew_log_record(ctx, phase, c): i64 {
+    var log = load64(ctx + AGN_CLJ_LOG);
+    var err = _agnosai_crew_log_journal_line(log, phase, c);
+    if (err != 0) {
+        _agnosai_crew_log_failed(log, err);
+        if (phase == AGNOSAI_TOOL_PHASE_INTENT) { return str_from("the crew's log could not take it"); }
+    }
+    var inner = load64(ctx + AGN_CLJ_INNER);
+    if (inner == 0) { return 0; }
+    return callptr(load64(inner + AGN_TJ_FP), load64(inner + AGN_TJ_CTX), phase, c);
+}
+
+# Write a crew's end where its run never sent one (ADR 036): a crew cancelled while it waited for
+# its turn, or with no thread to run on. `{"state":{...}}`, synced, so it is not resumed. Returns 0
+# or the store's error.
+fn agnosai_crew_log_close(log, state): i64 {
+    var ra = agnosai_arena_pool_acquire(_agnosai_crew_log_pool());
+    var line = bayan_json_v_obj_new_a(ra);
+    bayan_json_v_obj_set_a(ra, line, str_from_a(ra, "state"), agnosai_crew_state_to_value_a(ra, state));
+    var err = _agnosai_crew_log_put_a(ra, log, line, 1);
+    agnosai_arena_pool_release(_agnosai_crew_log_pool(), ra);
+    return err;
+}
+
+# ── reading a log back: a replay ───────────────────────────────────────────
+
+# What a crew's log says, folded: what a resume starts from (ADR 036).
+#
+# A task is **finished** when its log has its `task_completed`, completed or failed, and it is not
+# run again: a resume is not a retry. A task is **answered** when its answer waits on a reviewer
+# (`approval_requested`, and no `task_completed`): the answer is asked about again, not paid for
+# again. A task's **uncertain calls** are those an unfinished task made whose effect may stand: an
+# intent with no result, or a result that committed or cannot say. Re-running it may repeat them,
+# so a reviewer decides first.
+enum AgnosaiCrewReplayOff {
+    # The spec, rebuilt from the log's first line.
+    AGN_RP_SPEC = 0;
+    # The crew's last state when its log has one: a crew that ended, and is not resumed. Else 0.
+    AGN_RP_STATE = 8;
+    # The highest `seq` and run the log holds.
+    AGN_RP_SEQ = 16;
+    AGN_RP_RUN = 24;
+    # By task id: a finished task's result, an answered task's result, and an unfinished task's
+    # calls, a map from `run:call_id` to a call (`AgnosaiReplayCallOff`).
+    AGN_RP_FINISHED = 32;
+    AGN_RP_ANSWERED = 40;
+    AGN_RP_CALLS = 48;
+    AGN_RP_SIZE = 56;
+}
+
+# A call an earlier attempt made.
+enum AgnosaiReplayCallOff {
+    AGN_RC_TOOL = 0;
+    AGN_RC_CALL_ID = 8;
+    AGN_RC_ARGUMENTS = 16;
+    # "unknown" until a result says otherwise.
+    AGN_RC_EFFECT = 24;
+    AGN_RC_SIZE = 32;
+}
+
+# The crew's spec, rebuilt from its log's first line.
+fn agnosai_crew_replay_spec(rp): i64 { return load64(rp + AGN_RP_SPEC); }
+
+# The crew's last state when its log has one, a crew that ended and is not resumed, else 0.
+fn agnosai_crew_replay_state(rp): i64 { return load64(rp + AGN_RP_STATE); }
+
+# The highest `seq` the log holds: a resumed crew's events are numbered on from it.
+fn agnosai_crew_replay_seq(rp): i64 { return load64(rp + AGN_RP_SEQ); }
+
+# The highest run the log holds: 1, and one more for each resume. The next is this plus one.
+fn agnosai_crew_replay_run(rp): i64 { return load64(rp + AGN_RP_RUN); }
+
+# A finished task's result, or 0.
+fn agnosai_crew_replay_finished(rp, task_id: Str): i64 {
+    return map_get(load64(rp + AGN_RP_FINISHED), task_id);
+}
+
+# An answered task's result, waiting on a reviewer when the crew stopped, or 0.
+fn agnosai_crew_replay_answered(rp, task_id: Str): i64 {
+    if (agnosai_crew_replay_finished(rp, task_id) != 0) { return 0; }
+    return map_get(load64(rp + AGN_RP_ANSWERED), task_id);
+}
+
+# The calls an unfinished task made whose effect may stand, as a vec of calls, empty for none.
+fn agnosai_crew_replay_uncertain_a(a, rp, task_id: Str): i64 {
+    var out = vec_new_a(a);
+    if (agnosai_crew_replay_finished(rp, task_id) != 0) { return out; }
+    var calls = map_get(load64(rp + AGN_RP_CALLS), task_id);
+    if (calls == 0) { return out; }
+    var keys = map_keys(calls);
+    for (var i = 0; i < vec_len(keys); i = i + 1) {
+        var c = map_get(calls, vec_get(keys, i));
+        if (str_eq_cstr(load64(c + AGN_RC_EFFECT), "none") == 0) { vec_push_a(a, out, c); }
+    }
+    return out;
+}
+
+# The tool an earlier attempt called.
+fn agnosai_replay_call_tool(c): i64 { return load64(c + AGN_RC_TOOL); }
+
+# The call's id in that attempt's conversation.
+fn agnosai_replay_call_id(c): i64 { return load64(c + AGN_RC_CALL_ID); }
+
+# What the call was asked, as compact JSON, or 0 when its intent was not read.
+fn agnosai_replay_call_arguments(c): i64 { return load64(c + AGN_RC_ARGUMENTS); }
+
+# What its result said it did: `committed` or `unknown`, and `unknown` for an intent with no result.
+fn agnosai_replay_call_effect(c): i64 { return load64(c + AGN_RC_EFFECT); }
+
+fn _agnosai_replay_str(v, key): i64 {
+    var x = bayan_json_v_obj_get_by_cstr(v, key);
+    if (x == 0 || bayan_json_v_is_str(x) == 0) { return 0; }
+    return str_clone(bayan_json_v_str(x));
+}
+
+# Fold one journal line into the replay.
+fn _agnosai_replay_journal(rp, v, word: Str): i64 {
+    var task_id = _agnosai_replay_str(v, "task_id");
+    var call_id = _agnosai_replay_str(v, "call_id");
+    if (task_id == 0 || call_id == 0) { return 0; }
+    var run = 0;
+    var rv = bayan_json_v_obj_get_by_cstr(v, "run");
+    if (rv != 0) { run = bayan_json_v_int(rv); }
+    var by_task = load64(rp + AGN_RP_CALLS);
+    var calls = map_get(by_task, task_id);
+    if (calls == 0) {
+        calls = map_new_str();
+        map_set(by_task, task_id, calls);
+    }
+    var sb = str_builder_new();
+    str_builder_add_int(sb, run);
+    str_builder_add_cstr(sb, ":");
+    str_builder_add(sb, call_id);
+    var key = str_builder_build(sb);
+    var c = map_get(calls, key);
+    if (c == 0) {
+        c = alloc(AGN_RC_SIZE);
+        store64(c + AGN_RC_TOOL, _agnosai_replay_str(v, "tool"));
+        store64(c + AGN_RC_CALL_ID, call_id);
+        store64(c + AGN_RC_ARGUMENTS, 0);
+        store64(c + AGN_RC_EFFECT, str_from("unknown"));
+        map_set(calls, key, c);
+    }
+    if (str_eq_cstr(word, "intent") == 1) { store64(c + AGN_RC_ARGUMENTS, _agnosai_replay_str(v, "arguments")); }
+    else {
+        var effect = _agnosai_replay_str(v, "effect");
+        if (effect != 0) { store64(c + AGN_RC_EFFECT, effect); }
+    }
+    return 0;
+}
+
+# Fold one event line into the replay.
+fn _agnosai_replay_event(rp, v): i64 {
+    var seq = bayan_json_v_int(bayan_json_v_obj_get_by_cstr(v, "seq"));
+    if (seq > load64(rp + AGN_RP_SEQ)) { store64(rp + AGN_RP_SEQ, seq); }
+    var type = _agnosai_replay_str(v, "event");
+    if (type == 0) { return 0; }
+    var rv = bayan_json_v_obj_get_by_cstr(v, "result");
+    if (rv != 0) {
+        var res = agnosai_task_result_from_value(rv);
+        if (res != 0) {
+            if (str_eq_cstr(type, "task_completed") == 1) {
+                map_set(load64(rp + AGN_RP_FINISHED), agnosai_task_result_task_id(res), res);
+            }
+            if (str_eq_cstr(type, "approval_requested") == 1) {
+                map_set(load64(rp + AGN_RP_ANSWERED), agnosai_task_result_task_id(res), res);
+            }
+        }
+    }
+    return 0;
+}
+
+# The crew state a line carries, `crew_completed`'s or a close line's, or 0.
+fn _agnosai_replay_state_of(v): i64 {
+    var sv = bayan_json_v_obj_get_by_cstr(v, "state");
+    if (sv == 0) { return 0; }
+    return agnosai_crew_state_from_value(sv);
+}
+
+# Read crew `crew_id`'s log from `store` and fold it. Returns the replay, or 0 with the store's error
+# through `out_err`, or 0 and no error for a crew with no log, or whose log does not begin with a
+# spec it can rebuild. A line that does not parse is passed over: a crash mid-write leaves one, at
+# the end, and nothing after it was written.
+fn agnosai_crew_log_read(store, crew_id: Str, out_err): i64 {
+    store64(out_err, 0);
+    var bytes = 0;
+    var len = 0;
+    var err = agnosai_state_store_read_log(store, crew_id, &bytes, &len);
+    if (err != 0) {
+        store64(out_err, err);
+        return 0;
+    }
+    if (bytes == AGNOSAI_STATE_ABSENT) { return 0; }
+
+    var rp = alloc(AGN_RP_SIZE);
+    store64(rp + AGN_RP_SPEC, 0);
+    store64(rp + AGN_RP_STATE, 0);
+    store64(rp + AGN_RP_SEQ, 0);
+    store64(rp + AGN_RP_RUN, 1);
+    store64(rp + AGN_RP_FINISHED, map_new_str());
+    store64(rp + AGN_RP_ANSWERED, map_new_str());
+    store64(rp + AGN_RP_CALLS, map_new_str());
+    # ⚠ **Parsed on the global heap**, not in an arena given back after: a result and the spec
+    # rebuilt from a line hold its strings by pointer. A resume reads a log once.
+    var start = 0;
+    for (var i = 0; i < len; i = i + 1) {
+        if (load8(bytes + i) == 10) {
+            var v = bayan_json_v_parse_buf(bytes + start, i - start);
+            start = i + 1;
+            if (v != 0 && bayan_json_v_is_obj(v) == 1) {
+                var cv = bayan_json_v_obj_get_by_cstr(v, "crew");
+                var jv = bayan_json_v_obj_get_by_cstr(v, "journal");
+                if (cv != 0 && load64(rp + AGN_RP_SPEC) == 0) {
+                    store64(rp + AGN_RP_SPEC, agnosai_crew_log_spec_from_value(cv));
+                } elif (jv != 0 && bayan_json_v_is_str(jv) == 1) {
+                    var rn = bayan_json_v_obj_get_by_cstr(v, "run");
+                    if (rn != 0 && bayan_json_v_int(rn) > load64(rp + AGN_RP_RUN)) {
+                        store64(rp + AGN_RP_RUN, bayan_json_v_int(rn));
+                    }
+                    _agnosai_replay_journal(rp, v, bayan_json_v_str(jv));
+                } else {
+                    var en = bayan_json_v_obj_get_by_cstr(v, "run");
+                    if (en != 0 && bayan_json_v_int(en) > load64(rp + AGN_RP_RUN)) {
+                        store64(rp + AGN_RP_RUN, bayan_json_v_int(en));
+                    }
+                    if (bayan_json_v_obj_get_by_cstr(v, "seq") != 0) { _agnosai_replay_event(rp, v); }
+                    var st = _agnosai_replay_state_of(v);
+                    if (st != 0) { store64(rp + AGN_RP_STATE, st); }
+                }
+            }
+        }
+    }
+    if (load64(rp + AGN_RP_SPEC) == 0) { return 0; }
+    return rp;
+}

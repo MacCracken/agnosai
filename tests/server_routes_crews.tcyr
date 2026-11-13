@@ -659,6 +659,32 @@ fn _t_get_crew_found(): i64 {
     return 0;
 }
 
+# `GET /api/v1/crews/{id}/snapshot` (2.5.0, ADR 036): a finished crew's says so, task by task.
+fn _t_crew_snapshot_route(): i64 {
+    var o = agnosai_orchestrator_new(0);
+    var s = _t_state_with(o);
+    var created = agnosai_route_create_crew(s, _t_valid_body());
+    var id = _t_rbody_str(created, "crew_id");
+    var r = agnosai_route_crew_snapshot_a(default_alloc(), s, id);
+    assert(agnosai_route_status(r) == HTTP_OK, "a known crew's snapshot is 200");
+    assert(str_eq(_t_rbody_str(r, "crew_id"), id) == 1, "for that crew");
+    assert(str_eq_cstr(_t_rbody_str(r, "status"), "completed") == 1, "saying it completed");
+    var tasks = bayan_json_v_obj_get_by_cstr(agnosai_route_body(r), "tasks");
+    assert_eq(bayan_json_v_arr_len(tasks), 1, "listing its one task");
+    var t = bayan_json_v_arr_get(tasks, 0);
+    assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(t, "status")), "completed") == 1,
+      "as completed");
+    assert(bayan_json_v_obj_get_by_cstr(agnosai_route_body(r), "seq") != 0, "with its seq");
+    var up = str_from(str_upper_cstr(str_cstr(id)));
+    var upper = agnosai_route_crew_snapshot_a(default_alloc(), s, up);
+    assert(agnosai_route_status(upper) == HTTP_OK, "an uppercase id finds it, as GET does");
+    assert(agnosai_route_status(agnosai_route_crew_snapshot_a(default_alloc(), s, agnosai_uuid_v4_str()))
+      == HTTP_NOT_FOUND, "an unknown crew's is 404");
+    assert(agnosai_route_status(agnosai_route_crew_snapshot_a(default_alloc(), s, str_from("nope")))
+      == AGNOSAI_HTTP_UNPROCESSABLE, "a malformed id is 422");
+    return 0;
+}
+
 # The oracle's `Path<Uuid>` extractor rejects a malformed id BEFORE the handler,
 # so it is 422 rather than 404 — the same extractor-owns-the-status situation
 # agents.rs and approval.rs have.
@@ -1030,6 +1056,7 @@ fn main(): i64 {
     _t_create_crew_dag();
     _t_get_crew_not_found();
     _t_get_crew_found();
+    _t_crew_snapshot_route();
     _t_malformed_id_is_422();
     _t_cancel_crew();
     _t_create_crew_rejections();

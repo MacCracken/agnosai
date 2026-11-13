@@ -249,10 +249,10 @@ fn _t_abandoned(): i64 {
     agnosai_orchestrator_with_events(o, bus);
     var spec = _t_spec("never started");
     var id = agnosai_crew_id(spec);
-    _agnosai_orch_register(o, spec);
+    var runner = _agnosai_orch_register(o, spec);
     assert(agnosai_orchestrator_forget_crew(o, id) != 0, "a registered crew counts as held");
     var queued = _t_queued(o);
-    _agnosai_orch_abandon(o, id);
+    _agnosai_orch_abandon(o, runner, id);
     var left = agnosai_orchestrator_crew(o, id);
     assert_eq(agnosai_crew_state_status(left), AGNOSAI_CREW_FAILED,
       "an abandoned crew ends FAILED, not PENDING for good (ADR 032)");
@@ -266,10 +266,10 @@ fn _t_abandoned(): i64 {
     # Cancelled before the thread failed: the cancel stands, and left the queueing to a finish
     # there will not be, so the abandon does it.
     var c = _t_spec("cancelled, then never started");
-    _agnosai_orch_register(o, c);
+    var cr = _agnosai_orch_register(o, c);
     assert_eq(agnosai_orchestrator_cancel_crew(o, agnosai_crew_id(c)), 0, "a held crew is cancelled");
     var before = _t_queued(o);
-    _agnosai_orch_abandon(o, agnosai_crew_id(c));
+    _agnosai_orch_abandon(o, cr, agnosai_crew_id(c));
     assert_eq(agnosai_crew_state_status(agnosai_orchestrator_crew(o, agnosai_crew_id(c))),
       AGNOSAI_CREW_CANCELLED, "and stays CANCELLED");
     assert_eq(_t_queued(o), before + 1, "and is queued, so it can be evicted");

@@ -1,0 +1,628 @@
+# =========================================================================
+# orch_crew_log.tcyr — a crew's durable log (2.5.0, ADR 036).
+#
+# What a run writes, line by line: the spec first, every event numbered with no gap whether or
+# not anyone is subscribed, a finished task's result and the crew's state beside their events,
+# and each tool call's intent before the call runs, ahead of a consumer's journal. And what a
+# disk that refuses does: a spec that will not go down leaves no log, an intent that will not go
+# down refuses its call, and an event that will not go down lets the crew go on.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/strcase.cyr"
+include "src/telemetry/mod.cyr"
+include "src/core/error.cyr"
+include "src/core/json.cyr"
+include "src/core/message.cyr"
+include "src/core/resource.cyr"
+include "src/core/task.cyr"
+include "src/core/agent.cyr"
+include "src/core/crew.cyr"
+include "src/orchestrator/scheduler.cyr"
+include "src/orchestrator/audit.cyr"
+include "src/llm/retry.cyr"
+include "src/llm/hoosh.cyr"
+include "src/llm/router.cyr"
+include "src/orchestrator/scoring.cyr"
+include "src/orchestrator/output_validation.cyr"
+include "src/server/prompt_guard.cyr"
+include "src/server/output_filter.cyr"
+include "src/chan_lossy.cyr"
+include "src/server/sse.cyr"
+include "src/server/prometheus.cyr"
+include "src/arena_pool.cyr"
+include "src/sandbox/policy.cyr"
+include "src/sandbox/kavach_bridge.cyr"
+include "src/server/ssrf.cyr"
+include "src/tools/native.cyr"
+include "src/tools/registry.cyr"
+include "src/tool_call.cyr"
+include "src/tool_loop.cyr"
+include "src/model_catalog.cyr"
+include "src/orchestrator/approval.cyr"
+include "src/orchestrator/crew_runner.cyr"
+include "tests/test_helpers.cyr"
+include "tests/test_tmp.cyr"
+
+var _T_DIR = _tt_tmp_path("crew-log", "");
+
+fn _t_store(): i64 {
+    return agnosai_state_store_new(str_from(_T_DIR));
+}
+
+# ── a stub gateway ─────────────────────────────────────────────────────────
+
+fn _t_body(text, calls): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"model\":\"m\",\"choices\":[{\"message\":{\"content\":\"");
+    str_builder_add_cstr(sb, text);
+    str_builder_add_cstr(sb, "\"");
+    if (calls != 0) {
+        str_builder_add_cstr(sb, ",\"tool_calls\":");
+        str_builder_add_cstr(sb, calls);
+    }
+    str_builder_add_cstr(sb, "}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,");
+    str_builder_add_cstr(sb, "\"cost_micro_usd\":100,\"provider\":\"p\"}}");
+    return str_builder_build(sb);
+}
+
+# Answers "done", or, for a task whose tool it has not called, calls `note` once.
+fn _t_chat(client, request, out_response, parent_sc): i64 {
+    var a = agnosai_inference_request_alloc(request);
+    var msgs = agnosai_inference_request_messages(request);
+    var last = vec_get(msgs, vec_len(msgs) - 1);
+    var tools = agnosai_inference_request_tools(request);
+    if (agnosai_chat_message_role(last) == AGNOSAI_ROLE_TOOL || tools == 0 || vec_len(tools) == 0) {
+        store64(out_response, agnosai_hoosh_response_from_body_a(a, _t_body("done", 0)));
+        return 0;
+    }
+    store64(out_response, agnosai_hoosh_response_from_body_a(a, _t_body("",
+          "[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"note\",\"arguments\":\"{\\\"x\\\":1}\"}}]")));
+    return 0;
+}
+
+fn _t_client(): i64 {
+    return agnosai_hoosh_client_with_chat(agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"),
+        str_from("")), &_t_chat);
+}
+
+# ── a tool that reads the log as it runs ───────────────────────────────────
+
+# The store and crew the `note` tool looks in, and whether each run found its own intent there.
+var _t_tool_store = 0;
+var _t_tool_crew = 0;
+var _t_tool_runs = 0;
+var _t_tool_saw_intent = 0;
+
+fn _t_log_text(store, crew_id: Str): i64 {
+    var bytes = 0;
+    var len = 0;
+    if (agnosai_state_store_read_log(store, crew_id, &bytes, &len) != 0) { return 0; }
+    if (bytes == AGNOSAI_STATE_ABSENT) { return 0; }
+    return str_new(bytes, len);
+}
+
+fn _t_note_exec(ctx, input): i64 {
+    atomic_fetch_add(&_t_tool_runs, 1);
+    var text = _t_log_text(_t_tool_store, _t_tool_crew);
+    if (text != 0 && str_contains(text, str_from("\"journal\":\"intent\"")) == 1
+      && str_contains(text, str_from("\"tool\":\"note\"")) == 1) {
+        atomic_fetch_add(&_t_tool_saw_intent, 1);
+    }
+    return agnosai_tool_output_ok(bayan_json_v_str_new(str_from("noted")));
+}
+
+fn _t_schema(a, ctx): i64 {
+    var s = agnosai_tool_schema_new_a(a, str_from_a(a, "ignored"), str_from_a(a, "a test tool"));
+    agnosai_tool_schema_param_a(a, s, str_from_a(a, "x"), str_from_a(a, "a number"), str_from_a(a, "number"), 0);
+    return s;
+}
+
+fn _t_registry(): i64 {
+    var r = agnosai_tool_registry_new();
+    agnosai_tool_registry_register(r, agnosai_tool_new(str_from("note"), str_from("writes a note"), &_t_schema,
+        &_t_note_exec, 0));
+    return r;
+}
+
+# ── a crew ─────────────────────────────────────────────────────────────────
+
+fn _t_spec(name, n, process, tools): i64 {
+    var spec = agnosai_crew_new(str_from(name));
+    var agents = vec_new();
+    var ag = agnosai_agent_new(str_from("worker"), str_from("tester"), str_from("test things"));
+    if (tools == 1) {
+        var held = vec_new();
+        vec_push(held, str_from("note"));
+        agnosai_agent_with_tools(ag, held);
+    }
+    vec_push(agents, ag);
+    agnosai_crew_with_agents(spec, agents);
+    var tasks = vec_new();
+    for (var i = 0; i < n; i = i + 1) {
+        vec_push(tasks, agnosai_task_new(str_cat(str_from("task "), str_from_int(i))));
+    }
+    agnosai_crew_with_tasks(spec, tasks);
+    agnosai_crew_with_process(spec, process);
+    return spec;
+}
+
+# Open a log for `spec` over `store` and a runner that keeps it.
+fn _t_runner(spec, store): i64 {
+    var err: i64[1];
+    var log = agnosai_crew_log_open_a(default_alloc(), store, spec, &err);
+    assert_eq(load64(&err), 0, "the spec goes down");
+    var r = agnosai_crew_runner_new(spec);
+    agnosai_crew_runner_with_llm(r, _t_client());
+    agnosai_crew_runner_with_log(r, log);
+    return r;
+}
+
+fn _t_run(r): i64 {
+    var err: i64[1];
+    store64(&err, 0);
+    return agnosai_crew_runner_run(r, &err);
+}
+
+# ── reading a log back ─────────────────────────────────────────────────────
+
+# Every line of a crew's log, parsed, in the order it was written.
+fn _t_lines(store, crew_id: Str): i64 {
+    var out = vec_new();
+    var text = _t_log_text(store, crew_id);
+    if (text == 0) { return out; }
+    var d = str_data(text);
+    var n = str_len(text);
+    var start = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        if (load8(d + i) == 10) {
+            vec_push(out, bayan_json_v_parse_buf(d + start, i - start));
+            start = i + 1;
+        }
+    }
+    return out;
+}
+
+fn _t_str(v, key): i64 {
+    var x = bayan_json_v_obj_get_by_cstr(v, key);
+    if (x == 0 || bayan_json_v_is_str(x) == 0) { return str_from(""); }
+    return bayan_json_v_str(x);
+}
+
+# The event lines, in `seq` order.
+fn _t_events(lines): i64 {
+    var evs = vec_new();
+    for (var i = 0; i < vec_len(lines); i = i + 1) {
+        var l = vec_get(lines, i);
+        if (bayan_json_v_obj_get_by_cstr(l, "seq") != 0) { vec_push(evs, l); }
+    }
+    # Insertion sort by seq: a few dozen lines.
+    for (var j = 1; j < vec_len(evs); j = j + 1) {
+        var k = j;
+        while (k > 0 && bayan_json_v_int(bayan_json_v_obj_get_by_cstr(vec_get(evs, k - 1), "seq"))
+          > bayan_json_v_int(bayan_json_v_obj_get_by_cstr(vec_get(evs, k), "seq"))) {
+            var t = vec_get(evs, k);
+            vec_set(evs, k, vec_get(evs, k - 1));
+            vec_set(evs, k - 1, t);
+            k = k - 1;
+        }
+    }
+    return evs;
+}
+
+fn _t_count(evs, type): i64 {
+    var n = 0;
+    for (var i = 0; i < vec_len(evs); i = i + 1) {
+        if (str_eq_cstr(_t_str(vec_get(evs, i), "event"), type) == 1) { n = n + 1; }
+    }
+    return n;
+}
+
+# Whether the seqs are 1, 2, 3 … with no gap.
+fn _t_gapless(evs): i64 {
+    for (var i = 0; i < vec_len(evs); i = i + 1) {
+        if (bayan_json_v_int(bayan_json_v_obj_get_by_cstr(vec_get(evs, i), "seq")) != i + 1) { return 0; }
+    }
+    return 1;
+}
+
+# ── what a run writes ──────────────────────────────────────────────────────
+
+fn test_a_run_writes_its_log(): i64 {
+    var store = _t_store();
+    var spec = _t_spec("logged", 3, agnosai_process_sequential(), 0);
+    var r = _t_runner(spec, store);
+    var state = _t_run(r);
+    assert_eq(agnosai_crew_state_status(state), AGNOSAI_CREW_COMPLETED, "the crew completes");
+
+    var lines = _t_lines(store, agnosai_crew_id(spec));
+    assert(vec_len(lines) > 0, "it has a log");
+    var first = vec_get(lines, 0);
+    var sv = bayan_json_v_obj_get_by_cstr(first, "crew");
+    assert(sv != 0, "whose first line is the spec");
+    var back = agnosai_crew_log_spec_from_value(sv);
+    assert(back != 0, "which rebuilds");
+    assert(str_eq(agnosai_crew_id(back), agnosai_crew_id(spec)) == 1, "as the same crew");
+    assert_eq(vec_len(agnosai_crew_tasks(back)), 3, "with its three tasks");
+    assert(str_eq(agnosai_task_id(vec_get(agnosai_crew_tasks(back), 1)),
+        agnosai_task_id(vec_get(agnosai_crew_tasks(spec), 1))) == 1, "each by its own id");
+
+    var evs = _t_events(lines);
+    assert(_t_gapless(evs) == 1, "every event is a line, numbered from 1 with no gap, though nobody subscribed");
+    assert_eq(_t_count(evs, "crew_started"), 1, "crew_started");
+    assert_eq(_t_count(evs, "task_started"), 3, "a task_started each");
+    assert_eq(_t_count(evs, "task_completed"), 3, "a task_completed each");
+    assert_eq(_t_count(evs, "crew_completed"), 1, "and crew_completed");
+    assert(str_eq_cstr(_t_str(vec_get(evs, vec_len(evs) - 1), "event"), "crew_completed") == 1, "last");
+
+    var tc = 0;
+    for (var i = 0; i < vec_len(evs); i = i + 1) {
+        if (str_eq_cstr(_t_str(vec_get(evs, i), "event"), "task_completed") == 1) { tc = vec_get(evs, i); }
+    }
+    var res = agnosai_task_result_from_value(bayan_json_v_obj_get_by_cstr(tc, "result"));
+    assert(res != 0, "a task_completed line carries the whole result");
+    assert(str_eq_cstr(agnosai_task_result_output(res), "done") == 1, "its answer");
+    var md = agnosai_task_result_metadata(res);
+    assert(map_get(md, str_from("cost_micro_usd")) != 0, "and its metadata, what it spent with it");
+
+    var end = vec_get(evs, vec_len(evs) - 1);
+    var st = agnosai_crew_state_from_value(bayan_json_v_obj_get_by_cstr(end, "state"));
+    assert(st != 0, "crew_completed carries the crew's state");
+    assert_eq(agnosai_crew_state_status(st), AGNOSAI_CREW_COMPLETED, "completed");
+    assert_eq(vec_len(agnosai_crew_state_results(st)), 3, "with its three results");
+
+    # The snapshot agrees: the log is the crew's only receiver, and numbers what it sent.
+    var snap = agnosai_crew_runner_snapshot_a(default_alloc(), r);
+    assert_eq(bayan_json_v_int(bayan_json_v_obj_get_by_cstr(snap, "seq")), vec_len(evs),
+      "a crew with a log and no bus gets a sender of its own, and its snapshot reaches the last line");
+    assert(str_eq_cstr(_t_str(snap, "status"), "completed") == 1, "saying it completed");
+    agnosai_state_store_remove(store, agnosai_crew_id(spec));
+    return 0;
+}
+
+fn test_parallel_log(): i64 {
+    var store = _t_store();
+    var spec = _t_spec("logged-par", 8, agnosai_process_parallel(4), 0);
+    var r = _t_runner(spec, store);
+    _t_run(r);
+    var evs = _t_events(_t_lines(store, agnosai_crew_id(spec)));
+    assert(_t_gapless(evs) == 1, "a parallel crew's lines, put back by seq, have no gap");
+    assert_eq(_t_count(evs, "task_completed"), 8, "a task_completed for each of its tasks");
+    agnosai_state_store_remove(store, agnosai_crew_id(spec));
+    return 0;
+}
+
+# A tap comes off the sender with crew_completed, so a sender that outlives the run writes no
+# more into its log.
+fn test_tap_comes_off(): i64 {
+    var store = _t_store();
+    var spec = _t_spec("tap-off", 1, agnosai_process_sequential(), 0);
+    var tx = agnosai_event_bus_sender(agnosai_event_bus_new(), agnosai_crew_id(spec));
+    var r = _t_runner(spec, store);
+    agnosai_crew_runner_with_events(r, tx);
+    assert_eq(agnosai_event_sender_wanted(tx), 1, "a sender with a log wants its events, though nobody subscribed");
+    _t_run(r);
+    assert_eq(agnosai_event_sender_wanted(tx), 0, "and not once the crew has ended");
+    var before = vec_len(_t_lines(store, agnosai_crew_id(spec)));
+    agnosai_event_sender_send(tx, agnosai_crew_event_new(agnosai_crew_id(spec), str_from("late"), 0));
+    assert_eq(vec_len(_t_lines(store, agnosai_crew_id(spec))), before, "so a late send writes nothing");
+    agnosai_state_store_remove(store, agnosai_crew_id(spec));
+    return 0;
+}
+
+# ── the journal: an intent before its call ─────────────────────────────────
+
+var _t_inner_calls = 0;
+var _t_inner_saw_intent_first = 0;
+
+fn _t_inner_fp(ctx, phase, c): i64 {
+    atomic_fetch_add(&_t_inner_calls, 1);
+    if (phase == AGNOSAI_TOOL_PHASE_INTENT) {
+        var text = _t_log_text(_t_tool_store, _t_tool_crew);
+        if (text != 0 && str_contains(text, str_from("\"journal\":\"intent\"")) == 1) {
+            atomic_fetch_add(&_t_inner_saw_intent_first, 1);
+        }
+    }
+    return 0;
+}
+
+fn test_journal(): i64 {
+    var store = _t_store();
+    var spec = _t_spec("journaled", 2, agnosai_process_sequential(), 1);
+    _t_tool_store = store;
+    _t_tool_crew = agnosai_crew_id(spec);
+    _t_tool_runs = 0;
+    _t_tool_saw_intent = 0;
+    var r = _t_runner(spec, store);
+    agnosai_crew_runner_with_tools(r, _t_registry(), agnosai_tool_journal_new(&_t_inner_fp, 0));
+    var state = _t_run(r);
+    assert_eq(agnosai_crew_state_status(state), AGNOSAI_CREW_COMPLETED, "a crew with tools completes");
+    assert_eq(_t_tool_runs, 2, "its tool ran once a task");
+    assert_eq(_t_tool_saw_intent, 2, "and each time, its intent was already in the log");
+    assert_eq(_t_inner_calls, 4, "the consumer's journal is still asked, intent and result");
+    assert_eq(_t_inner_saw_intent_first, 2, "after the log had the intent");
+
+    var lines = _t_lines(store, agnosai_crew_id(spec));
+    var intents = 0;
+    var results = 0;
+    for (var i = 0; i < vec_len(lines); i = i + 1) {
+        var l = vec_get(lines, i);
+        var j = _t_str(l, "journal");
+        if (str_eq_cstr(j, "intent") == 1) {
+            intents = intents + 1;
+            assert(str_eq_cstr(_t_str(l, "tool"), "note") == 1, "an intent names its tool");
+            assert(str_eq_cstr(_t_str(l, "call_id"), "c1") == 1, "and its call");
+            assert(str_contains(_t_str(l, "arguments"), str_from("\"x\":1")) == 1, "and what it was asked");
+            assert(str_len(_t_str(l, "task_id")) == 36, "and its task");
+        }
+        if (str_eq_cstr(j, "result") == 1) {
+            results = results + 1;
+            assert(str_eq_cstr(_t_str(l, "effect"), "committed") == 1,
+              "a result says the call's effect: committed, for a tool that succeeded");
+        }
+    }
+    assert_eq(intents, 2, "an intent a call");
+    assert_eq(results, 2, "and a result");
+    agnosai_state_store_remove(store, agnosai_crew_id(spec));
+    return 0;
+}
+
+# ── a disk that refuses ────────────────────────────────────────────────────
+
+# A backend over the file store that refuses what `_t_refuse` names: a spec, an intent, or events.
+var _t_refuse = 0;
+var _t_real = 0;
+
+fn _t_r_save(ctx, id, buf, len): i64 { return agnosai_state_store_save(_t_real, id, buf, len); }
+fn _t_r_load(ctx, id, ob, ol): i64 { return agnosai_state_store_load(_t_real, id, ob, ol); }
+fn _t_r_read(ctx, id, ob, ol): i64 { return agnosai_state_store_read_log(_t_real, id, ob, ol); }
+fn _t_r_list(ctx, out): i64 { return agnosai_state_store_list(_t_real, out); }
+fn _t_r_remove(ctx, id): i64 { return agnosai_state_store_remove(_t_real, id); }
+fn _t_r_append(ctx, id, buf, len, sync): i64 {
+    var line = str_new(buf, len);
+    if (_t_refuse != 0 && str_contains(line, str_from(_t_refuse)) == 1) {
+        return agnosai_error_io(str_from("no space left on device"));
+    }
+    return agnosai_state_store_append(_t_real, id, buf, len, sync);
+}
+
+fn _t_refusing(): i64 {
+    _t_real = _t_store();
+    return agnosai_state_store_backend(0, &_t_r_save, &_t_r_load, &_t_r_append, &_t_r_read, &_t_r_list,
+      &_t_r_remove);
+}
+
+fn test_refusals(): i64 {
+    var store = _t_refusing();
+
+    _t_refuse = "\"crew\":";
+    var spec = _t_spec("no-spec", 1, agnosai_process_sequential(), 0);
+    var err: i64[1];
+    var log = agnosai_crew_log_open_a(default_alloc(), store, spec, &err);
+    assert_eq(log, 0, "a spec that will not go down leaves no log");
+    assert(load64(&err) != 0, "and says why");
+
+    _t_refuse = "\"journal\":\"intent\"";
+    var tspec = _t_spec("no-intent", 1, agnosai_process_sequential(), 1);
+    _t_tool_store = _t_real;
+    _t_tool_crew = agnosai_crew_id(tspec);
+    _t_tool_runs = 0;
+    var r = _t_runner(tspec, store);
+    agnosai_crew_runner_with_tools(r, _t_registry(), 0);
+    var state = _t_run(r);
+    assert_eq(_t_tool_runs, 0, "a call whose intent will not go down does not run");
+    var res = vec_get(agnosai_crew_state_results(state), 0);
+    var records = map_get(agnosai_task_result_metadata(res), str_from("tool_calls"));
+    assert(records != 0 && bayan_json_v_arr_len(records) == 1, "and the task's record keeps it");
+    assert(str_contains(bayan_json_v_build(records), str_from("not journaled")) == 1, "as refused, not journaled");
+
+    _t_refuse = "\"event\":\"task_started\"";
+    var espec = _t_spec("no-events", 2, agnosai_process_sequential(), 0);
+    var er = _t_runner(espec, store);
+    var estate = _t_run(er);
+    assert_eq(agnosai_crew_state_status(estate), AGNOSAI_CREW_COMPLETED,
+      "an event that will not go down lets the crew go on");
+    var evs = _t_events(_t_lines(_t_real, agnosai_crew_id(espec)));
+    assert_eq(_t_count(evs, "task_started"), 0, "its log is short of it");
+    assert_eq(_t_count(evs, "task_completed"), 2, "and has the rest");
+    _t_refuse = 0;
+    agnosai_state_store_remove(_t_real, agnosai_crew_id(tspec));
+    agnosai_state_store_remove(_t_real, agnosai_crew_id(espec));
+    return 0;
+}
+
+# ── the spec a log keeps ───────────────────────────────────────────────────
+
+fn test_spec_round_trip(): i64 {
+    var spec = _t_spec("full", 2, agnosai_process_dag(), 1);
+    agnosai_crew_with_tenant(spec, str_from("tenant-a"));
+    agnosai_crew_with_tool_limits(spec, 3, 4, 5000, 6000);
+    agnosai_crew_with_delegated(spec, 1);
+    agnosai_crew_with_trace_parent(spec, str_from("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"));
+    var t1 = vec_get(agnosai_crew_tasks(spec), 1);
+    agnosai_task_with_dependency(t1, agnosai_task_id(vec_get(agnosai_crew_tasks(spec), 0)));
+    agnosai_task_with_risk(t1, AGNOSAI_RISK_HIGH);
+    var text = bayan_json_v_build(agnosai_crew_log_spec_value(spec));
+    var back = agnosai_crew_log_spec_from_value(bayan_json_v_parse_buf(str_data(text), str_len(text)));
+    assert(back != 0, "a spec the log kept rebuilds");
+    assert(str_eq_cstr(agnosai_crew_tenant(back), "tenant-a") == 1, "with its tenant");
+    var tl = agnosai_crew_tool_limits(back);
+    assert(tl != 0 && load64(tl) == 3 && load64(tl + 8) == 4 && load64(tl + 16) == 5000 && load64(tl + 24) == 6000,
+      "its tool limits");
+    assert_eq(agnosai_crew_delegated(back), 1, "that a tool started it");
+    assert(str_eq(agnosai_crew_trace_parent(back), agnosai_crew_trace_parent(spec)) == 1, "its trace parent");
+    assert_eq(agnosai_process_kind(agnosai_crew_process(back)), AGNOSAI_PROCESS_DAG, "its process");
+    var bt1 = vec_get(agnosai_crew_tasks(back), 1);
+    assert_eq(vec_len(agnosai_task_dependencies(bt1)), 1, "a task's dependencies");
+    assert_eq(agnosai_task_risk(bt1), AGNOSAI_RISK_HIGH, "and risk");
+    var ag = vec_get(agnosai_crew_agents(back), 0);
+    assert_eq(vec_len(agnosai_agent_tools(ag)), 1, "and an agent's tools");
+    var plain = _t_spec("plain", 1, agnosai_process_sequential(), 0);
+    var pt = bayan_json_v_build(agnosai_crew_log_spec_value(plain));
+    var pb = agnosai_crew_log_spec_from_value(bayan_json_v_parse_buf(str_data(pt), str_len(pt)));
+    assert_eq(agnosai_crew_tenant(pb), 0, "a spec with no tenant has none back");
+    assert_eq(agnosai_crew_tool_limits(pb), 0, "nor tool limits");
+    assert_eq(agnosai_crew_delegated(pb), 0, "nor came from a tool");
+    return 0;
+}
+
+# A managed crew's results are marked before they go out, so its log keeps them whole.
+fn test_managed_marks(): i64 {
+    var store = _t_store();
+    var spec = _t_spec("managed", 2, agnosai_process_hierarchical(str_from("boss")), 0);
+    var agents = agnosai_crew_agents(spec);
+    vec_push(agents, agnosai_agent_new(str_from("boss"), str_from("manager"), str_from("lead")));
+    var r = _t_runner(spec, store);
+    var state = _t_run(r);
+    assert_eq(agnosai_crew_state_status(state), AGNOSAI_CREW_COMPLETED, "a managed crew with a log completes");
+    var evs = _t_events(_t_lines(store, agnosai_crew_id(spec)));
+    var assigned = 0;
+    var manager = 0;
+    for (var i = 0; i < vec_len(evs); i = i + 1) {
+        var l = vec_get(evs, i);
+        if (str_eq_cstr(_t_str(l, "event"), "task_completed") == 1) {
+            var res = bayan_json_v_obj_get_by_cstr(l, "result");
+            var md = bayan_json_v_obj_get_by_cstr(res, "metadata");
+            if (bayan_json_v_obj_get_by_cstr(md, "assigned_by") != 0) { assigned = assigned + 1; }
+            if (bayan_json_v_obj_get_by_cstr(md, "role") != 0) { manager = manager + 1; }
+        }
+    }
+    assert_eq(assigned, 2, "each worker's result in the log says who assigned it");
+    assert_eq(manager, 1, "and the manager's says it is the manager's");
+    agnosai_state_store_remove(store, agnosai_crew_id(spec));
+    return 0;
+}
+
+# The log's own writer writes what bayan's does, byte for byte, for every kind of value and every
+# byte a string can hold.
+fn test_writer_matches_bayan(): i64 {
+    var all = alloc(256);
+    for (var i = 0; i < 255; i = i + 1) { store8(all + i, i + 1); }
+    var text = str_new(all, 255);
+    var v = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(v, str_from("every byte"), bayan_json_v_str_new(text));
+    bayan_json_v_obj_set(v, str_from("quote \" and \\ in a key"), bayan_json_v_str_new(str_from("")));
+    var arr = bayan_json_v_arr_new();
+    bayan_json_v_arr_push(arr, bayan_json_v_int_new(0 - 42));
+    bayan_json_v_arr_push(arr, bayan_json_v_int_new(9223372036854775807));
+    bayan_json_v_arr_push(arr, bayan_json_v_bool_new(1));
+    bayan_json_v_arr_push(arr, bayan_json_v_bool_new(0));
+    bayan_json_v_arr_push(arr, bayan_json_v_null());
+    bayan_json_v_arr_push(arr, bayan_json_v_float_new(f64_div(f64_from(1), f64_from(3))));
+    bayan_json_v_arr_push(arr, bayan_json_v_arr_new());
+    bayan_json_v_arr_push(arr, bayan_json_v_obj_new());
+    bayan_json_v_obj_set(v, str_from("nested"), arr);
+    var sb = str_builder_new();
+    _agnosai_crew_log_value_a(default_alloc(), sb, v);
+    var ours = str_builder_build(sb);
+    assert(str_eq(ours, bayan_json_v_build(v)) == 1, "the log's writer writes what bayan's does, byte for byte");
+    var back = bayan_json_v_parse_buf(str_data(ours), str_len(ours));
+    assert(back != 0, "and it parses back");
+    assert(str_eq(bayan_json_v_str(bayan_json_v_obj_get_by_cstr(back, "every byte")), text) == 1,
+      "to every byte it was given");
+
+    # The writer reads eight bytes at a time: each byte that needs an escape, at each place in a
+    # word, among plain bytes and UTF-8.
+    var specials = "\"\\\n\x01\x1f\x7f\xc3";
+    var wrong = 0;
+    for (var k = 0; k < 7; k = k + 1) {
+        for (var p = 0; p < 24; p = p + 1) {
+            var buf = alloc(24);
+            for (var q = 0; q < 24; q = q + 1) { store8(buf + q, 97 + q % 3); }
+            store8(buf + 20, 0xc3);
+            store8(buf + 21, 0xa9);
+            store8(buf + p, load8(specials + k));
+            var one = bayan_json_v_str_new(str_new(buf, 24));
+            var sb2 = str_builder_new();
+            _agnosai_crew_log_value_a(default_alloc(), sb2, one);
+            if (str_eq(str_builder_build(sb2), bayan_json_v_build(one)) == 0) { wrong = wrong + 1; }
+        }
+    }
+    assert_eq(wrong, 0, "a byte that needs an escape is escaped wherever it falls in a word");
+    return 0;
+}
+
+# The log's own verbs and the sender's, each named.
+var _t_taps = 0;
+var _t_tap_seq = 0;
+
+fn _t_tap(ctx, event): i64 {
+    _t_taps = _t_taps + ctx;
+    _t_tap_seq = agnosai_crew_event_seq(event);
+    return 0;
+}
+
+fn test_names(): i64 {
+    var store = _t_store();
+    var spec = _t_spec("named", 1, agnosai_process_sequential(), 0);
+    var err: i64[1];
+    var log = agnosai_crew_log_open_a(default_alloc(), store, spec, &err);
+    assert_eq(agnosai_crew_log_store(log), store, "a log knows its store");
+    assert(str_eq(agnosai_crew_log_crew_id(log), agnosai_crew_id(spec)) == 1, "and its crew");
+    assert_eq(agnosai_crew_log_run(log), 1, "and that it is the crew's first run");
+    assert(str_eq(bayan_json_v_build(agnosai_crew_log_spec_value_a(default_alloc(), spec)),
+        bayan_json_v_build(agnosai_crew_log_spec_value(spec))) == 1, "the spec's log form, in an allocator");
+    var j = agnosai_crew_log_journal_a(default_alloc(), log, 0);
+    assert_eq(load64(j + AGN_TJ_FP), &_agnosai_crew_log_record, "the crew's journal writes through the log");
+    var st = agnosai_crew_state_new(agnosai_crew_id(spec), AGNOSAI_CREW_CANCELLED);
+    assert_eq(agnosai_crew_log_close(log, st), 0, "a crew that never ran closes its log with its state");
+    var rp = agnosai_crew_log_read(store, agnosai_crew_id(spec), &err);
+    assert(rp != 0 && agnosai_crew_replay_state(rp) != 0, "which reads back as a crew that ended");
+    assert_eq(agnosai_crew_state_status(agnosai_crew_replay_state(rp)), AGNOSAI_CREW_CANCELLED, "as it ended");
+    agnosai_state_store_remove(store, agnosai_crew_id(spec));
+
+    var ev = agnosai_crew_event_new(str_from("c"), str_from("t"), 0);
+    assert_eq(agnosai_crew_event_extra(ev), 0, "an event carries nothing for the log by default");
+    var x = bayan_json_v_obj_new();
+    agnosai_crew_event_with_extra(ev, x);
+    assert_eq(agnosai_crew_event_extra(ev), x, "and what it is given");
+
+    var tx = agnosai_event_sender_new_a(default_alloc());
+    assert_eq(agnosai_event_sender_wanted(tx), 0, "a sender on no bus with no tap wants nothing");
+    agnosai_event_sender_with_tap(tx, &_t_tap, 5);
+    assert_eq(agnosai_event_sender_wanted(tx), 1, "and with a tap wants every event");
+    agnosai_event_sender_with_seq(tx, 41);
+    var word: i64[1];
+    store64(&word, 0);
+    agnosai_event_sender_send_set(tx, agnosai_crew_event_new(str_from("c"), str_from("t"), 0), &word, 9);
+    assert_eq(load64(&word), 9, "a send stores its word");
+    assert_eq(_t_taps, 5, "and hands the event to the tap, with its context");
+    assert_eq(_t_tap_seq, 42, "numbered on from where the sender was set to");
+    agnosai_event_sender_send_set(tx, 0, &word, 3);
+    assert_eq(_t_taps, 5, "a send of no event reaches no tap");
+    assert_eq(load64(&word), 3, "and still stores its word");
+
+    var r = agnosai_crew_runner_new(spec);
+    assert_eq(agnosai_crew_runner_log(r), 0, "a runner has no log until it is given one");
+    assert_eq(agnosai_crew_runner_phase(r), AGNOSAI_CREW_PENDING, "and is pending until it runs");
+    agnosai_crew_runner_with_log(r, log);
+    assert_eq(agnosai_crew_runner_log(r), log, "and keeps the one it is given");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+    agnosai_model_set_tier_override(AGNOSAI_TIER_FAST, str_from("stub-model"));
+    agnosai_model_set_tier_override(AGNOSAI_TIER_CAPABLE, str_from("stub-model"));
+    agnosai_model_set_tier_override(AGNOSAI_TIER_PREMIUM, str_from("stub-model"));
+    test_a_run_writes_its_log();
+    test_parallel_log();
+    test_tap_comes_off();
+    test_journal();
+    test_refusals();
+    test_spec_round_trip();
+    test_writer_matches_bayan();
+    test_managed_marks();
+    test_names();
+    _tt_cleanup();
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+sys_exit_group(f);

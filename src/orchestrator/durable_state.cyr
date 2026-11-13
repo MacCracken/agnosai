@@ -13,15 +13,22 @@
 # rather than internal wiring, so the whole surface is the deliverable and
 # nothing here can be trimmed as unreachable.
 #
-# ## `StateStore` is not ported, and that is not a shortcut
+# ## `StateStore` is a backend table (2.5.0, ADR 036)
 #
-# The oracle's `StateStore` trait uses `impl Future` in return position, so it
-# is not even `dyn`-compatible: no `Box<dyn StateStore>` can exist. It has one
-# implementor, zero callers, and no `<S: StateStore>` bound anywhere in the
-# tree. It is pluggability that was declared and never used. This is therefore
-# a flat module, and if a second backend ever lands the port's established
-# pattern is an fnptr field plus `callptr` (`src/tools/agnos.cyr`), added at
-# that point rather than in advance.
+# The oracle's `StateStore` trait used `impl Future` in return position, so it was
+# not even `dyn`-compatible: no `Box<dyn StateStore>` could exist. It had one
+# implementor and zero callers, and through 2.4.3 this module was flat for that
+# reason. **2.5.0 gives it a caller, the crew log (`src/crew_log.cyr`), and a
+# plausible second backend, a consumer's own database**, so it is ported as the
+# pattern this header named for that day: a table of fnptrs and a context,
+# `agnosai_state_store_backend`. The file store is its first backend, and
+# `agnosai_state_store_new` still builds it, so every caller of 2.4.3 is unchanged.
+#
+# The oracle's two verbs (`save`, `load`) keep their names and shapes. The log
+# adds four: `append` one record, `read_log` the whole of one, `list` the crews
+# that have one, and `remove` a crew's log and snapshot. Every verb refuses an
+# unsafe crew id before it reaches a backend (ADR 008), so a backend keyed on
+# something other than a path is held to the same rule.
 #
 # The `async` goes the same way. `tokio::fs::{create_dir_all, write, read}` are
 # blocking syscalls handed to a thread pool; a blocking Cyrius implementation
@@ -122,10 +129,18 @@ var AGNOSAI_STATE_ABSENT = 0;
 var AGNOSAI_STATE_ENOENT = 0 - 2;
 var AGNOSAI_STATE_EEXIST = 0 - 17;
 
-# FileStateStore — one immutable base directory.
+# A store: a backend's verbs and its context (ADR 036). `BASE_DIR` is the file backend's directory,
+# at offset 0 as it always was, and 0 for another backend.
 enum AgnosaiStateStoreOff {
     AGN_SSTORE_BASE_DIR = 0;
-    AGN_SSTORE_SIZE = 8;
+    AGN_SSTORE_CTX = 8;
+    AGN_SSTORE_SAVE = 16;
+    AGN_SSTORE_LOAD = 24;
+    AGN_SSTORE_APPEND = 32;
+    AGN_SSTORE_READ_LOG = 40;
+    AGN_SSTORE_LIST = 48;
+    AGN_SSTORE_REMOVE = 56;
+    AGN_SSTORE_SIZE = 64;
 }
 
 # Log one of the oracle's `tracing` events.
@@ -363,52 +378,60 @@ fn agnosai_crew_id_is_safe(crew_id: Str): i64 {
     return 1;
 }
 
-# Create a store rooted at `base_dir`.
+# ── the file backend ─────────────────────────────────────────────────────
+
+# Create a store rooted at `base_dir`: the file backend.
 #
 # Stores the path verbatim — no canonicalisation, no existence check, no
 # trailing-separator fixup. The oracle's `new` does the same, and the directory
-# is created on first write rather than here.
+# is created on first write rather than here. Its context is the store itself.
 fn agnosai_state_store_new(base_dir: Str): i64 {
-    var s = alloc(AGN_SSTORE_SIZE);
+    var s = agnosai_state_store_backend(0, &_agnosai_file_store_save, &_agnosai_file_store_load,
+      &_agnosai_file_store_append, &_agnosai_file_store_read_log, &_agnosai_file_store_list,
+      &_agnosai_file_store_remove);
     store64(s + AGN_SSTORE_BASE_DIR, base_dir);
+    store64(s + AGN_SSTORE_CTX, s);
     return s;
 }
 
-# The store's base directory. Private in the oracle; exposed here for tests.
+# The file backend's base directory, or 0 for another backend. Private in the oracle; exposed
+# here for tests.
 fn agnosai_state_store_base_dir(store): i64 {
     return load64(store + AGN_SSTORE_BASE_DIR);
 }
 
-# The file path for a crew — the oracle's `path_for`.
-#
-# `{base_dir}/{crew_id}.json`. Note this is plain concatenation where the
-# oracle uses `Path::join`, which *replaces* the base when the joined component
-# is absolute; `agnosai_crew_id_is_safe` refuses separators, so that case cannot
-# arise here. `str_builder_build` NUL-terminates, so `str_data` on the result is
-# a valid cstring for free.
-fn agnosai_state_path_for(store, crew_id: Str): i64 {
+# `{base_dir}/{crew_id}{ext}`. `str_builder_build` NUL-terminates, so `str_data` on the result is a
+# valid cstring for free.
+fn _agnosai_state_file_for(store, crew_id: Str, ext): i64 {
     var sb = str_builder_new();
     str_builder_add(sb, load64(store + AGN_SSTORE_BASE_DIR));
     str_builder_add_cstr(sb, "/");
     str_builder_add(sb, crew_id);
-    str_builder_add_cstr(sb, ".json");
+    str_builder_add_cstr(sb, ext);
     return str_builder_build(sb);
 }
 
-# Save a crew's state bytes — the oracle's `StateStore::save`.
+# The file path for a crew's snapshot — the oracle's `path_for`.
 #
-# Returns 0 on success or an `AgnosaiError` pointer, which is `core_error`'s
-# documented stand-in for `Result<()>`. Takes `(buf, len)` rather than a Str
-# because the oracle takes `&[u8]` and its own tests pass non-UTF-8 payloads.
+# `{base_dir}/{crew_id}.json`. Note this is plain concatenation where the
+# oracle uses `Path::join`, which *replaces* the base when the joined component
+# is absolute; `agnosai_crew_id_is_safe` refuses separators, so that case cannot
+# arise here.
+fn agnosai_state_path_for(store, crew_id: Str): i64 {
+    return _agnosai_state_file_for(store, crew_id, ".json");
+}
+
+# The file path for a crew's log (ADR 036): `{base_dir}/{crew_id}.log`, beside its snapshot.
+fn agnosai_state_log_path_for(store, crew_id: Str): i64 {
+    return _agnosai_state_file_for(store, crew_id, ".log");
+}
+
+# Save a crew's state bytes — the oracle's `StateStore::save`, on disk.
 #
 # The order is the oracle's: debug log, create the directory tree, build the
 # path, write, info log. Neither failure path logs anything, because the oracle
 # does not — the error carries the detail instead.
-fn agnosai_state_store_save(store, crew_id: Str, buf, len): i64 {
-    if (agnosai_crew_id_is_safe(crew_id) == 0) {
-        return agnosai_error_io(str_cat(str_from("unsafe crew id: "), crew_id));
-    }
-
+fn _agnosai_file_store_save(store, crew_id: Str, buf, len): i64 {
     var base = load64(store + AGN_SSTORE_BASE_DIR);
     _agnosai_durable_log(SK_DEBUG, "saving crew state to file", 25, crew_id, base);
 
@@ -427,6 +450,172 @@ fn agnosai_state_store_save(store, crew_id: Str, buf, len): i64 {
     return 0;
 }
 
+# Read a whole file as a store verb: 0 with `*out_bytes` the payload, or `AGNOSAI_STATE_ABSENT` for
+# a file that is not there, or an error naming `path`.
+fn _agnosai_file_store_read(path: Str, out_bytes, out_len): i64 {
+    var len = 0;
+    var data = _agnosai_read_file_exact(path, &len);
+    if (data == AGNOSAI_STATE_ENOENT) { return 0; }
+    if (data < 0) {
+        return agnosai_error_io(_agnosai_io_detail("read", path, data));
+    }
+    store64(out_bytes, data);
+    store64(out_len, len);
+    return 0;
+}
+
+# Load a crew's state bytes — the oracle's `StateStore::load`, from disk.
+#
+# `-ENOENT` is the miss. Every other errno is an error, logged nowhere, exactly
+# as the oracle's `Err(e)` arm is silent.
+fn _agnosai_file_store_load(store, crew_id: Str, out_bytes, out_len): i64 {
+    var path = agnosai_state_path_for(store, crew_id);
+    _agnosai_durable_log(SK_DEBUG, "loading crew state from file", 28, crew_id, path);
+    var err = _agnosai_file_store_read(path, out_bytes, out_len);
+    if (err != 0) { return err; }
+    if (load64(out_bytes) == AGNOSAI_STATE_ABSENT) {
+        _agnosai_durable_log(SK_DEBUG, "no saved state found", 20, crew_id, 0);
+        return 0;
+    }
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "bytes=");
+    str_builder_add_int(sb, load64(out_len));
+    _agnosai_durable_log(SK_INFO, "crew state loaded", 17, crew_id, str_builder_build(sb));
+    return 0;
+}
+
+# Open a crew's log to append to, creating it, and its directory when that is missing. Returns the
+# fd or a negative errno.
+#
+# ⚠ **0600, and `O_CLOEXEC`.** A log holds a crew's answers and its tool calls' arguments, so it is
+# its owner's alone, and a sandboxed tool's child must not inherit an fd onto it. The directory is
+# made only when the open says it is missing, so an append into one that exists costs no `mkdir`.
+fn _agnosai_file_store_open_log(store, path: Str): i64 {
+    var flags = O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC;
+    var cpath = str_cstr(path);
+    var fd = file_open(cpath, flags, 0x180);
+    if (fd != AGNOSAI_STATE_ENOENT) { return fd; }
+    var rc = _agnosai_mkdir_p(load64(store + AGN_SSTORE_BASE_DIR));
+    if (rc != 0) { return rc; }
+    return file_open(cpath, flags, 0x180);
+}
+
+# Append one record to a crew's log: the whole of `buf`, and on disk before it returns when `sync`
+# is 1 (ADR 036).
+#
+# One `O_APPEND` write per record where it can be, looping on a short one, so two tasks appending
+# at once never interleave inside a record. The fd is opened per record: a store holds nothing open
+# between them, so a crew that dies leaves no fd behind and a backend needs no handle.
+fn _agnosai_file_store_append(store, crew_id: Str, buf, len, sync): i64 {
+    var path = agnosai_state_log_path_for(store, crew_id);
+    var fd = _agnosai_file_store_open_log(store, path);
+    if (fd < 0) {
+        return agnosai_error_io(_agnosai_io_detail("open", path, fd));
+    }
+    var done = 0;
+    while (done < len) {
+        var n = file_write(fd, buf + done, len - done);
+        if (n <= 0) {
+            file_close(fd);
+            if (n == 0) { n = 0 - 5; }
+            return agnosai_error_io(_agnosai_io_detail("append", path, n));
+        }
+        done = done + n;
+    }
+    if (sync == 1) {
+        var rc = sys_fsync(fd);
+        if (rc < 0) {
+            file_close(fd);
+            return agnosai_error_io(_agnosai_io_detail("fsync", path, rc));
+        }
+    }
+    file_close(fd);
+    return 0;
+}
+
+# Read a crew's whole log, or `AGNOSAI_STATE_ABSENT` for a crew that has none.
+fn _agnosai_file_store_read_log(store, crew_id: Str, out_bytes, out_len): i64 {
+    return _agnosai_file_store_read(agnosai_state_log_path_for(store, crew_id), out_bytes, out_len);
+}
+
+# Push the id of every crew with a log into `out_ids`. A base directory that is not there yet holds
+# none, which is not an error: a store writes nothing until its first crew.
+fn _agnosai_file_store_list(store, out_ids): i64 {
+    var base = load64(store + AGN_SSTORE_BASE_DIR);
+    var names = vec_new();
+    var rc = dir_list_checked(base, names);
+    if (rc == AGNOSAI_STATE_ENOENT) { return 0; }
+    if (rc < 0) {
+        return agnosai_error_io(_agnosai_io_detail("list", base, rc));
+    }
+    for (var i = 0; i < vec_len(names); i = i + 1) {
+        var name = vec_get(names, i);
+        var n = str_len(name);
+        if (n > 4 && memeq(str_data(name) + n - 4, ".log", 4) == 1) {
+            vec_push(out_ids, str_sub(name, 0, n - 4));
+        }
+    }
+    return 0;
+}
+
+# Remove one file, where a file that is not there is already removed.
+fn _agnosai_file_store_unlink(path: Str): i64 {
+    var rc = xunlink(str_data(path));
+    if (rc == 0 || rc == AGNOSAI_STATE_ENOENT) { return 0; }
+    return agnosai_error_io(_agnosai_io_detail("remove", path, rc));
+}
+
+# Remove a crew's log and its snapshot. Either may be missing.
+fn _agnosai_file_store_remove(store, crew_id: Str): i64 {
+    var err = _agnosai_file_store_unlink(agnosai_state_log_path_for(store, crew_id));
+    if (err != 0) { return err; }
+    return _agnosai_file_store_unlink(agnosai_state_path_for(store, crew_id));
+}
+
+# ── the backend table (ADR 036) ────────────────────────────────────────────
+
+# A store over a backend of a consumer's own: its context, which every verb is handed first, and
+# one fnptr per verb. Each answers 0 or an `AgnosaiError`, as the file backend's do:
+#
+#   save_fp(ctx, crew_id, buf, len)            the oracle's `save`: replace the crew's snapshot
+#   load_fp(ctx, crew_id, out_bytes, out_len)  the oracle's `load`: `AGNOSAI_STATE_ABSENT` for none
+#   append_fp(ctx, crew_id, buf, len, sync)    one log record, on disk before it returns at sync 1
+#   read_log_fp(ctx, crew_id, out_bytes, out_len)   the whole log, `AGNOSAI_STATE_ABSENT` for none
+#   list_fp(ctx, out_ids)                      push each crew id that has a log, a Str, into a vec
+#   remove_fp(ctx, crew_id)                    the crew's log and snapshot; none is not an error
+#
+# ⚠ **`append_fp` is called from any task's thread, at once**, and a record must land whole and
+# never inside another. Records need not land in order: a reader orders them (`src/crew_log.cyr`).
+fn agnosai_state_store_backend(ctx, save_fp, load_fp, append_fp, read_log_fp, list_fp,
+  remove_fp): i64 {
+    var s = alloc(AGN_SSTORE_SIZE);
+    store64(s + AGN_SSTORE_BASE_DIR, 0);
+    store64(s + AGN_SSTORE_CTX, ctx);
+    store64(s + AGN_SSTORE_SAVE, save_fp);
+    store64(s + AGN_SSTORE_LOAD, load_fp);
+    store64(s + AGN_SSTORE_APPEND, append_fp);
+    store64(s + AGN_SSTORE_READ_LOG, read_log_fp);
+    store64(s + AGN_SSTORE_LIST, list_fp);
+    store64(s + AGN_SSTORE_REMOVE, remove_fp);
+    return s;
+}
+
+# The error a verb answers for a crew id it will not take (ADR 008).
+fn _agnosai_state_unsafe(crew_id: Str): i64 {
+    return agnosai_error_io(str_cat(str_from("unsafe crew id: "), crew_id));
+}
+
+# Save a crew's state bytes — the oracle's `StateStore::save`.
+#
+# Returns 0 on success or an `AgnosaiError` pointer, which is `core_error`'s
+# documented stand-in for `Result<()>`. Takes `(buf, len)` rather than a Str
+# because the oracle takes `&[u8]` and its own tests pass non-UTF-8 payloads.
+fn agnosai_state_store_save(store, crew_id: Str, buf, len): i64 {
+    if (agnosai_crew_id_is_safe(crew_id) == 0) { return _agnosai_state_unsafe(crew_id); }
+    return callptr(load64(store + AGN_SSTORE_SAVE), load64(store + AGN_SSTORE_CTX), crew_id, buf,
+      len);
+}
+
 # Load a crew's state bytes — the oracle's `StateStore::load`.
 #
 # Returns 0 for the oracle's `Ok` or an `AgnosaiError` pointer for its `Err`.
@@ -436,38 +625,47 @@ fn agnosai_state_store_save(store, crew_id: Str, buf, len): i64 {
 # Splitting the Option out into a parameter is what keeps the two zeroes apart:
 # a bare return would have to use 0 for both "no error" and "no snapshot",
 # which are opposite answers, and `save` already spends 0 on success.
-#
-# `-ENOENT` is the miss. Every other errno is an error, logged nowhere, exactly
-# as the oracle's `Err(e)` arm is silent.
 fn agnosai_state_store_load(store, crew_id: Str, out_bytes, out_len): i64 {
     store64(out_bytes, AGNOSAI_STATE_ABSENT);
     store64(out_len, 0);
+    if (agnosai_crew_id_is_safe(crew_id) == 0) { return _agnosai_state_unsafe(crew_id); }
+    return callptr(load64(store + AGN_SSTORE_LOAD), load64(store + AGN_SSTORE_CTX), crew_id,
+      out_bytes, out_len);
+}
 
-    if (agnosai_crew_id_is_safe(crew_id) == 0) {
-        return agnosai_error_io(str_cat(str_from("unsafe crew id: "), crew_id));
+# Append one record to a crew's log, on disk before it returns when `sync` is 1 (ADR 036).
+fn agnosai_state_store_append(store, crew_id: Str, buf, len, sync): i64 {
+    if (agnosai_crew_id_is_safe(crew_id) == 0) { return _agnosai_state_unsafe(crew_id); }
+    return callptr(load64(store + AGN_SSTORE_APPEND), load64(store + AGN_SSTORE_CTX), crew_id, buf,
+      len, sync);
+}
+
+# Read a crew's whole log: 0 with `*out_bytes` the bytes, or `AGNOSAI_STATE_ABSENT` for none, or an
+# error.
+fn agnosai_state_store_read_log(store, crew_id: Str, out_bytes, out_len): i64 {
+    store64(out_bytes, AGNOSAI_STATE_ABSENT);
+    store64(out_len, 0);
+    if (agnosai_crew_id_is_safe(crew_id) == 0) { return _agnosai_state_unsafe(crew_id); }
+    return callptr(load64(store + AGN_SSTORE_READ_LOG), load64(store + AGN_SSTORE_CTX), crew_id,
+      out_bytes, out_len);
+}
+
+# Push the id of every crew that has a log into `out_ids`. An id a backend hands back that is not
+# safe (ADR 008) is left out, as no other verb would take it.
+fn agnosai_state_store_list(store, out_ids): i64 {
+    var all = vec_new();
+    var err = callptr(load64(store + AGN_SSTORE_LIST), load64(store + AGN_SSTORE_CTX), all);
+    for (var i = 0; i < vec_len(all); i = i + 1) {
+        var id = vec_get(all, i);
+        if (agnosai_crew_id_is_safe(id) == 1) { vec_push(out_ids, id); }
     }
+    return err;
+}
 
-    var path = agnosai_state_path_for(store, crew_id);
-    _agnosai_durable_log(SK_DEBUG, "loading crew state from file", 28, crew_id, path);
-
-    var len = 0;
-    var data = _agnosai_read_file_exact(path, &len);
-    if (data == AGNOSAI_STATE_ENOENT) {
-        _agnosai_durable_log(SK_DEBUG, "no saved state found", 20, crew_id, 0);
-        return 0;
-    }
-    if (data < 0) {
-        return agnosai_error_io(_agnosai_io_detail("read", path, data));
-    }
-
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, "bytes=");
-    str_builder_add_int(sb, len);
-    _agnosai_durable_log(SK_INFO, "crew state loaded", 17, crew_id, str_builder_build(sb));
-
-    store64(out_bytes, data);
-    store64(out_len, len);
-    return 0;
+# Remove a crew's log and its snapshot. A crew with neither is not an error.
+fn agnosai_state_store_remove(store, crew_id: Str): i64 {
+    if (agnosai_crew_id_is_safe(crew_id) == 0) { return _agnosai_state_unsafe(crew_id); }
+    return callptr(load64(store + AGN_SSTORE_REMOVE), load64(store + AGN_SSTORE_CTX), crew_id);
 }
 
 # Serialize a crew state to pretty JSON bytes — the oracle's

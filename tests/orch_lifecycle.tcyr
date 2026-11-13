@@ -1164,6 +1164,203 @@ fn test_budget_ending(): i64 {
     return 0;
 }
 
+# ── 2.5.0: a snapshot agrees with the events (ADR 036) ─────────────────────
+
+# Each snapshot is checked against the stream: replaying every event at or before its `seq` must
+# give exactly its statuses. A task the replay has not reached reads `pending` or `queued`. So a
+# snapshot that ran ahead of its events fails, and so does one that lagged them.
+
+var _t_snap_runner = 0;
+var _t_snap_go = 0;
+var _t_snap_done = 0;
+var _t_snaps = 0;
+
+fn _t_snapper(arg): i64 {
+    while (atomic_load(&_t_snap_go) == 1 && vec_len(_t_snaps) < 4000) {
+        vec_push(_t_snaps, agnosai_crew_runner_snapshot_a(default_alloc(), _t_snap_runner));
+    }
+    atomic_store(&_t_snap_done, 1);
+    return 0;
+}
+
+fn _t_stub_chat_slow(client, request, out_response, parent_sc): i64 {
+    sleep_ms(1);
+    return _t_stub_chat(client, request, out_response, parent_sc);
+}
+
+fn _t_snap_str(v, key): i64 {
+    var x = bayan_json_v_obj_get_by_cstr(v, key);
+    if (x == 0 || bayan_json_v_is_str(x) == 0) { return str_from(""); }
+    return bayan_json_v_str(x);
+}
+
+# Whether snapshot `snap` agrees with `evs`, the whole stream of its crew.
+fn _t_snap_agrees(snap, evs): i64 {
+    var seq = bayan_json_v_int(bayan_json_v_obj_get_by_cstr(snap, "seq"));
+    var tasks = map_new_str();
+    var crew = str_from("pending");
+    for (var i = 0; i < vec_len(evs); i = i + 1) {
+        var ev = vec_get(evs, i);
+        if (agnosai_crew_event_seq(ev) <= seq) {
+            var t = agnosai_crew_event_event_type(ev);
+            var id = _tl_task_id(ev);
+            if (str_eq_cstr(t, "crew_started") == 1) { crew = str_from("running"); }
+            if (str_eq_cstr(t, "task_started") == 1) { map_set(tasks, id, str_from("running")); }
+            if (str_eq_cstr(t, "approval_requested") == 1) { map_set(tasks, id, str_from("awaiting_approval")); }
+            if (str_eq_cstr(t, "approval_decided") == 1) { map_set(tasks, id, str_from("running")); }
+            if (str_eq_cstr(t, "task_completed") == 1) { map_set(tasks, id, _tl_data_str(ev, "status")); }
+            if (str_eq_cstr(t, "crew_completed") == 1) { crew = _tl_data_str(ev, "status"); }
+        }
+    }
+    var list = bayan_json_v_obj_get_by_cstr(snap, "tasks");
+    var waiting = 0;
+    for (var j = 0; j < bayan_json_v_arr_len(list); j = j + 1) {
+        var e = bayan_json_v_arr_get(list, j);
+        var status = _t_snap_str(e, "status");
+        var want = map_get(tasks, _t_snap_str(e, "task_id"));
+        if (want != 0) {
+            if (str_eq(status, want) == 0) { return 0; }
+        } else {
+            if (str_eq_cstr(status, "pending") == 0 && str_eq_cstr(status, "queued") == 0) { return 0; }
+        }
+        if (str_eq_cstr(status, "awaiting_approval") == 1) { waiting = 1; }
+    }
+    if (str_eq_cstr(crew, "running") == 1 && waiting == 1) { crew = str_from("awaiting_approval"); }
+    return str_eq(_t_snap_str(snap, "status"), crew);
+}
+
+# Run `spec` watched, with snapshots taken throughout from another thread; check every one.
+# Returns how many there were.
+fn _t_run_snapped(spec, gate, chat_fp, name): i64 {
+    var sub: i64[1];
+    var r = _t_runner(spec, chat_fp, &sub);
+    if (gate != 0) { agnosai_crew_runner_with_approval(r, gate, 0); }
+    _t_snap_runner = r;
+    _t_snaps = vec_new();
+    atomic_store(&_t_snap_go, 1);
+    atomic_store(&_t_snap_done, 0);
+    thread_create_detached(&_t_snapper, 0);
+    var err: i64[1];
+    store64(&err, 0);
+    agnosai_crew_runner_run(r, &err);
+    atomic_store(&_t_snap_go, 0);
+    while (atomic_load(&_t_snap_done) == 0) { sleep_ms(1); }
+    var evs = _t_drain(load64(&sub));
+    _tl_assert_legal(evs, agnosai_crew_id(spec), name);
+    var bad = 0;
+    for (var i = 0; i < vec_len(_t_snaps); i = i + 1) {
+        if (_t_snap_agrees(vec_get(_t_snaps, i), evs) == 0) { bad = bad + 1; }
+    }
+    assert_eq(bad, 0, name);
+    # The last word: a finished crew's snapshot says it finished, at its last event.
+    var last = agnosai_crew_runner_snapshot_a(default_alloc(), r);
+    assert(_t_snap_agrees(last, evs) == 1, "a finished crew's snapshot agrees with its whole stream");
+    assert_eq(bayan_json_v_int(bayan_json_v_obj_get_by_cstr(last, "seq")),
+      agnosai_crew_event_seq(vec_get(evs, vec_len(evs) - 1)), "and its seq is its last event's");
+    return vec_len(_t_snaps);
+}
+
+# A move made on another thread, while the bus lock is held here.
+var _t_mv_runner = 0;
+var _t_mv_word = 0;
+var _t_mv_done = 0;
+
+fn _t_mover(arg): i64 {
+    _agnosai_crew_move(_t_mv_runner, &_t_mv_word, 7, 0);
+    atomic_store(&_t_mv_done, 1);
+    return 0;
+}
+
+# ⚠ **A status moves only under the bus lock**, where a snapshot reads it: with the lock held, a
+# move on another thread waits, and lands once it is given back.
+fn test_move_takes_the_lock(): i64 {
+    var spec = _t_crew("move-lock", 1, agnosai_process_sequential());
+    var sub: i64[1];
+    var r = _t_runner(spec, &_t_stub_chat, &sub);
+    _t_mv_runner = r;
+    _t_mv_word = 0;
+    atomic_store(&_t_mv_done, 0);
+    var tx = load64(r + AGN_CR_EVENT_TX);
+    _agnosai_event_sender_lock(tx);
+    thread_create_detached(&_t_mover, 0);
+    sleep_ms(30);
+    var during = atomic_load(&_t_mv_word);
+    _agnosai_event_sender_unlock(tx);
+    while (atomic_load(&_t_mv_done) == 0) { sleep_ms(1); }
+    assert_eq(during, 0, "a move waits while the bus lock is held");
+    assert_eq(atomic_load(&_t_mv_word), 7, "and lands once it is given back");
+    return 0;
+}
+
+fn test_snapshot(): i64 {
+    # Before the run: pending, every task pending, nothing numbered.
+    var spec = _t_crew("snap-before", 3, agnosai_process_sequential());
+    var sub: i64[1];
+    var r = _t_runner(spec, &_t_stub_chat, &sub);
+    var v = agnosai_crew_runner_snapshot_a(default_alloc(), r);
+    assert(str_eq_cstr(_t_snap_str(v, "status"), "pending") == 1, "a crew not started reads pending");
+    assert_eq(bayan_json_v_int(bayan_json_v_obj_get_by_cstr(v, "seq")), 0, "at seq 0");
+    assert_eq(bayan_json_v_arr_len(bayan_json_v_obj_get_by_cstr(v, "tasks")), 3, "listing each task");
+    assert(str_eq(_t_snap_str(v, "crew_id"), agnosai_crew_id(spec)) == 1, "under its crew's id");
+
+    var n = _t_run_snapped(_t_crew("snap-seq", 6, agnosai_process_sequential()), 0, &_t_stub_chat_slow,
+      "every snapshot of a sequential crew agrees with its events");
+    assert(n > 0, "and some were taken mid-run");
+    _t_run_snapped(_t_crew("snap-par", 12, agnosai_process_parallel(4)), 0, &_t_stub_chat_slow,
+      "every snapshot of a parallel crew, four at once, agrees with its events");
+    var dag = vec_new();
+    var a = _t_task("a");
+    var b = _t_task("b FAILME");
+    var c = _t_task("c");
+    agnosai_task_with_dependency(c, agnosai_task_id(a));
+    var d = _t_task("d");
+    agnosai_task_with_dependency(d, agnosai_task_id(b));
+    vec_push(dag, a);
+    vec_push(dag, b);
+    vec_push(dag, c);
+    vec_push(dag, d);
+    _t_run_snapped(_t_crew_of("snap-dag", dag, agnosai_process_dag()), 0, &_t_stub_chat_failme,
+      "every snapshot of a DAG with a failing branch agrees with its events");
+
+    # Waiting on a reviewer: the snapshot reads awaiting_approval, task and crew, while it waits.
+    var gate = agnosai_approval_gate_new();
+    var risky = vec_new();
+    for (var i = 0; i < 4; i = i + 1) { vec_push(risky, _t_risky("risky", AGNOSAI_RISK_HIGH)); }
+    _t_review(gate, 4, AGNOSAI_APPROVAL_APPROVED, 0);
+    _t_run_snapped(_t_crew_of("snap-gated", risky, agnosai_process_parallel(4)), gate, &_t_stub_chat,
+      "every snapshot of a crew waiting on its reviewer agrees with its events");
+    _t_review_wait();
+    var seen = 0;
+    for (var k = 0; k < vec_len(_t_snaps); k = k + 1) {
+        if (str_eq_cstr(_t_snap_str(vec_get(_t_snaps, k), "status"), "awaiting_approval") == 1) { seen = 1; }
+    }
+    assert_eq(seen, 1, "and one was taken while the crew waited, reading awaiting_approval");
+
+    # A hierarchical crew's manager task is listed once it has one, after the spec's.
+    var hspec = _t_crew("snap-hier", 3, agnosai_process_hierarchical(str_from("boss")));
+    var hagents = vec_new();
+    vec_push(hagents, agnosai_agent_new(str_from("boss"), str_from("manager"), str_from("lead")));
+    vec_push(hagents, agnosai_agent_new(str_from("w1"), str_from("worker"), str_from("work")));
+    agnosai_crew_with_agents(hspec, hagents);
+    _t_run_snapped(hspec, 0, &_t_stub_chat_slow, "every snapshot of a managed crew agrees with its events");
+    var hlast = vec_get(_t_snaps, vec_len(_t_snaps) - 1);
+    var hlist = bayan_json_v_obj_get_by_cstr(hlast, "tasks");
+    assert(bayan_json_v_arr_len(hlist) == 3 || bayan_json_v_arr_len(hlist) == 4,
+      "a managed crew's snapshot lists its tasks, and its manager's once it has one");
+    var hr = 0;
+    var hsub: i64[1];
+    hr = _t_runner(_t_crew("snap-hier-2", 2, agnosai_process_hierarchical(str_from("boss"))), &_t_stub_chat, &hsub);
+    agnosai_crew_with_agents(load64(hr + AGN_CR_SPEC), hagents);
+    var herr: i64[1];
+    agnosai_crew_runner_run(hr, &herr);
+    var hfin = agnosai_crew_runner_snapshot_a(default_alloc(), hr);
+    var hfl = bayan_json_v_obj_get_by_cstr(hfin, "tasks");
+    assert_eq(bayan_json_v_arr_len(hfl), 3, "a finished managed crew's lists its two tasks and its manager's");
+    assert(str_eq_cstr(_t_snap_str(bayan_json_v_arr_get(hfl, 2), "status"), "completed") == 1,
+      "the manager's last, completed");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
@@ -1182,6 +1379,8 @@ fn main(): i64 {
     test_tool_events();
     test_sliding_window();
     test_budget_ending();
+    test_snapshot();
+    test_move_takes_the_lock();
     return assert_summary();
 }
 

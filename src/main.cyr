@@ -252,6 +252,37 @@ fn _agnosai_main_hoosh_url(): i64 {
     return str_from(v);
 }
 
+# Where crews' logs go (ADR 036): `AGNOSAI_STATE_DIR`, or 0 when it is unset or empty, and crews
+# then keep none, as through 2.4.3. The buffer `getenv` hands back is never freed, so the borrow
+# lasts.
+fn _agnosai_main_state_dir(): i64 {
+    var v = getenv("AGNOSAI_STATE_DIR");
+    if (v == 0) { return 0; }
+    if (strlen(v) == 0) { return 0; }
+    return str_from(v);
+}
+
+# Claim `dir` for this process (ADR 036): an exclusive, non-blocking lock on `<dir>/.owner`, held for
+# the process's life, so a second server on the same directory refuses to start rather than resume
+# the first's live crews. The kernel drops the lock when its holder exits, however it exits, so a
+# crash leaves nothing to clear, and the file is never removed: removing it would let a starting
+# process lock a new file while the old one is still held. `O_CLOEXEC`, so a tool's child does not
+# inherit the claim. agnostic claims its own database the same way. Returns 1 once claimed.
+fn _agnosai_main_claim_state_dir(dir: Str): i64 {
+    if (_agnosai_mkdir_p(dir) != 0) { return 0; }
+    var sb = str_builder_new();
+    str_builder_add(sb, dir);
+    str_builder_add_cstr(sb, "/.owner");
+    var fd = file_open(str_cstr(str_builder_build(sb)), O_RDWR | O_CREAT | O_CLOEXEC, 0x180);
+    if (fd < 0) { return 0; }
+    if (file_trylock(fd) != 0) {
+        file_close(fd);
+        return 0;
+    }
+    # The fd stays open: the lock is the process's.
+    return 1;
+}
+
 # The operator's model per tier: `AGNOSAI_MODEL_FAST`, `_CAPABLE` and `_PREMIUM` (ADR 030). Each is
 # an id sent exactly as written, checked by nobody, and with one set that tier never reads the
 # catalog. An empty one is none, which is what makes a variable a compose file passes through blank
@@ -459,6 +490,28 @@ fn main(): i64 {
     # minted it, so this is non-zero without a setter. And since 2.4.0 the SAME
     # approval gate (ADR 032): the Rust line minted a second one here, so
     # `POST /api/v1/approvals` decided for a gate no crew waited on.
+    # 2.5.0, ADR 036 — with `AGNOSAI_STATE_DIR` set, every crew keeps a log there, and a start reads
+    # them back before the server listens: a crew whose log ended answers as it ended, and one whose
+    # log did not, because the last process stopped mid-run, is resumed from where it stopped.
+    var state_dir = _agnosai_main_state_dir();
+    if (state_dir != 0) {
+        if (_agnosai_main_claim_state_dir(state_dir) == 0) {
+            _agnosai_main_log_kv(SK_ERROR, "another process holds this state directory; refusing to start", 61,
+              "state_dir", 9, state_dir);
+            return 1;
+        }
+        agnosai_orchestrator_with_state_store(orchestrator, agnosai_state_store_new(state_dir));
+        var restored: i64[1];
+        var resumed = agnosai_orchestrator_recover(orchestrator, &restored);
+        if (sakshi_get_level() >= SK_INFO) {
+            var f[AGNOSAI_LOG_FIELDS_BYTES];
+            var n = agnosai_log_fields_start(&f, state_dir);
+            n = agnosai_log_field_int(&f, n, "resumed", resumed);
+            n = agnosai_log_field_int(&f, n, "restored", load64(&restored));
+            sakshi_log_kv(SK_INFO, "crew logs kept", 14, "state_dir", 9, &f, n);
+        }
+    }
+
     var state = agnosai_app_state_new(orchestrator, tools, auth, events,
       agnosai_orchestrator_audit(orchestrator), agnosai_orchestrator_approval_gate(orchestrator));
 

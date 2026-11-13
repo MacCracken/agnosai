@@ -66,7 +66,10 @@ enum AgnosaiCrewEventOff {
     AGN_CE_EVENT_TYPE = 8;
     AGN_CE_DATA = 16;
     AGN_CE_SEQ = 24;
-    AGN_SSE_EVENT_SIZE = 32;
+    # What the crew's log keeps beside the event, a JSON object whose fields join its line, or 0
+    # (ADR 036). No subscriber sees it.
+    AGN_CE_EXTRA = 32;
+    AGN_SSE_EVENT_SIZE = 40;
 }
 
 # The crew that emitted the event.
@@ -103,7 +106,20 @@ fn agnosai_crew_event_new_a(a, crew_id: Str, event_type: Str, data): i64 {
     store64(e + AGN_CE_EVENT_TYPE, event_type);
     store64(e + AGN_CE_DATA, data);
     store64(e + AGN_CE_SEQ, 0);
+    store64(e + AGN_CE_EXTRA, 0);
     return e;
+}
+
+# Give the event what its crew's log keeps beside it (ADR 036): a JSON object, whose fields join
+# the event's line in the log and reach no subscriber. Returns the event.
+fn agnosai_crew_event_with_extra(e, extra): i64 {
+    store64(e + AGN_CE_EXTRA, extra);
+    return e;
+}
+
+# What the crew's log keeps beside the event, or 0.
+fn agnosai_crew_event_extra(e): i64 {
+    return load64(e + AGN_CE_EXTRA);
 }
 
 # The event as a JSON value, in the struct's field order.
@@ -211,7 +227,12 @@ enum AgnosaiEventSenderOff {
     AGN_ES_ALLOC = 16;
     # The `seq` of the last event this sender delivered, 0 before the first (ADR 032).
     AGN_ES_SEQ = 24;
-    AGN_ES_SIZE = 32;
+    # A receiver beside the subscribers that every event reaches, or 0 (ADR 036): a crew's log.
+    # `TAP_FP(ctx, event)` is called once the event is numbered and out, outside the bus lock, on
+    # the sending thread, so it may write and wait for the disk.
+    AGN_ES_TAP_FP = 32;
+    AGN_ES_TAP_CTX = 40;
+    AGN_ES_SIZE = 48;
 }
 
 # Create a sender bound to a bus's lock.
@@ -221,7 +242,48 @@ fn _agnosai_event_sender_new_a(a, mtx): i64 {
     store64(tx + AGN_ES_MUTEX, mtx);
     store64(tx + AGN_ES_ALLOC, a);
     store64(tx + AGN_ES_SEQ, 0);
+    store64(tx + AGN_ES_TAP_FP, 0);
+    store64(tx + AGN_ES_TAP_CTX, 0);
     return tx;
+}
+
+# A sender on no bus, with a lock of its own (ADR 036): for a crew with a log and no bus, whose
+# events the log alone receives and numbers.
+fn agnosai_event_sender_new_a(a): i64 {
+    return _agnosai_event_sender_new_a(a, mutex_new());
+}
+
+# Give every event this sender sends to `tap_fp(ctx, event)` as well, or stop with `tap_fp` 0
+# (ADR 036). Set under the bus lock, so a send sees the tap whole or not at all. Returns the sender.
+fn agnosai_event_sender_with_tap(tx, tap_fp, ctx): i64 {
+    var mtx = load64(tx + AGN_ES_MUTEX);
+    mutex_lock(mtx);
+    store64(tx + AGN_ES_TAP_CTX, ctx);
+    store64(tx + AGN_ES_TAP_FP, tap_fp);
+    mutex_unlock(mtx);
+    return tx;
+}
+
+# Go on numbering from `seq` (ADR 036): a resumed crew's events follow those its log holds.
+fn agnosai_event_sender_with_seq(tx, seq): i64 {
+    var mtx = load64(tx + AGN_ES_MUTEX);
+    mutex_lock(mtx);
+    store64(tx + AGN_ES_SEQ, seq);
+    mutex_unlock(mtx);
+    return tx;
+}
+
+# Whether an event sent now would reach anything: a subscriber, or a tap (ADR 036). What a caller
+# asks before it builds an event, so a crew nobody watches and nothing logs builds none.
+fn agnosai_event_sender_wanted(tx): i64 {
+    if (tx == 0) { return 0; }
+    var mtx = load64(tx + AGN_ES_MUTEX);
+    mutex_lock(mtx);
+    var n = vec_len(load64(tx + AGN_ES_SUBS));
+    var tap = load64(tx + AGN_ES_TAP_FP);
+    mutex_unlock(mtx);
+    if (n > 0 || tap != 0) { return 1; }
+    return 0;
 }
 
 # The `seq` of the last event this sender delivered, or 0 before the first.
@@ -298,11 +360,40 @@ fn agnosai_event_sender_unsubscribe(tx, sub): i64 {
 # sent them. An event that reaches nobody takes no number: a subscriber that attaches next sees
 # the count go on from the last event anyone received.
 fn agnosai_event_sender_send(tx, event): i64 {
+    return agnosai_event_sender_send_set(tx, event, 0, 0);
+}
+
+# Send `event`, or nothing for 0, and store `value` at `word`, or nothing for a `word` of 0, as one
+# step under the bus lock (ADR 036). A crew's snapshot is read under the same lock, so a status it
+# reads is never ahead of the events numbered so far, nor behind them. Returns the subscribers
+# reached.
+#
+# A tap (ADR 036) receives the event too, once it is numbered and out and the lock is given back,
+# on this thread: so a crew's log has every event it sent before the send returns, and two
+# senders' lines may land in either order, which a reader of the log puts back by `seq`.
+fn agnosai_event_sender_send_set(tx, event, word, value): i64 {
     var mtx = load64(tx + AGN_ES_MUTEX);
     mutex_lock(mtx);
+    if (word != 0) { store64(word, value); }
+    var n = 0;
+    var tap = 0;
+    var ctx = 0;
+    if (event != 0) {
+        tap = load64(tx + AGN_ES_TAP_FP);
+        ctx = load64(tx + AGN_ES_TAP_CTX);
+        n = _agnosai_event_sender_deliver_locked(tx, event);
+    }
+    mutex_unlock(mtx);
+    if (tap != 0) { callptr(tap, ctx, event); }
+    return n;
+}
+
+# Number `event` and push it to every subscriber. The caller holds the bus lock. An event is
+# numbered when anything receives it: a subscriber, or a tap.
+fn _agnosai_event_sender_deliver_locked(tx, event): i64 {
     var subs = load64(tx + AGN_ES_SUBS);
     var n = vec_len(subs);
-    if (n > 0) {
+    if (n > 0 || load64(tx + AGN_ES_TAP_FP) != 0) {
         var seq = load64(tx + AGN_ES_SEQ) + 1;
         store64(tx + AGN_ES_SEQ, seq);
         store64(event + AGN_CE_SEQ, seq);
@@ -319,8 +410,24 @@ fn agnosai_event_sender_send(tx, event): i64 {
             store64(sub + AGN_ER_LAGGED, load64(sub + AGN_ER_LAGGED) + 1);
         }
     }
-    mutex_unlock(mtx);
     return n;
+}
+
+# Take the bus lock a sender's events go out under, to read what must agree with them (ADR 036).
+# Held for a few loads, and given back with `_agnosai_event_sender_unlock`.
+fn _agnosai_event_sender_lock(tx): i64 {
+    mutex_lock(load64(tx + AGN_ES_MUTEX));
+    return 0;
+}
+
+fn _agnosai_event_sender_unlock(tx): i64 {
+    mutex_unlock(load64(tx + AGN_ES_MUTEX));
+    return 0;
+}
+
+# The `seq` of the last event delivered, for a caller that holds the bus lock.
+fn _agnosai_event_sender_seq_locked(tx): i64 {
+    return load64(tx + AGN_ES_SEQ);
 }
 
 # EventBus — the registry of per-crew senders.

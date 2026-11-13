@@ -1,0 +1,253 @@
+# =========================================================================
+# crew_log.bcyr — what a crew's log costs (ADR 036).
+#
+# No oracle: the Rust line kept no log. A file of its own, as the roadmap's 2.7.1 asks of crew rows.
+# The crew is `manager.bcyr`'s four-task sequential crew, run with no log, with a log whose store
+# keeps nothing (what the log costs the crew: every event built, numbered and rendered), and with a
+# log on the file store in `$TMPDIR` (that, and the writes and fsyncs, which are the disk's: on a
+# tmpfs they are nearly nothing, on ext4 they are most of the row). Then a snapshot, and reading a
+# four-task log back into a replay.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+include "src/strcase.cyr"
+include "src/telemetry/mod.cyr"
+include "src/core/error.cyr"
+include "src/core/json.cyr"
+include "src/core/message.cyr"
+include "src/core/resource.cyr"
+include "src/core/task.cyr"
+include "src/core/agent.cyr"
+include "src/core/crew.cyr"
+include "src/orchestrator/scheduler.cyr"
+include "src/orchestrator/audit.cyr"
+include "src/llm/retry.cyr"
+include "src/llm/hoosh.cyr"
+include "src/llm/router.cyr"
+include "src/orchestrator/scoring.cyr"
+include "src/orchestrator/output_validation.cyr"
+include "src/server/prompt_guard.cyr"
+include "src/server/output_filter.cyr"
+include "src/chan_lossy.cyr"
+include "src/server/sse.cyr"
+include "src/server/prometheus.cyr"
+include "src/arena_pool.cyr"
+include "src/sandbox/policy.cyr"
+include "src/sandbox/kavach_bridge.cyr"
+include "src/server/ssrf.cyr"
+include "src/tools/native.cyr"
+include "src/tools/registry.cyr"
+include "src/tool_call.cyr"
+include "src/tool_loop.cyr"
+include "src/handoff.cyr"
+include "src/model_catalog.cyr"
+include "src/orchestrator/approval.cyr"
+include "src/orchestrator/hierarchical.cyr"
+include "src/orchestrator/crew_runner.cyr"
+
+# Rounds of batch/`_BR`, as every `.bcyr` runs them (*Settled decisions*).
+var _BR = 5;
+
+fn _b_o_tools(t1, t2): i64 {
+    var v = vec_new();
+    vec_push(v, str_from(t1));
+    if (t2 != 0) { vec_push(v, str_from(t2)); }
+    return v;
+}
+
+fn _b_o_agent(key: Str, complexity: Str, domain, tools): i64 {
+    var a = agnosai_agent_new(key, str_from("worker"), str_from("execute tasks"));
+    agnosai_agent_with_name(a, str_cat(str_from("Agent "), key));
+    agnosai_agent_with_tools(a, tools);
+    agnosai_agent_with_complexity(a, complexity);
+    if (domain != 0) { agnosai_agent_with_domain(a, domain); }
+    return a;
+}
+
+fn _b_o_task(i): i64 {
+    var t = agnosai_task_new(str_cat(str_from("task-"), str_from_int(i)));
+    agnosai_task_with_context(t, str_from("complexity"),
+      bayan_json_v_str_new(str_from("medium")));
+    var req = bayan_json_v_arr_new();
+    bayan_json_v_arr_push(req, bayan_json_v_str_new(str_from("sql_query")));
+    bayan_json_v_arr_push(req, bayan_json_v_str_new(str_from("report_writer")));
+    agnosai_task_with_context(t, str_from("required_tools"), req);
+    return t;
+}
+
+# `orch.bcyr`'s `_b_o_spec`: three agents and `n_tasks` alike tasks, under `process`.
+fn _b_spec(n_tasks, process): i64 {
+    var c = agnosai_crew_new(str_from("bench-manager"));
+    agnosai_crew_with_agents(c, _b_agents());
+    var tasks = vec_new();
+    for (var i = 0; i < n_tasks; i = i + 1) { vec_push(tasks, _b_o_task(i)); }
+    agnosai_crew_with_tasks(c, tasks);
+    agnosai_crew_with_process(c, process);
+    return c;
+}
+
+fn _b_agents(): i64 {
+    var agents = vec_new();
+    vec_push(agents, _b_o_agent(str_from("a1"), str_from("medium"), str_from("finance"),
+        _b_o_tools("sql_query", "report_writer")));
+    vec_push(agents, _b_o_agent(str_from("a2"), str_from("high"), str_from("devops"),
+        _b_o_tools("docker", "kubectl")));
+    vec_push(agents, _b_o_agent(str_from("a3"), str_from("low"), 0,
+        _b_o_tools("sql_query", 0)));
+    return agents;
+}
+
+# The gateway every bench client talks to, already read: three models, so a run measures the
+# selection a task really makes and never a GET.
+fn _b_catalog_get(client, a, path: Str, out_body): i64 {
+    store64(out_body, str_from("{\"data\":[\
+{\"id\":\"bench-fast\",\"owned_by\":\"openai\",\"pricing\":{\"input_micro_usd_per_1k\":1,\
+\"output_micro_usd_per_1k\":1}},\
+{\"id\":\"bench-capable\",\"owned_by\":\"openai\",\"pricing\":{\"input_micro_usd_per_1k\":5,\
+\"output_micro_usd_per_1k\":5}},\
+{\"id\":\"bench-premium\",\"owned_by\":\"openai\",\"pricing\":{\"input_micro_usd_per_1k\":9,\
+\"output_micro_usd_per_1k\":9}}]}"));
+    return 200;
+}
+
+fn _b_catalog_client(): i64 {
+    return agnosai_hoosh_client_with_get(agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"),
+        str_from("")), &_b_catalog_get);
+}
+
+var _b_stub_body = 0;
+
+fn _b_stub_chat(client, request, out_response, parent_sc): i64 {
+    store64(out_response, agnosai_hoosh_response_from_body(_b_stub_body));
+    return 0;
+}
+
+# A store that keeps nothing: the log's cost to the crew, without the disk's.
+fn _b_n_save(ctx, id, buf, len): i64 { return 0; }
+fn _b_n_load(ctx, id, ob, ol): i64 { return 0; }
+fn _b_n_append(ctx, id, buf, len, sync): i64 { return 0; }
+fn _b_n_read(ctx, id, ob, ol): i64 { return 0; }
+fn _b_n_list(ctx, out): i64 { return 0; }
+fn _b_n_remove(ctx, id): i64 { return 0; }
+
+fn _b_null_store(): i64 {
+    return agnosai_state_store_backend(0, &_b_n_save, &_b_n_load, &_b_n_append, &_b_n_read, &_b_n_list,
+      &_b_n_remove);
+}
+
+# `$TMPDIR`, else `/tmp`, with a directory of this process's own.
+fn _b_dir(): i64 {
+    var base = getenv("TMPDIR");
+    if (base == 0 || strlen(base) == 0) { base = "/tmp"; }
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, base);
+    str_builder_add_cstr(sb, "/agnosai-bench-log.");
+    str_builder_add_int(sb, sys_getpid());
+    return str_builder_build(sb);
+}
+
+fn _b_client(): i64 {
+    return agnosai_hoosh_client_with_chat(
+      agnosai_hoosh_client_new(str_from("http://127.0.0.1:1"), str_from("")), &_b_stub_chat);
+}
+
+# One four-task crew, with a log in `store` or none for 0. Returns the runner.
+fn _b_one(client, store): i64 {
+    var spec = _b_spec(4, agnosai_process_sequential());
+    var r = agnosai_crew_runner_new(spec);
+    agnosai_crew_runner_with_llm(r, client);
+    if (store != 0) {
+        var lerr: i64[1];
+        var log = agnosai_crew_log_open_a(default_alloc(), store, spec, &lerr);
+        if (log == 0) { syscall(60, 1); }
+        agnosai_crew_runner_with_log(r, log);
+    }
+    var err: i64[1];
+    store64(&err, 0);
+    var st = agnosai_crew_runner_run(r, &err);
+    # A crew that did not complete measured nothing it names.
+    if (st == 0 || agnosai_crew_state_status(st) != AGNOSAI_CREW_COMPLETED) { syscall(60, 1); }
+    return r;
+}
+
+fn _b_run(name, store, n, file): i64 {
+    var client = _b_client();
+    var b = bench_new(name);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            var r = _b_one(client, store);
+            # The file store's log goes, so the directory stays one file deep.
+            if (file == 1) { agnosai_state_store_remove(store, agnosai_crew_id(load64(r + AGN_CR_SPEC))); }
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
+# A finished four-task crew's snapshot, in an arena reset each time.
+fn _b_snapshot(): i64 {
+    var n = 50000;
+    var r = _b_one(_b_client(), 0);
+    var ar = arena_allocator_growable(4096);
+    var b = bench_new("crew_snapshot_4_tasks");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            if (agnosai_crew_runner_snapshot_a(ar, r) == 0) { syscall(60, 1); }
+            reset_via(ar);
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
+# A four-task crew's whole log, read back and folded.
+fn _b_read(store): i64 {
+    var n = 2000;
+    var r = _b_one(_b_client(), store);
+    var id = agnosai_crew_id(load64(r + AGN_CR_SPEC));
+    var b = bench_new("crew_log_read_4_tasks");
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            var err: i64[1];
+            var rp = agnosai_crew_log_read(store, id, &err);
+            if (rp == 0 || agnosai_crew_replay_state(rp) == 0) { syscall(60, 1); }
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    agnosai_state_store_remove(store, id);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+    # A catalog to choose models from, as `orch.bcyr` has: without one every task fails at once.
+    agnosai_model_catalog_of(_b_catalog_client());
+    _b_stub_body = str_cat(str_cat(
+        str_from("{\"model\":\"gpt-4o-mini\",\"choices\":[{\"message\":{\"content\":\"done\"}}],"),
+        str_from("\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":500,\"total_tokens\":1500,")),
+      str_from("\"cost_micro_usd\":450,\"provider\":\"openai\"}}"));
+    var dir = _b_dir();
+    var file = agnosai_state_store_new(dir);
+    # The crews first, on a heap no other row has moved: unlogged, then logged.
+    _b_run("crew_log_run_4_task_unlogged", 0, 1000, 0);
+    _b_run("crew_log_run_4_task_null_store", _b_null_store(), 1000, 0);
+    _b_run("crew_log_run_4_task_file_store", file, 200, 1);
+    _b_snapshot();
+    _b_read(file);
+    sys_rmdir(str_data(dir));
+    return 0;
+}
+
+var r = main();
+syscall(60, r);

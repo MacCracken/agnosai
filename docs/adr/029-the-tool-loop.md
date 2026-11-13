@@ -99,6 +99,11 @@ Neither is durable by itself: the chain is in memory, by design (`orch_durable_s
 survives a crash is what a consumer's journal put on disk before returning. agnosai's own durable log is F4. The
 chain holds the tool's name and the effect and never the arguments, as it is kept for good.
 
+> **2.5.0 note** ([ADR 036](036-a-crew-keeps-a-log-and-resumes-from-it.md)): a crew with a log journals each call in it,
+> synced, before any consumer's journal is asked, and a call whose intent the log cannot take does not run. A resume
+> reads an intent with no result, or a result that committed or cannot say, as a call whose effect may stand, and asks
+> a reviewer before its task runs again.
+
 The effect is ADR 025's: `none`, `committed` or `unknown`. turnstone's `partial` and `rolled_back` are not adopted,
 as no tool here can report them.
 

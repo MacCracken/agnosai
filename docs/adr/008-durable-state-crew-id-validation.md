@@ -80,3 +80,7 @@ This follows the precedent of [ADR 007](007-audit-redirect-revalidation.md),
 which closed an SSRF-via-redirect bypass the oracle has. Same shape: a public
 surface where the oracle's safety depended on nobody calling it, tightened with
 the reasoning written down rather than left as a silent divergence.
+
+> **2.5.0 note** ([ADR 036](036-a-crew-keeps-a-log-and-resumes-from-it.md)): `StateStore` is a table of a backend's
+> verbs, and the check moved from the file backend to the verbs themselves, so a backend of a consumer's own, keyed on
+> anything, is held to it too. `list` leaves out an id a backend hands back that the check refuses.
