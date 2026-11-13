@@ -2,9 +2,29 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-11-13 (the 2.5.0 release gate).
+> Last refreshed: 2026-11-13 (the 2.5.1 release gate).
 
-## Now — 2.5.0
+## Now — 2.5.1
+
+| | |
+|---|---|
+| **version** | **2.5.1** (cut 2026-11-13, `version-bump.sh`'s UTC date): the server's own crews live in arenas their orchestrator gives back (ADR 037). A crew from `POST /api/v1/crews`, an A2A delegation or the `delegate` tool goes back once its registry lets it go and no route is reading it; every route that reads one holds it and copies what it renders |
+| **cyrius pin** | **6.7.18**, unchanged, the latest tag |
+| **tests** | **116 suites, 13,262 assertions, 0 failed** under `CYRIUS_DCE=1` with wasmtime 50.0.1, counted from each suite's printed line as well as its exit code. 2.5.0's tree read 13,156: +106, nearly all `orch_crew_arena` (1,380, from 1,288), its REST loop, its holds and its copies, with `server_routes_crews` (211), `server_routes_sse` (40), `server_sse` (59) and `tools_builtin_delegate` (64) grown. **39 mutants, all killed**, in two groups run side by side in copies of the tree: the orchestrator's holds, its give-back and the copy 22, the routes, the stream and the tool 17. The first 37 were killed on the first pass; of the 2 written for the give-back's skipped walk, one got through, a crew forgotten while held whose ended entry no test looked for, closed. Writing them found more first: an answer read once its crew had gone back, which no test made, and a crew read back from its log evicting an owned one |
+| **coverage** | **99%**: 113/113 files, 2,068/2,078 fns (gate `--min 80`), the same 10 unreferenced as 2.5.0. A first run read 2,064/2,078: four new functions only the runs reached, each now named by a test |
+| **dist** | `dist/agnosai.cyr` 51,271 lines + `dist/agnosai-guard.cyr` 1,034, both v2.5.1, by `wc -l` (2.5.0's read 50,921 and 1,034). Sidecars **6 / 1** leaves, unchanged. `[lib]` unchanged, 122 modules |
+| **binary** | `build/agnosai` **3,178,552 B** (2.5.0: 3,166,216). aarch64 **7,237,216 B** (7,237,160), not compacted, built and not started. The native binary answers `/ready` with `"version":"2.5.1"` and exits 0 on SIGTERM |
+| **deps** | Unchanged from 2.5.0: every pin on its latest tag. hoosh at 2.12.3 |
+| **lock** | `cyrius.lock` unchanged: 119 files, 8 commit pins |
+| **gates** | `check-symbols.sh`: 3,641 top-level definitions across 123 files, no duplicates, all prefixed. `check-clean.sh`: fmt and lint 257 files, doc 124, doctest 1, vet, deny, `deps --verify` 119, lib snapshot 113, generated sources, log lengths 256, dist matches src. Fuzz 4/4. The examples run. CI replica (ubuntu:26.04, wasmtime 47.0.3, fresh user, all 8 pins from GitHub): **every `ci.yml` step passed**, 116 suites, 13,232 assertions, 0 failed, coverage, the examples, fuzz and `cyrius bench` |
+| **benchmarks** | Interleaved against a 2.5.0 build on the same `lib/`, three rounds of `server` and `rest_crews` at a load of 2.08: `route_create_crew_*` 92.6 → 109.8 µs (+19%), `route_get_crew_*` 17.1 → 21.7 µs (+27%), the dashboard's routes +10–13%; `rest_get_crew_2_tasks` 2.0 → 6.1 µs, `rest_post_crew_2_tasks` 271 → 288 µs; and what a posted crew keeps, 13,144 → 0 B. A first cut walked the ended queue for every crew given back, 40 µs a post at a full registry (`route_create_crew_*` 144 µs), and the walk is skipped for a crew eviction gives back. The wider A/B of six files before that, at 2.42: median +0.0% across 183 rows, 168 within 5%, the crew runner's rows −2% to +2%. `bench-history.sh` appended 268 rows for 2.5.1 at a starting load of 4.1 |
+| **memory** | `tests/orch_crew_arena.tcyr`'s REST loop, with the registry's cap at 8 so every post past it evicts: a two-task crew posted, read, snapshotted and listed leaves **0 B on the global heap, where 2.5.0 left 13,144** (measured in a 2.5.0 tree, the same loop); an A2A delegation 0 B, where its field list alone was 264; a refused request 0 B, where validation was 152. Its arenas number the registry's cap plus two at most, and are used again. ⚠ **With the server's audit chain on, a crew still keeps 6,360 B**, its entries past the chain's ring of 10,000, which keep their memory: roadmap 2.5.2 |
+| **the holds** | `tests/orch_crew_arena.tcyr`: a crew held past its eviction stays whole until let go and is scrubbed then; one never registered goes back at its last hold; forgotten, it goes back at once, or when let go if held; a consumer's crew is not held and eviction leaves it to its consumer; the registry's ids and a snapshot's are copies; a crew read back from its log at start-up evicts as a registration does; a JSON copy owns its strings; and every route's answer, rendered before its crew is evicted and given back and again after, is the same text. `tests/server_routes_sse.tcyr`: a stream's subscription goes back to the bus, and none is made for a crew that does not exist. `tests/tools_builtin_delegate.tcyr`: a delegated crew is owned, and its id handed back a copy |
+| **build warnings** | Unchanged from 2.5.0: large static data, the DCE note, the two "refusing to overwrite stdlib leaf" lines, and the two `src/tool_loop.cyr` "assigning non-pointer to typed pointer" lines, at 1007 and 1184 |
+| **consumer** | Not re-run. agnostic pins 2.2.4 and builds its own crews, which are its own to give back (ADR 028): nothing changes for it. `agnosai_orchestrator_crew_ids_a` hands out copies now |
+| **upstream filings** | ⚠ **Seven not committed**, so not visible upstream, unchanged from 2.5.0: sigil (RSA over 4096 bits; the lane pool), sandhi (bytes per exchange; chunked bodies; the pooled connection's allocator), bote (MCP client), bayan (its escape one builder call a byte) |
+
+### 2.5.0 — the release (2026-11-13)
 
 | | |
 |---|---|

@@ -91,7 +91,8 @@ agnosai_event_bus_recycle(bus, sub);
   second call is refused only until the arena serves another crew. Reads that race a release are the
   consumer's to prevent, and the engine cannot do it for them.
 - **Negative**: `agnosai_orchestrator_crew_ids_a` hands out registry keys, which for an arena crew are in the
-  arena, so a consumer that both walks the registry and releases crews needs the same care.
+  arena, so a consumer that both walks the registry and releases crews needs the same care. **2.5.1 note**: it
+  hands out copies, in the allocator it is given (ADR 037).
 - **Negative**: a pool keeps what it minted. A burst of held crews stays parked, and an arena that served a
   large crew keeps its chunks. The heap below has no way to give them back.
 - **Negative**: `agnosai_chan_reopen` knows a private offset.
@@ -107,6 +108,9 @@ agnosai_event_bus_recycle(bus, sub);
   - **Telemetry**, with the exporter on: a span per task and per call, on the global heap.
   - **The binary's REST path.** A crew from `POST /api/v1/crews` is on the global heap, and stays. A route
     reads a registry entry with no hold on it, so eviction cannot release under it. That needs a reader count.
+    **2.5.1 note** ([ADR 037](037-the-servers-crews-are-the-orchestrators-to-give-back.md)): it has one. The
+    server's crews live in arenas of the orchestrator's own, which gives each back once its registry lets it go
+    and no route holds it, and the REST loop reads 0 B. A consumer's crews are as this ADR says.
 
 ## Alternatives considered
 

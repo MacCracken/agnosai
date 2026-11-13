@@ -383,9 +383,14 @@ fn agnosai_crew_req_from_value(v): i64 {
 # exposes `has_dependency_cycle` as `pub(crate)` and tests it directly, so the
 # `dep < n` guard is kept exactly as the oracle has it.
 fn agnosai_crew_has_dependency_cycle(tasks): i64 {
+    return agnosai_crew_has_dependency_cycle_a(default_alloc(), tasks);
+}
+
+# `agnosai_crew_has_dependency_cycle`, its marks in `a`.
+fn agnosai_crew_has_dependency_cycle_a(a, tasks): i64 {
     var n = vec_len(tasks);
-    var state = vec_new();
-    for (var i = 0; i < n; i = i + 1) { vec_push(state, 0); }
+    var state = vec_new_a(a);
+    for (var i = 0; i < n; i = i + 1) { vec_push_a(a, state, 0); }
     for (var j = 0; j < n; j = j + 1) {
         if (_agnosai_crew_cycle_visit(j, tasks, state, n) == 1) { return 1; }
     }
@@ -416,36 +421,43 @@ fn _agnosai_crew_cycle_visit(node, tasks, state, n): i64 {
 # still reject the same requests but would report a different message, and the
 # messages are wire-visible.
 fn agnosai_validate_crew_request(r): i64 {
+    return agnosai_validate_crew_request_a(default_alloc(), r);
+}
+
+# `agnosai_validate_crew_request`, with what it works in and the message it answers in `a`: the
+# request's arena, so a valid request costs the global heap nothing (2.5.1). Through 2.5.0 the
+# cycle check's marks were a vec there, 152 B a request for good.
+fn agnosai_validate_crew_request_a(al, r): i64 {
     var name = agnosai_crew_req_name(r);
     if (str_len(name) == 0 || str_len(name) > AGNOSAI_CREW_MAX_STRING_LEN) {
-        return _agnosai_crew_err_len("name must be 1-");
+        return _agnosai_crew_err_len_a(al, "name must be 1-");
     }
 
     var agents = agnosai_crew_req_agents(r);
-    if (vec_len(agents) == 0) { return str_from("at least one agent is required"); }
+    if (vec_len(agents) == 0) { return str_from_a(al, "at least one agent is required"); }
     if (vec_len(agents) > AGNOSAI_CREW_MAX_AGENTS) {
-        var sb = str_builder_new();
-        str_builder_add_cstr(sb, "at most ");
-        str_builder_add_int(sb, AGNOSAI_CREW_MAX_AGENTS);
-        str_builder_add_cstr(sb, " agents allowed");
-        return str_builder_build(sb);
+        var sb = str_builder_new_a(al);
+        str_builder_add_cstr_a(al, sb, "at most ");
+        str_builder_add_int_a(al, sb, AGNOSAI_CREW_MAX_AGENTS);
+        str_builder_add_cstr_a(al, sb, " agents allowed");
+        return str_builder_build_a(al, sb);
     }
 
     var tasks = agnosai_crew_req_tasks(r);
-    if (vec_len(tasks) == 0) { return str_from("at least one task is required"); }
+    if (vec_len(tasks) == 0) { return str_from_a(al, "at least one task is required"); }
     if (vec_len(tasks) > AGNOSAI_CREW_MAX_TASKS) {
-        var sb2 = str_builder_new();
-        str_builder_add_cstr(sb2, "at most ");
-        str_builder_add_int(sb2, AGNOSAI_CREW_MAX_TASKS);
-        str_builder_add_cstr(sb2, " tasks allowed");
-        return str_builder_build(sb2);
+        var sb2 = str_builder_new_a(al);
+        str_builder_add_cstr_a(al, sb2, "at most ");
+        str_builder_add_int_a(al, sb2, AGNOSAI_CREW_MAX_TASKS);
+        str_builder_add_cstr_a(al, sb2, " tasks allowed");
+        return str_builder_build_a(al, sb2);
     }
 
     for (var i = 0; i < vec_len(agents); i = i + 1) {
         var a = vec_get(agents, i);
         if (str_len(agnosai_agent_key(a)) > AGNOSAI_CREW_MAX_STRING_LEN
           || str_len(agnosai_agent_role(a)) > AGNOSAI_CREW_MAX_STRING_LEN) {
-            return _agnosai_crew_err_indexed("agent ", i, ": field exceeds max length");
+            return _agnosai_crew_err_indexed_a(al, "agent ", i, ": field exceeds max length");
         }
     }
 
@@ -453,67 +465,72 @@ fn agnosai_validate_crew_request(r): i64 {
     for (var j = 0; j < n; j = j + 1) {
         var t = vec_get(tasks, j);
         if (str_len(agnosai_task_req_description(t)) > AGNOSAI_CREW_MAX_STRING_LEN) {
-            return _agnosai_crew_err_indexed("task ", j, ": description exceeds max length");
+            return _agnosai_crew_err_indexed_a(al, "task ", j, ": description exceeds max length");
         }
         var deps = agnosai_task_req_dependencies(t);
         for (var k = 0; k < vec_len(deps); k = k + 1) {
             var dep = vec_get(deps, k);
             if (dep >= n) {
-                var sb3 = str_builder_new();
-                str_builder_add_cstr(sb3, "task ");
-                str_builder_add_int(sb3, j);
-                str_builder_add_cstr(sb3, ": dependency index ");
-                str_builder_add_int(sb3, dep);
-                str_builder_add_cstr(sb3, " out of range");
-                return str_builder_build(sb3);
+                var sb3 = str_builder_new_a(al);
+                str_builder_add_cstr_a(al, sb3, "task ");
+                str_builder_add_int_a(al, sb3, j);
+                str_builder_add_cstr_a(al, sb3, ": dependency index ");
+                str_builder_add_int_a(al, sb3, dep);
+                str_builder_add_cstr_a(al, sb3, " out of range");
+                return str_builder_build_a(al, sb3);
             }
             if (dep == j) {
-                return _agnosai_crew_err_indexed("task ", j, ": self-dependency");
+                return _agnosai_crew_err_indexed_a(al, "task ", j, ": self-dependency");
             }
         }
     }
 
-    if (agnosai_crew_has_dependency_cycle(tasks) == 1) {
-        return str_from("task dependencies contain a cycle");
+    if (agnosai_crew_has_dependency_cycle_a(al, tasks) == 1) {
+        return str_from_a(al, "task dependencies contain a cycle");
     }
-    return _agnosai_crew_check_manager(r);
+    return _agnosai_crew_check_manager_a(al, r);
 }
 
 # A hierarchical crew names its manager, one of its own agents, and no other crew names one
 # (2.4.3, ADR 035). Checked last, so every message the Rust line gave comes first, as it did.
 fn _agnosai_crew_check_manager(r): i64 {
+    return _agnosai_crew_check_manager_a(default_alloc(), r);
+}
+
+# `_agnosai_crew_check_manager`, its message in `a`.
+fn _agnosai_crew_check_manager_a(a, r): i64 {
     var manager = agnosai_crew_req_manager(r);
     var p = agnosai_crew_req_process(r);
     var hierarchical = 0;
     if (p != 0 && str_eq_cstr(p, "hierarchical") == 1) { hierarchical = 1; }
     if (hierarchical == 0) {
-        if (manager != 0) { return str_from("manager is only for a hierarchical crew"); }
+        if (manager != 0) { return str_from_a(a, "manager is only for a hierarchical crew"); }
         return 0;
     }
-    if (manager == 0) { return str_from("a hierarchical crew must name its manager"); }
+    if (manager == 0) { return str_from_a(a, "a hierarchical crew must name its manager"); }
     var agents = agnosai_crew_req_agents(r);
     for (var i = 0; i < vec_len(agents); i = i + 1) {
         if (str_eq(agnosai_agent_key(vec_get(agents, i)), manager) == 1) { return 0; }
     }
-    return str_from("manager names no agent in agents");
+    return str_from_a(a, "manager names no agent in agents");
 }
 
 # `name must be 1-{MAX_STRING_LEN} characters`.
-fn _agnosai_crew_err_len(prefix): Str {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, prefix);
-    str_builder_add_int(sb, AGNOSAI_CREW_MAX_STRING_LEN);
-    str_builder_add_cstr(sb, " characters");
-    return str_builder_build(sb);
+fn _agnosai_crew_err_len_a(a, prefix): Str {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, prefix);
+    str_builder_add_int_a(a, sb, AGNOSAI_CREW_MAX_STRING_LEN);
+    str_builder_add_cstr_a(a, sb, " characters");
+    return str_builder_build_a(a, sb);
 }
 
 # `{prefix}{index}{suffix}` — the oracle's `format!("agent {i}: ..")` shape.
-fn _agnosai_crew_err_indexed(prefix, index, suffix): Str {
-    var sb = str_builder_new();
-    str_builder_add_cstr(sb, prefix);
-    str_builder_add_int(sb, index);
-    str_builder_add_cstr(sb, suffix);
-    return str_builder_build(sb);
+fn _agnosai_crew_err_indexed_a(a, prefix, index, suffix): Str {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, prefix);
+    str_builder_add_int_a(a, sb, index);
+    str_builder_add_cstr_a(a, sb, suffix);
+    return str_builder_build_a(a, sb);
 }
 
 # =========================================================================
@@ -537,12 +554,17 @@ var AGNOSAI_CREW_MAX_CONCURRENCY = 64;
 # `agnosai_validate_crew_request` has checked is one of its agents. Through 2.4.2 it got a fresh
 # UUID, the Rust line's `Uuid::new_v4()`, which named no agent, and ran sequentially.
 fn _agnosai_route_process_for(r): i64 {
+    return _agnosai_route_process_for_a(default_alloc(), r);
+}
+
+# `_agnosai_route_process_for`, in allocator `a`: the crew's (ADR 037).
+fn _agnosai_route_process_for_a(a, r): i64 {
     var p = agnosai_crew_req_process(r);
-    if (p == 0) { return agnosai_process_sequential(); }
+    if (p == 0) { return agnosai_process_sequential_a(a); }
     if (str_eq_cstr(p, "hierarchical") == 1) {
-        return agnosai_process_hierarchical(agnosai_crew_req_manager(r));
+        return agnosai_process_hierarchical_a(a, agnosai_crew_req_manager(r));
     }
-    if (str_eq_cstr(p, "dag") == 1) { return agnosai_process_dag(); }
+    if (str_eq_cstr(p, "dag") == 1) { return agnosai_process_dag_a(a); }
     if (str_eq_cstr(p, "parallel") == 1) {
         var n = AGNOSAI_CREW_DEFAULT_CONCURRENCY;
         if (agnosai_crew_req_has_concurrency(r) == 1) {
@@ -550,9 +572,9 @@ fn _agnosai_route_process_for(r): i64 {
         }
         if (n < 1) { n = 1; }
         if (n > AGNOSAI_CREW_MAX_CONCURRENCY) { n = AGNOSAI_CREW_MAX_CONCURRENCY; }
-        return agnosai_process_parallel(n);
+        return agnosai_process_parallel_a(a, n);
     }
-    return agnosai_process_sequential();
+    return agnosai_process_sequential_a(a);
 }
 
 # Build the `CrewSpec` a validated request describes.
@@ -567,15 +589,25 @@ fn _agnosai_route_process_for(r): i64 {
 # kept because the oracle keeps it and because this fn is reachable from a
 # caller that skipped validation.
 fn _agnosai_route_build_spec(r): i64 {
-    var spec = agnosai_crew_new(agnosai_crew_req_name(r));
+    return _agnosai_route_build_spec_in(0, r);
+}
+
+# `_agnosai_route_build_spec`, in crew arena `ca` (ADR 037), or on the global heap for 0. The
+# request `r` must live in the same place: the spec takes its strings and agents as they are.
+fn _agnosai_route_build_spec_in(ca, r): i64 {
+    var a = ca;
+    if (a == 0) { a = default_alloc(); }
+    var spec = 0;
+    if (ca != 0) { spec = agnosai_crew_new_in(ca, agnosai_crew_req_name(r)); }
+    else { spec = agnosai_crew_new(agnosai_crew_req_name(r)); }
     agnosai_crew_with_agents(spec, agnosai_crew_req_agents(r));
-    agnosai_crew_with_process(spec, _agnosai_route_process_for(r));
+    agnosai_crew_with_process(spec, _agnosai_route_process_for_a(a, r));
 
     var reqs = agnosai_crew_req_tasks(r);
-    var tasks = vec_new();
+    var tasks = vec_new_a(a);
     for (var i = 0; i < vec_len(reqs); i = i + 1) {
         var tr = vec_get(reqs, i);
-        var t = agnosai_task_new(agnosai_task_req_description(tr));
+        var t = agnosai_task_new_a(a, agnosai_task_req_description(tr));
         var eo = agnosai_task_req_expected_output(tr);
         if (eo != 0) { agnosai_task_with_expected_output(t, eo); }
         # `if let Some(priority)` — an absent priority leaves Task::new's default
@@ -585,7 +617,7 @@ fn _agnosai_route_build_spec(r): i64 {
         }
         agnosai_task_with_risk(t, agnosai_task_req_risk(tr));
         agnosai_task_with_budget(t, agnosai_task_req_max_tokens(tr), agnosai_task_req_max_cost_micro_usd(tr));
-        vec_push(tasks, t);
+        vec_push_a(a, tasks, t);
     }
 
     for (var j = 0; j < vec_len(reqs); j = j + 1) {
@@ -593,7 +625,7 @@ fn _agnosai_route_build_spec(r): i64 {
         for (var k = 0; k < vec_len(deps); k = k + 1) {
             var idx = vec_get(deps, k);
             if (idx < vec_len(tasks)) {
-                agnosai_task_with_dependency(vec_get(tasks, j),
+                agnosai_task_with_dependency_a(a, vec_get(tasks, j),
                   agnosai_task_id(vec_get(tasks, idx)));
             }
         }
@@ -666,26 +698,46 @@ fn agnosai_route_create_crew_tp_a(a, state, body: Str, tp: Str): i64 {
     if (v == 0) {
         return agnosai_route_error_a(a, HTTP_BAD_REQUEST, str_from_a(a, "malformed JSON body"));
     }
-    var req = agnosai_crew_req_from_value_a(default_alloc(), v);
+    # ⚠ **The crew lives in an arena of its orchestrator's, which gives it back when its registry
+    # lets it go (2.5.1, ADR 037).** Through 2.5.0 it was on the global heap, about 9 KiB a crew for
+    # good. The request is read straight into that arena, as the spec takes its strings and agents
+    # as they are, and an arena no crew came of goes back at once.
+    var o = agnosai_app_state_orchestrator(state);
+    var ca = agnosai_orchestrator_crew_arena(o);
+    var req = agnosai_crew_req_from_value_a(ca, v);
     if (req == 0) {
+        agnosai_crew_arena_give_back(ca);
         return agnosai_route_error_a(a, AGNOSAI_HTTP_UNPROCESSABLE,
           str_from_a(a, "body is not a valid crew run request"));
     }
 
-    var err = agnosai_validate_crew_request(req);
+    var err = agnosai_validate_crew_request_a(a, req);
     if (err != 0) {
         _agnosai_route_crew_warn(agnosai_crew_req_name(req), err);
-        return agnosai_route_error_a(a, HTTP_BAD_REQUEST, err);
+        var why = err;
+        agnosai_crew_arena_give_back(ca);
+        return agnosai_route_error_a(a, HTTP_BAD_REQUEST, why);
     }
 
-    var spec = _agnosai_route_build_spec(req);
-    if (tp != 0) { agnosai_crew_with_trace_parent(spec, tp); }
-    var st = agnosai_orchestrator_run_crew(agnosai_app_state_orchestrator(state), spec);
+    var spec = _agnosai_route_build_spec_in(ca, req);
+    if (tp != 0) { agnosai_crew_with_trace_parent(spec, str_clone_a(ca, tp)); }
+    # Held from here to the answer: the run ends, and another request's crew may evict this one
+    # before the answer is built, and it does not go back while held.
+    var hold = agnosai_orchestrator_own_crew(o, spec);
+    var st = agnosai_orchestrator_run_crew(o, spec);
     if (st == 0) {
         _agnosai_route_crew_run_error(agnosai_crew_req_name(req));
+        agnosai_orchestrator_let_go(o, hold);
         return agnosai_route_error_a(a, HTTP_INTERNAL, str_from_a(a, "crew execution failed"));
     }
+    var out = agnosai_json_copy_a(a, _agnosai_route_crew_run_value_a(a, st));
+    agnosai_orchestrator_let_go(o, hold);
+    return agnosai_route_json_a(a, HTTP_OK, out);
+}
 
+# The answer to `POST /api/v1/crews`, in `a`: the crew's id, status, reason, results and profile. Its
+# strings are the crew's, so a caller copies it before letting the crew go.
+fn _agnosai_route_crew_run_value_a(a, st): i64 {
     var obj = bayan_json_v_obj_new_a(a);
     bayan_json_v_obj_set_a(a, obj, AGN_JK_CREW_ID,
       bayan_json_v_str_new_a(a, agnosai_crew_state_crew_id(st)));
@@ -714,26 +766,19 @@ fn agnosai_route_create_crew_tp_a(a, state, body: Str, tp: Str): i64 {
     # `Option`; same judgement as the unreachable skip in `agents.rs`.
     var prof = agnosai_crew_state_profile(st);
     if (prof != 0) {
-        bayan_json_v_obj_set_a(a, obj, AGN_JK_PROFILE,
-          agnosai_crew_profile_to_value(prof));
+        bayan_json_v_obj_set_a(a, obj, AGN_JK_PROFILE, agnosai_crew_profile_to_value_a(a, prof));
     }
-    return agnosai_route_json_a(a, HTTP_OK, obj);
+    return obj;
 }
 
 # Global-allocator form of `agnosai_route_create_crew_a`.
 #
-# **Two allocators, like `create_definition`.** The body's parse tree and the
-# response go in the request arena; `agnosai_crew_req_from_value_a` is handed
-# `default_alloc()` because `_agnosai_route_build_spec` passes its Strs into
-# the spec and `agnosai_orchestrator_run_crew` registers that spec — the crew
-# outlives the request that created it, which is the whole point of
-# `GET /api/v1/crews/{id}` answering later.
-#
-# **This route cannot approach zero and should not.** Most of what it
-# allocates is the crew *execution* — task results accumulated by
-# `crew_runner` and kept in the registry — which is retained state, not
-# per-request garbage. What moves to the arena is the parse tree and the
-# response.
+# **Two allocators.** The body's parse tree and the response go in the request
+# arena, and the crew, its request read in too, in an arena of its
+# orchestrator's (2.5.1, ADR 037): the crew outlives the request that created
+# it, which is the whole point of `GET /api/v1/crews/{id}` answering later, and
+# goes back when the registry lets it go and no route is reading it. Through
+# 2.5.0 the crew and its request were on the global heap, for good.
 fn agnosai_route_create_crew(state, body: Str): i64 {
     return agnosai_route_create_crew_a(default_alloc(), state, body);
 }
@@ -745,14 +790,12 @@ fn agnosai_route_create_crew(state, body: Str): i64 {
 fn _agnosai_route_crew_warn(name: Str, err: Str): i64 {
     if (sakshi_get_level() < SK_WARN) { return 0; }
     # sakshi carries one key/value per record, so the two the oracle logs are
-    # packed into one — the same shape `_agnosai_lt_log` uses.
-    var sb = str_builder_new();
-    str_builder_add(sb, name);
-    str_builder_add_cstr(sb, " error=");
-    str_builder_add(sb, err);
-    var line = str_builder_build(sb);
-    sakshi_log_kv(SK_WARN, "crew request validation failed", 30, "crew", 4,
-      str_data(line), str_len(line));
+    # packed into one, on this stack: through 2.5.0 the line was built on the
+    # global heap, for good, for every request refused.
+    var f[AGNOSAI_LOG_FIELDS_BYTES];
+    var n = agnosai_log_fields_start(&f, name);
+    n = agnosai_log_field_str(&f, n, "error", err);
+    sakshi_log_kv(SK_WARN, "crew request validation failed", 30, "crew", 4, &f, n);
     return 0;
 }
 
@@ -779,11 +822,17 @@ fn agnosai_route_get_crew_a(a, state, id: Str): i64 {
         return agnosai_route_error_a(a, AGNOSAI_HTTP_UNPROCESSABLE,
           str_from_a(a, "crew id is not a valid UUID"));
     }
-    var c = agnosai_orchestrator_crew(agnosai_app_state_orchestrator(state), key);
+    # Held while it is read, and copied, as a crew its orchestrator owns may go back once the
+    # registry lets it go (ADR 037).
+    var o = agnosai_app_state_orchestrator(state);
+    var hold: i64[1];
+    var c = agnosai_orchestrator_hold_crew(o, key, &hold);
     if (c == 0) {
         return agnosai_route_error_a(a, HTTP_NOT_FOUND, str_from_a(a, "crew not found"));
     }
-    return agnosai_route_json_a(a, HTTP_OK, agnosai_crew_state_to_value_a(a, c));
+    var out = agnosai_json_copy_a(a, agnosai_crew_state_to_value_a(a, c));
+    agnosai_orchestrator_let_go(o, load64(&hold));
+    return agnosai_route_json_a(a, HTTP_OK, out);
 }
 
 # Global-allocator form of `agnosai_route_get_crew_a`.

@@ -277,3 +277,30 @@ fn _agnosai_str_vec_from_value(dst, v): i64 {
     }
     return dst;
 }
+
+# A copy of `v` that owns its every string, keys too, in `a` (ADR 037).
+#
+# A JSON string holds its `Str` by pointer, so a value rendered from a crew points into the crew's
+# memory until it is serialized. A route that reads a crew the orchestrator may give back renders
+# it, copies it with this, and lets go of the crew before it answers. Every kind is rebuilt; a
+# float keeps its bits.
+fn agnosai_json_copy_a(a, v): i64 {
+    if (v == 0 || bayan_json_v_is_null(v) == 1) { return bayan_json_v_null_a(a); }
+    if (bayan_json_v_is_str(v) == 1) { return bayan_json_v_str_new_a(a, str_clone_a(a, bayan_json_v_str(v))); }
+    if (bayan_json_v_is_int(v) == 1) { return bayan_json_v_int_new_a(a, bayan_json_v_int(v)); }
+    if (bayan_json_v_is_bool(v) == 1) { return bayan_json_v_bool_new_a(a, bayan_json_v_bool(v)); }
+    if (bayan_json_v_is_float(v) == 1) { return bayan_json_v_float_new_a(a, bayan_json_v_float(v)); }
+    if (bayan_json_v_is_arr(v) == 1) {
+        var arr = bayan_json_v_arr_new_a(a);
+        for (var i = 0; i < bayan_json_v_arr_len(v); i = i + 1) {
+            bayan_json_v_arr_push_a(a, arr, agnosai_json_copy_a(a, bayan_json_v_arr_get(v, i)));
+        }
+        return arr;
+    }
+    var obj = bayan_json_v_obj_new_a(a);
+    for (var j = 0; j < bayan_json_v_obj_len(v); j = j + 1) {
+        bayan_json_v_obj_set_a(a, obj, str_clone_a(a, bayan_json_v_obj_key(v, j)),
+          agnosai_json_copy_a(a, bayan_json_v_obj_val(v, j)));
+    }
+    return obj;
+}

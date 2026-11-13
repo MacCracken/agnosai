@@ -1026,6 +1026,25 @@ fn _t_task_result_shape(): i64 {
     return 0;
 }
 
+# 2.5.1: validation works, and answers, in the allocator it is given, so a valid request costs the
+# global heap nothing.
+fn _t_validate_in_an_arena(): i64 {
+    var a = arena_allocator_growable(8192);
+    var req = agnosai_crew_req_from_value_a(a, _t_parse(_t_valid_body()));
+    var before = alloc_used();
+    assert_eq(agnosai_validate_crew_request_a(a, req), 0, "a valid request passes, in an arena");
+    assert_eq(alloc_used() - before, 0, "costing the global heap nothing");
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"name\":\"c\",\"agents\":[{\"agent_key\":\"a\",\"name\":\"A\",");
+    str_builder_add_cstr(sb, "\"role\":\"r\",\"goal\":\"g\"}],\"tasks\":[{\"description\":\"x\",");
+    str_builder_add_cstr(sb, "\"dependencies\":[1]},{\"description\":\"y\",\"dependencies\":[0]}]}");
+    var cyc = agnosai_crew_req_from_value_a(a, _t_parse(str_builder_build(sb)));
+    var err = agnosai_validate_crew_request_a(a, cyc);
+    assert(err != 0 && str_contains(err, str_from("cycle")) == 1, "a cycle is refused");
+    assert_eq(agnosai_crew_has_dependency_cycle_a(a, agnosai_crew_req_tasks(cyc)), 1, "as the arena's check finds");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     _t_task_result_shape();
@@ -1069,6 +1088,7 @@ fn main(): i64 {
     _t_crew_req_constructors_take_an_allocator();
     _t_audit_trail_owns_the_crew_name();
 
+    _t_validate_in_an_arena();
     return assert_summary();
 }
 

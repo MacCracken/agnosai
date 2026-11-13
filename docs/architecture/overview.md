@@ -111,6 +111,13 @@ Every move of a task's status goes with the event that reports it under the bus 
 (`GET /api/v1/crews/{id}/snapshot`) reads them under it, so a reader that fell behind takes each task as
 the snapshot says and goes on from the first event after its `seq`.
 
+### The server's own crews (2.5.1, [ADR 037](../adr/037-the-servers-crews-are-the-orchestrators-to-give-back.md))
+
+A crew from `POST /api/v1/crews`, an A2A delegation or the `delegate` tool is built in an arena from its orchestrator's
+own pool and owned by it. Every route that reads one holds it (`agnosai_orchestrator_hold_crew`) and copies what it
+renders before letting go, and the orchestrator gives a crew back once its registry has evicted or forgotten it and
+nothing holds it. A consumer's crews (ADR 028) are its own to give back.
+
 ### Agent Scoring
 
 Five weighted factors (0.0–1.0 each):

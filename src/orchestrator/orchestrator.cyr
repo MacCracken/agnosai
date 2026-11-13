@@ -84,7 +84,10 @@ enum AgnosaiOrchestratorOff {
     AGN_OR_RUNNERS = 144;
     # Where each crew's log goes, or 0 for none (ADR 036).
     AGN_OR_STORE = 152;
-    AGN_OR_SIZE = 160;
+    # The pool the crews this orchestrator owns take their arenas from, made on first use, under
+    # `MUTEX` (ADR 037).
+    AGN_OR_POOL = 160;
+    AGN_OR_SIZE = 168;
 }
 
 # What a tenant has spent, through every crew it ran, and how many of its crews are admitted and
@@ -134,6 +137,7 @@ fn agnosai_orchestrator_new(budget): i64 {
     store64(o + AGN_OR_MAX_TASKS, AGNOSAI_NO_LIMIT);
     store64(o + AGN_OR_RUNNERS, map_new_str());
     store64(o + AGN_OR_STORE, 0);
+    store64(o + AGN_OR_POOL, 0);
     return o;
 }
 
@@ -308,14 +312,14 @@ fn _agnosai_orch_state_snapshot_a(a, state): i64 {
         var res = vec_get(results, i);
         var e = bayan_json_v_obj_new_a(a);
         bayan_json_v_obj_set_a(a, e, str_from_a(a, "task_id"),
-          bayan_json_v_str_new_a(a, agnosai_task_result_task_id(res)));
+          bayan_json_v_str_new_a(a, str_clone_a(a, agnosai_task_result_task_id(res))));
         bayan_json_v_obj_set_a(a, e, str_from_a(a, "status"),
           bayan_json_v_str_new_a(a, agnosai_task_status_to_wire_a(a, agnosai_task_result_status(res))));
         bayan_json_v_arr_push_a(a, list, e);
     }
     var v = bayan_json_v_obj_new_a(a);
     bayan_json_v_obj_set_a(a, v, str_from_a(a, "crew_id"),
-      bayan_json_v_str_new_a(a, agnosai_crew_state_crew_id(state)));
+      bayan_json_v_str_new_a(a, str_clone_a(a, agnosai_crew_state_crew_id(state))));
     bayan_json_v_obj_set_a(a, v, str_from_a(a, "status"),
       bayan_json_v_str_new_a(a, agnosai_crew_status_to_wire_a(a, agnosai_crew_state_status(state))));
     bayan_json_v_obj_set_a(a, v, str_from_a(a, "seq"), bayan_json_v_int_new_a(a, 0));
@@ -335,6 +339,13 @@ fn agnosai_orchestrator_crew_snapshot_a(a, o, crew_id: Str): i64 {
     mutex_lock(mtx);
     var runner = map_get(load64(o + AGN_OR_RUNNERS), crew_id);
     var state = map_get(load64(o + AGN_OR_CREWS), crew_id);
+    # Held while it is read, when the orchestrator owns it (ADR 037): the snapshot copies its
+    # strings, and the hold keeps them from going back meanwhile.
+    var hold = 0;
+    if (runner != 0 && load64(load64(runner + AGN_CR_SPEC) + AGN_CREW_OWNER) == o) {
+        hold = load64(runner + AGN_CR_SPEC);
+        store64(hold + AGN_CREW_HOLDS, load64(hold + AGN_CREW_HOLDS) + 1);
+    }
     mutex_unlock(mtx);
     if (runner == 0 && state == 0) { return 0; }
     # A crew put back from its log after a restart (ADR 036) has no runner and sent no event in
@@ -345,7 +356,9 @@ fn agnosai_orchestrator_crew_snapshot_a(a, o, crew_id: Str): i64 {
     # would wait on a `pending` crew for good.
     var ended = 0 - 1;
     if (state != 0 && _agnosai_orch_is_finished(state) == 1) { ended = agnosai_crew_state_status(state); }
-    return _agnosai_crew_runner_snapshot_ended_a(a, runner, ended);
+    var v = _agnosai_crew_runner_snapshot_ended_a(a, runner, ended);
+    agnosai_orchestrator_let_go(o, hold);
+    return v;
 }
 
 # The ids of every crew the registry holds, as a vec of Str.
@@ -368,8 +381,9 @@ fn agnosai_orchestrator_crew_ids_a(a, o): i64 {
     var ids = vec_new_a(a);
     var n = _agnosai_map_slots(m);
     for (var i = 0; i < n; i = i + 1) {
+        # A copy, in `a`: a key is in its crew's arena, which may go back (ADR 037).
         if (_agnosai_map_slot_live(m, i) == 1) {
-            vec_push_a(a, ids, _agnosai_map_slot_key(m, i));
+            vec_push_a(a, ids, str_clone_a(a, _agnosai_map_slot_key(m, i)));
         }
     }
     mutex_unlock(mtx);
@@ -487,6 +501,13 @@ fn _agnosai_orch_note_ended_locked(o, state): i64 {
 # crews still grows past the cap, as the oracle's does, and costs one comparison per submit
 # rather than a walk of the map.
 fn _agnosai_orch_evict_locked(o, out_ids): i64 {
+    return _agnosai_orch_evict_give_locked(o, default_alloc(), out_ids, 0);
+}
+
+# `_agnosai_orch_evict_locked`, copying each id it pushes onto `out_ids` in `a`, and pushing each
+# owned crew it lets go that nothing holds onto `give`, for its caller to give back once the lock is
+# given back (ADR 037), or 0.
+fn _agnosai_orch_evict_give_locked(o, a, out_ids, give): i64 {
     var crews = load64(o + AGN_OR_CREWS);
     var held = map_size(load64(o + AGN_OR_CANCEL));
     if (map_size(crews) - held < AGNOSAI_MAX_RETAINED_CREWS) { return 0; }
@@ -499,7 +520,9 @@ fn _agnosai_orch_evict_locked(o, out_ids): i64 {
         if (_agnosai_orch_is_current_locked(o, state) == 1) {
             # Its log goes with it, once the lock is given back (ADR 036): the id is copied, as
             # the crew's arena may go back first.
-            if (out_ids != 0) { vec_push(out_ids, str_clone(agnosai_crew_state_crew_id(state))); }
+            if (out_ids != 0) { vec_push_a(a, out_ids, str_clone_a(a, agnosai_crew_state_crew_id(state))); }
+            var er = map_get(load64(o + AGN_OR_RUNNERS), agnosai_crew_state_crew_id(state));
+            if (er != 0) { _agnosai_orch_leave_locked(o, load64(er + AGN_CR_SPEC), give); }
             map_delete(load64(o + AGN_OR_RUNNERS), agnosai_crew_state_crew_id(state));
             map_delete(crews, agnosai_crew_state_crew_id(state));
             evicted = evicted + 1;
@@ -574,6 +597,121 @@ fn _agnosai_orch_level_for(status): i64 {
     if (status == AGNOSAI_CREW_FAILED) { return str_from("error"); }
     if (status == AGNOSAI_CREW_CANCELLED) { return str_from("warn"); }
     return str_from("info");
+}
+
+# ── crews the orchestrator gives back itself (2.5.1, ADR 037) ──────────────
+
+# An arena for a crew this orchestrator will own, from its own pool, made on first use: build the
+# crew in it with `agnosai_crew_new_in` and hand it to `agnosai_orchestrator_own_crew`. One that
+# goes unused goes back with `agnosai_crew_arena_give_back`.
+fn agnosai_orchestrator_crew_arena(o): i64 {
+    var mtx = load64(o + AGN_OR_MUTEX);
+    mutex_lock(mtx);
+    var pool = load64(o + AGN_OR_POOL);
+    if (pool == 0) {
+        pool = agnosai_crew_pool_new(AGNOSAI_CREW_ARENA_BYTES);
+        store64(o + AGN_OR_POOL, pool);
+    }
+    mutex_unlock(mtx);
+    return agnosai_crew_pool_acquire(pool);
+}
+
+# How many arenas the orchestrator's own pool has made, or 0 before its first.
+fn agnosai_orchestrator_crew_arenas_minted(o): i64 {
+    var pool = load64(o + AGN_OR_POOL);
+    if (pool == 0) { return 0; }
+    return agnosai_crew_pool_minted(pool);
+}
+
+# Give `spec`, built in an arena from `agnosai_orchestrator_crew_arena`, to the orchestrator to give
+# back itself, before it is run (ADR 037). Returns a hold on it for the caller, which the caller
+# lets go of with `agnosai_orchestrator_let_go` once it has read what it wants: the crew goes back
+# once nothing holds it and the registry has let it go, evicted or forgotten, or was never given it.
+# A spec on the global heap cannot go back: it is left as it is, and the hold is 0.
+#
+# ⚠ **After the last hold is let go, nothing the crew had is valid**, as after
+# `agnosai_orchestrator_release_crew`, which is what gives it back: its spec, its id, its state.
+# A reader of an owned crew holds it (`agnosai_orchestrator_hold_crew`) for as long as it reads,
+# and copies what it keeps (`agnosai_json_copy_a`).
+fn agnosai_orchestrator_own_crew(o, spec): i64 {
+    if (agnosai_crew_arena(spec) == 0) { return 0; }
+    store64(spec + AGN_CREW_HOLDS, 1);
+    store64(spec + AGN_CREW_PLACED, _AGNOSAI_CREW_UNPLACED);
+    store64(spec + AGN_CREW_OWNER, o);
+    return spec;
+}
+
+# What `AGN_CREW_PLACED` says of an owned crew: not in the registry, never or since it was forgotten;
+# in it; or let go by eviction, which took its one entry off the head of the ended queue.
+var _AGNOSAI_CREW_UNPLACED = 0;
+var _AGNOSAI_CREW_IN_PLACE = 1;
+var _AGNOSAI_CREW_EVICTED = 2;
+
+# The registry lets `spec` go by eviction: when the orchestrator owns it, it is no longer placed, and
+# with nothing holding it, it goes onto `give` to be given back once the lock is given back. The
+# caller holds the lock.
+fn _agnosai_orch_leave_locked(o, spec, give): i64 {
+    if (spec == 0 || load64(spec + AGN_CREW_OWNER) != o) { return 0; }
+    store64(spec + AGN_CREW_PLACED, _AGNOSAI_CREW_EVICTED);
+    if (load64(spec + AGN_CREW_HOLDS) == 0 && give != 0) { vec_push(give, spec); }
+    return 0;
+}
+
+# Give back every crew on `give`, outside the registry lock.
+fn _agnosai_orch_give_back(o, give): i64 {
+    if (give == 0) { return 0; }
+    for (var i = 0; i < vec_len(give); i = i + 1) { _agnosai_orch_give_back_one(o, vec_get(give, i)); }
+    return 0;
+}
+
+# Give back one owned crew. ⚠ **One eviction let go is not looked for in the ended queue**: eviction
+# took its entry off the queue's head, and an owned crew runs once, so it has no other, and the
+# release's walk of the queue, an arena check an entry, would find nothing. Through the first cut of
+# 2.5.1 every give-back walked it, which cost a post 40 µs at a full registry
+# (`route_create_crew_*`). A crew forgotten, or never registered, is looked for as any is.
+fn _agnosai_orch_give_back_one(o, spec): i64 {
+    var purge = 1;
+    if (load64(spec + AGN_CREW_PLACED) == _AGNOSAI_CREW_EVICTED) { purge = 0; }
+    return _agnosai_orch_release(o, spec, purge);
+}
+
+# Read crew `crew_id` with a hold on it (ADR 037). Returns its registered state, or 0 for a crew
+# the registry does not hold, and stores through `out_hold` what `agnosai_orchestrator_let_go` takes:
+# the crew when the orchestrator owns it, held, else 0. A held crew is not given back until let go,
+# though the registry let it go meanwhile. A crew the orchestrator does not own is not held: its
+# consumer gives it back, and says when (ADR 028).
+fn agnosai_orchestrator_hold_crew(o, crew_id: Str, out_hold): i64 {
+    store64(out_hold, 0);
+    var mtx = load64(o + AGN_OR_MUTEX);
+    mutex_lock(mtx);
+    var state = map_get(load64(o + AGN_OR_CREWS), crew_id);
+    if (state != 0) {
+        var runner = map_get(load64(o + AGN_OR_RUNNERS), crew_id);
+        if (runner != 0) {
+            var spec = load64(runner + AGN_CR_SPEC);
+            if (load64(spec + AGN_CREW_OWNER) == o) {
+                store64(spec + AGN_CREW_HOLDS, load64(spec + AGN_CREW_HOLDS) + 1);
+                store64(out_hold, spec);
+            }
+        }
+    }
+    mutex_unlock(mtx);
+    return state;
+}
+
+# Let go of a hold from `agnosai_orchestrator_hold_crew` or `agnosai_orchestrator_own_crew`, 0 for
+# none. The last hold on a crew the registry has let go gives it back.
+fn agnosai_orchestrator_let_go(o, hold): i64 {
+    if (hold == 0) { return 0; }
+    var mtx = load64(o + AGN_OR_MUTEX);
+    mutex_lock(mtx);
+    var n = load64(hold + AGN_CREW_HOLDS) - 1;
+    store64(hold + AGN_CREW_HOLDS, n);
+    var give = 0;
+    if (n == 0 && load64(hold + AGN_CREW_PLACED) != _AGNOSAI_CREW_IN_PLACE) { give = 1; }
+    mutex_unlock(mtx);
+    if (give == 1) { _agnosai_orch_give_back_one(o, hold); }
+    return 0;
 }
 
 # Give a registered crew its log (ADR 036), when the orchestrator has a store: a new one, whose
@@ -675,11 +813,18 @@ fn _agnosai_orch_register_with(o, spec, parent, rp): i64 {
     # the state and no flag: a cancel there was lost, and queued a live crew as ended.
     _agnosai_orch_attach_log(o, runner, spec, rp);
 
+    # Both lists in the new crew's allocator: the ids of the crews eviction lets go, whose logs go,
+    # and the owned crews among them nothing holds, which go back (ADR 037). Logs first, as a crew
+    # given back takes its id with it.
     var dropped = 0;
-    if (load64(o + AGN_OR_STORE) != 0) { dropped = vec_new(); }
+    if (load64(o + AGN_OR_STORE) != 0) { dropped = vec_new_a(a); }
+    var give = 0;
+    if (load64(o + AGN_OR_POOL) != 0) { give = vec_new_a(a); }
     var mtx = load64(o + AGN_OR_MUTEX);
     mutex_lock(mtx);
-    var evicted = _agnosai_orch_evict_locked(o, dropped);
+    var evicted = _agnosai_orch_evict_give_locked(o, a, dropped, give);
+    # An owned crew is placed from here until the registry lets it go (ADR 037).
+    if (load64(spec + AGN_CREW_OWNER) == o) { store64(spec + AGN_CREW_PLACED, _AGNOSAI_CREW_IN_PLACE); }
     var registered = agnosai_crew_state_new_a(a, crew_id, AGNOSAI_CREW_PENDING);
     # The runner moves this state's status while a task awaits a reviewer (ADR 032).
     _agnosai_crew_runner_with_state(runner, registered);
@@ -690,6 +835,7 @@ fn _agnosai_orch_register_with(o, spec, parent, rp): i64 {
     mutex_unlock(mtx);
     _agnosai_orch_log_evicted(evicted);
     _agnosai_orch_drop_logs(o, dropped);
+    _agnosai_orch_give_back(o, give);
 
     var rurl = load64(o + AGN_OR_LLM_URL);
     if (rurl != 0) {
@@ -1226,17 +1372,19 @@ fn _agnosai_orch_restore_ended(o, state): i64 {
     var mtx = load64(o + AGN_OR_MUTEX);
     var dropped = 0;
     if (load64(o + AGN_OR_STORE) != 0) { dropped = vec_new(); }
+    var give = vec_new();
     mutex_lock(mtx);
     if (map_get(load64(o + AGN_OR_CREWS), crew_id) != 0) {
         mutex_unlock(mtx);
         return 0;
     }
-    var evicted = _agnosai_orch_evict_locked(o, dropped);
+    var evicted = _agnosai_orch_evict_give_locked(o, default_alloc(), dropped, give);
     map_set(load64(o + AGN_OR_CREWS), str_clone(crew_id), state);
     _agnosai_orch_note_ended_locked(o, state);
     mutex_unlock(mtx);
     _agnosai_orch_log_evicted(evicted);
     _agnosai_orch_drop_logs(o, dropped);
+    _agnosai_orch_give_back(o, give);
     return 1;
 }
 
@@ -1428,10 +1576,22 @@ fn agnosai_orchestrator_forget_crew(o, crew_id: Str): i64 {
         mutex_unlock(mtx);
         return agnosai_error_other(str_from("crew is still running and cannot be forgotten"));
     }
+    # An owned crew nothing holds goes back once the lock is given back (ADR 037).
+    var owned = 0;
+    var fr = map_get(load64(o + AGN_OR_RUNNERS), crew_id);
+    if (fr != 0 && load64(load64(fr + AGN_CR_SPEC) + AGN_CREW_OWNER) == o) {
+        owned = load64(fr + AGN_CR_SPEC);
+        store64(owned + AGN_CREW_PLACED, _AGNOSAI_CREW_UNPLACED);
+        if (load64(owned + AGN_CREW_HOLDS) != 0) { owned = 0; }
+    }
     map_delete(crews, crew_id);
     map_delete(load64(o + AGN_OR_RUNNERS), crew_id);
     _agnosai_orch_compact_ended_locked(o);
     mutex_unlock(mtx);
+    if (owned != 0) {
+        agnosai_orchestrator_release_crew(o, owned);
+        return 0;
+    }
     # Its log goes with it (ADR 036).
     var store = load64(o + AGN_OR_STORE);
     if (store != 0) {
@@ -1492,6 +1652,12 @@ fn _agnosai_orch_purge_ended_locked(o, a): i64 {
 # The channel is removed here too, as a crew that never ran left its own behind. That closes a
 # subscription, which `agnosai_event_bus_recycle` then takes back.
 fn agnosai_orchestrator_release_crew(o, spec): i64 {
+    return _agnosai_orch_release(o, spec, 1);
+}
+
+# `agnosai_orchestrator_release_crew`, looking in the ended queue for the crew's entries only when
+# `purge` is 1 (ADR 037).
+fn _agnosai_orch_release(o, spec, purge): i64 {
     var crew_id = agnosai_crew_id(spec);
     if (crew_id == 0) {
         return agnosai_error_other(str_from("crew has already been released"));
@@ -1512,7 +1678,7 @@ fn agnosai_orchestrator_release_crew(o, spec): i64 {
     atomic_fence();
     map_delete(load64(o + AGN_OR_CREWS), crew_id);
     map_delete(load64(o + AGN_OR_RUNNERS), crew_id);
-    if (a != 0) { _agnosai_orch_purge_ended_locked(o, a); }
+    if (a != 0 && purge == 1) { _agnosai_orch_purge_ended_locked(o, a); }
     _agnosai_orch_compact_ended_locked(o);
     mutex_unlock(mtx);
 

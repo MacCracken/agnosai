@@ -229,6 +229,17 @@ fn _t_dl_id_is_live_before_the_call_returns(): i64 {
     var seen = agnosai_crew_state_status(crew);
     assert(seen == AGNOSAI_CREW_PENDING || seen == AGNOSAI_CREW_RUNNING,
       "...and not finished — delegate did NOT wait for the crew to finish");
+
+    # 2.5.1 (ADR 037): the crew lives in an arena its orchestrator owns, and gives back once its
+    # registry lets it go; the answer's id is the tool's own copy, not the crew's.
+    var o = agnosai_app_state_orchestrator(st);
+    var runner = map_get(load64(o + AGN_OR_RUNNERS), cid);
+    assert(runner != 0, "the crew has its runner");
+    var spec = load64(runner + AGN_CR_SPEC);
+    assert(agnosai_crew_arena(spec) != 0, "the delegated crew lives in an arena");
+    assert_eq(load64(spec + AGN_CREW_OWNER), o, "which its orchestrator owns");
+    assert_eq(agnosai_crew_arena_holds(agnosai_crew_arena(spec), str_data(cid)), 0,
+      "and the id handed back is a copy, not the crew's");
     return 0;
 }
 

@@ -604,6 +604,24 @@ fn agnosai_event_bus_recycle(bus, sub): i64 {
     return 1;
 }
 
+# The sender for a crew the bus has a channel for, or 0, creating none (2.5.1). What a reader that
+# outlived its crew's channel asks, where `agnosai_event_bus_sender` would mint one for nothing.
+fn agnosai_event_bus_sender_if(bus, crew_id: Str): i64 {
+    var mtx = load64(bus + AGN_EB_MUTEX);
+    mutex_lock(mtx);
+    var tx = map_get(load64(bus + AGN_EB_CHANNELS), crew_id);
+    mutex_unlock(mtx);
+    return tx;
+}
+
+# Close a subscription no sender lists any more, so it can be recycled. One already closed is left.
+fn _agnosai_event_sub_close(sub): i64 {
+    if (sub == 0 || load64(sub + AGN_ER_CLOSED) == 1) { return 0; }
+    chan_close(load64(sub + AGN_ER_CHAN));
+    store64(sub + AGN_ER_CLOSED, 1);
+    return 0;
+}
+
 # Remove a crew's channel — call once the crew is finished.
 #
 # The oracle drops the map's sender, after which any receiver still holding on

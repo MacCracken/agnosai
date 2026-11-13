@@ -55,12 +55,22 @@ fn _agnosai_delegate_schema(a, ctx): i64 {
 # the conversation's arena, which goes back with the task. A task keeps its description by pointer,
 # so the delegated agent would read whatever the next conversation wrote there.
 fn _agnosai_delegate_spec(def, agent_name: Str, task: Str): i64 {
-    var agents = vec_new();
-    vec_push(agents, def);
-    var tasks = vec_new();
-    vec_push(tasks, agnosai_task_new(str_clone(task)));
+    return _agnosai_delegate_spec_in(0, def, agent_name, task);
+}
 
-    var spec = agnosai_crew_new(str_cat(str_from("delegate:"), agent_name));
+# `_agnosai_delegate_spec`, in crew arena `ca` (2.5.1, ADR 037), or on the global heap for 0.
+fn _agnosai_delegate_spec_in(ca, def, agent_name: Str, task: Str): i64 {
+    var a = ca;
+    if (a == 0) { a = default_alloc(); }
+    var agents = vec_new_a(a);
+    vec_push_a(a, agents, def);
+    var tasks = vec_new_a(a);
+    vec_push_a(a, tasks, agnosai_task_new_a(a, str_clone_a(a, task)));
+
+    var name = str_cat_a(a, str_from_a(a, "delegate:"), agent_name);
+    var spec = 0;
+    if (ca != 0) { spec = agnosai_crew_new_in(ca, name); }
+    else { spec = agnosai_crew_new(name); }
     agnosai_crew_with_agents(spec, agents);
     agnosai_crew_with_tasks(spec, tasks);
     return spec;
@@ -76,6 +86,11 @@ fn _agnosai_delegate_spec(def, agent_name: Str, task: Str): i64 {
 # when it delegated**, a ceiling and not a share: the crew runs past this call and its task, and a
 # tracker under the task's would outlive it, so what the crew spends is not recorded above it.
 fn _agnosai_delegate_bounded_spec_a(a, def, agent_name: Str, task: Str, caller, budget, out_held): i64 {
+    return _agnosai_delegate_bounded_spec_in_a(a, 0, def, agent_name, task, caller, budget, out_held);
+}
+
+# `_agnosai_delegate_bounded_spec_a`, the crew in crew arena `ca`, or on the global heap for 0.
+fn _agnosai_delegate_bounded_spec_in_a(a, ca, def, agent_name: Str, task: Str, caller, budget, out_held): i64 {
     store64(out_held, 0);
     var tokens = AGNOSAI_NO_LIMIT;
     var cost = AGNOSAI_NO_LIMIT;
@@ -89,9 +104,11 @@ fn _agnosai_delegate_bounded_spec_a(a, def, agent_name: Str, task: Str, caller, 
         var held = agnosai_tools_withheld_a(a, def, caller);
         store64(out_held, held);
         if (vec_len(held) > 0) { agnosai_log_withheld(caller, def, held); }
-        worker = agnosai_worker_within_a(default_alloc(), def, caller);
+        var wa = ca;
+        if (wa == 0) { wa = default_alloc(); }
+        worker = agnosai_worker_within_a(wa, def, caller);
     }
-    var spec = _agnosai_delegate_spec(worker, agent_name, task);
+    var spec = _agnosai_delegate_spec_in(ca, worker, agent_name, task);
     if (budget != 0) { agnosai_crew_with_budget(spec, tokens, cost); }
     return spec;
 }
@@ -100,7 +117,7 @@ fn _agnosai_delegate_bounded_spec_a(a, def, agent_name: Str, task: Str, caller, 
 # resolve `agent`) and the orchestrator (to submit against).
 fn _agnosai_delegate_execute(ctx, input): i64 {
     # Only the answer goes here. The crew outlives this call, so what it holds stays off this
-    # allocator, and that cost is the crew's (roadmap 2.5.1).
+    # allocator, in the crew's own arena (ADR 037).
     var a = agnosai_tool_input_alloc(input);
     var agent_v = agnosai_tool_input_get(input, str_from_a(a, "agent"));
     if (agent_v == 0 || bayan_json_v_is_str(agent_v) == 0) {
@@ -121,10 +138,16 @@ fn _agnosai_delegate_execute(ctx, input): i64 {
             agent_name));
     }
 
+    # ⚠ **The crew lives in an arena of its orchestrator's, which gives it back when its registry
+    # lets it go (2.5.1, ADR 037).** Through 2.5.0 it, and the copy of the agent it runs, were on the
+    # global heap for good.
+    var orch = agnosai_app_state_orchestrator(ctx);
+    var ca = agnosai_orchestrator_crew_arena(orch);
     var held = 0;
-    var spec = _agnosai_delegate_bounded_spec_a(a, def, agent_name, bayan_json_v_str(task_v),
+    var spec = _agnosai_delegate_bounded_spec_in_a(a, ca, def, agent_name, bayan_json_v_str(task_v),
       agnosai_tool_input_agent(input), agnosai_tool_input_budget(input), &held);
     if (spec == 0) {
+        agnosai_crew_arena_give_back(ca);
         return agnosai_tool_output_err_a(a, str_from_a(a, "the delegating task has no budget left to hand on"));
     }
 
@@ -132,18 +155,22 @@ fn _agnosai_delegate_execute(ctx, input): i64 {
     # which a span may do: only the id is handed on. 0 with telemetry off (ADR 029).
     var sc = agnosai_tool_input_span_ctx(input);
     if (sc != 0) {
-        agnosai_crew_with_trace_parent(spec, agnosai_otlp_span_context_format_a(default_alloc(), sc));
+        agnosai_crew_with_trace_parent(spec, agnosai_otlp_span_context_format_a(ca, sc));
         agnosai_crew_with_delegated(spec, 1);
     }
 
-    var crew_id = agnosai_orchestrator_submit_crew(
-      agnosai_app_state_orchestrator(ctx), spec);
+    # Nothing here reads the crew after it starts, so the hold goes as soon as its id is copied.
+    var hold = agnosai_orchestrator_own_crew(orch, spec);
+    var crew_id = agnosai_orchestrator_submit_crew(orch, spec);
     if (crew_id == 0) {
+        agnosai_orchestrator_let_go(orch, hold);
         return agnosai_tool_output_err_a(a, str_from_a(a, "could not start the delegated crew"));
     }
+    var id = str_clone_a(a, crew_id);
+    agnosai_orchestrator_let_go(orch, hold);
 
     var o = bayan_json_v_obj_new_a(a);
-    bayan_json_v_obj_set_a(a, o, str_from_a(a, "crew_id"), bayan_json_v_str_new_a(a, crew_id));
+    bayan_json_v_obj_set_a(a, o, str_from_a(a, "crew_id"), bayan_json_v_str_new_a(a, id));
     # `pending`, not `running` — the crew is registered and the thread is
     # started, but nothing here waits to see it picked up, so claiming `running`
     # would be a guess. It is the same wire spelling the crew map holds.

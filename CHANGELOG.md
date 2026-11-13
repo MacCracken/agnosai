@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.1] — 2026-11-13
+
+The server's own crews live in arenas its orchestrator gives back, and every route that reads one holds it
+([ADR 037](docs/adr/037-the-servers-crews-are-the-orchestrators-to-give-back.md)).
+
+### ⚠ Behaviour changes
+
+- **A crew the server built is given back once its registry lets it go and no route is reading it**: a crew from
+  `POST /api/v1/crews`, an A2A delegation, or the `delegate` tool. Through 2.5.0 each stayed on the global heap for
+  good, 13,144 B for a two-task crew posted, read, snapshotted and listed, which is now 0. Nothing on the wire changes:
+  an evicted crew already answered 404.
+- **`agnosai_orchestrator_crew_ids_a` hands out copies** of the registry's ids, in the allocator it is given, where it
+  handed out the registry's keys, which for an arena crew are in the crew's arena.
+
+### Added
+
+- **Crews the orchestrator owns**: `agnosai_orchestrator_crew_arena`, an arena from the orchestrator's own pool;
+  `agnosai_orchestrator_own_crew`, which gives it a crew built there and returns a hold for the builder; and
+  `agnosai_orchestrator_crew_arenas_minted`. A crew is given back through `agnosai_orchestrator_release_crew` once its
+  holds are 0 and its registry no longer has it, evicted, forgotten or never registered.
+- **Holds**: `agnosai_orchestrator_hold_crew(o, id, &hold)` reads a registered crew and holds it if the orchestrator
+  owns it, and `agnosai_orchestrator_let_go(o, hold)` lets go. A crew a consumer built is read with no hold, and
+  eviction leaves it to its consumer (ADR 028).
+- `agnosai_json_copy_a`, a copy of a JSON value that owns every string and key; `agnosai_validate_crew_request_a` and
+  `agnosai_crew_has_dependency_cycle_a`; `agnosai_event_bus_sender_if`, a crew's sender without minting one.
+- On the spec, `AGN_CREW_OWNER`, `AGN_CREW_HOLDS` and `AGN_CREW_PLACED`, under the owner's registry lock.
+
+### Changed
+
+- **The routes that read a crew hold it and copy what they render**: `POST` and `GET /api/v1/crews`, the snapshot, the
+  dashboard's two routes and A2A, which serialize after the route returns, copy their answer before letting go; the
+  SSE stream holds its crew for the whole stream; the `delegate` tool until it has copied the crew's id.
+- `POST /api/v1/crews` reads its request into the crew's arena, as the spec takes its strings and agents as they are,
+  and gives the arena back at once for a request it refuses. A2A reads its request into the request arena and copies
+  what the crew keeps.
+
+### Fixed
+
+- **The SSE stream gave nothing back**: each stream minted a subscription, about 2.4 KiB, and its crew's id, on the
+  global heap. It takes the bus's idle subscriptions and gives its own back, and keeps the id on its stack. It also
+  subscribed to a crew that did not exist, which minted a sender and removed the channel of a crew that registered in
+  between: it no longer does.
+- **A valid crew request cost 152 B for good**: the cycle check's marks were a vec on the global heap. Validation and
+  its messages are the request arena's now, and so is A2A's list of allowed fields, which cost 264 B a delegation. A
+  refused request's warning is composed on the stack, where it was a line on the global heap.
+- **With a state store, every registration allocated the list of logs eviction drops on the global heap** (2.5.0); it
+  is the new crew's own now.
+
+### Performance
+
+- **What the server keeps for a crew**: `benches/rest_crews.bcyr` (new, a file of its own as roadmap 2.7.1 asks of
+  crew rows, using only route functions 2.5.0 had, so it runs on both trees) posts a two-task crew with the registry's
+  cap at 8: **2.5.0 kept 13,144 B a crew for good, 2.5.1 keeps 0**. With the server's audit chain on, its entries still
+  keep 6,360 B a crew (roadmap 2.5.2).
+- **What that costs, in time**, interleaved against a 2.5.0 build on the same `lib/`, medians of three at a load of
+  2.08: posting a crew `route_create_crew_*` 92.6 → 109.8 µs (+19%), the arena it takes, scrubbed when it goes back,
+  and the answer's copy; reading one `route_get_crew_*` 17.1 → 21.7 µs (+27%), the copy of what it renders; the
+  dashboard's two routes +10–13%, a hold and a copy a crew; `rest_get_crew_2_tasks` 2.0 → 6.1 µs and
+  `rest_post_crew_2_tasks` 271 → 288 µs. Microseconds a request, against memory that grew with every crew served.
+- **The first cut walked the ended queue for every crew given back**, an arena check an entry, which cost a post at a
+  full registry 40 µs (`route_create_crew_*` 144 µs). A crew eviction gives back skips the walk, as eviction took its
+  one entry off the queue's head (ADR 037).
+- The wider A/B against 2.5.0, four rounds of `orch`, `server`, `core`, `tools`, `crew_log` and `rest_crews` before the
+  walk was skipped, at a mean load of 2.42: median +0.0% across 183 rows, 168 within 5%. The crew runner's rows did
+  not move (`run_crew_*` −2% to +2%).
+
 ## [2.5.0] — 2026-11-13
 
 Durable execution: a crew keeps a log and resumes from it, and a reader that fell behind its events resyncs from a

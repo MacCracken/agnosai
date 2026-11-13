@@ -144,23 +144,44 @@ fn _agnosai_sse_warn(msg, msg_len, key, key_len, val: Str): i64 {
 fn agnosai_sse_crew_stream(state, cfd, id_raw: Str): i64 {
     var a = sandhi_server_request_arena();
     var bus = agnosai_app_state_events(state);
+    var o = agnosai_app_state_orchestrator(state);
 
-    # Cloned onto the global bump on purpose: the frame loop rewinds `a` after
-    # every frame, and this is referenced by all of them.
+    # **On this stack, not the global bump** (2.5.1): the frame loop rewinds `a` after every frame,
+    # and this is referenced by all of them, so through 2.5.0 it was cloned onto the global heap, a
+    # few dozen bytes a stream for good. An id is a UUID's 36 bytes; one longer is cut to the 64 the
+    # buffer holds, and then names no crew.
     # The transport validates before calling (see `src/server/serve.cyr`), so
     # this is defence in depth — but `agnosai_uuid_canonical` answers 0 on a
-    # malformed id and `str_clone(0)` faults, which is too sharp an edge to
-    # leave resting on one caller doing the right thing.
+    # malformed id, which is too sharp an edge to leave resting on one caller
+    # doing the right thing.
     var canon = agnosai_uuid_canonical(id_raw);
     if (canon == 0) { canon = id_raw; }
-    var crew_id = str_clone(canon);
+    var idbuf[64];
+    var idlen = str_len(canon);
+    if (idlen > 64) { idlen = 64; }
+    memcpy(&idbuf, str_data(canon), idlen);
+    var idstr[16];
+    store64(&idstr, &idbuf);
+    store64(&idstr + 8, idlen);
+    var crew_id = &idstr;
 
-    # Order matters and is the oracle's: ask whether the crew exists FIRST,
-    # because `subscribe` creates the channel as a side effect and would make
-    # every id look live.
+    # ⚠ **The crew is held for the stream's life (ADR 037)**: its events point into it, and a crew
+    # its orchestrator owns goes back once the registry lets it go, which can be while the last of
+    # its events wait here to be sent. Held first, so a crew found live cannot go back under the
+    # stream.
+    var hold: i64[1];
+    store64(&hold, 0);
+    if (o != 0) { agnosai_orchestrator_hold_crew(o, crew_id, &hold); }
+
+    # Ask whether the crew exists FIRST: `subscribe` creates the channel as a side effect and would
+    # make every id look live. ⚠ **A crew that does not exist is not subscribed to (2.5.1).** Through
+    # 2.5.0 it was, and its channel then removed, which minted a sender for nothing and removed the
+    # channel of a crew that registered in between. A subscription is the bus's to reuse
+    # (`agnosai_event_bus_recycle`), where through 2.5.0 each stream minted one, about 2.4 KiB for
+    # good.
     var crew_exists = agnosai_event_bus_has(bus, crew_id);
-    var sub = agnosai_event_bus_subscribe(bus, crew_id);
-    if (crew_exists == 0) { agnosai_event_bus_remove(bus, crew_id); }
+    var sub = 0;
+    if (crew_exists == 1) { sub = agnosai_event_bus_subscribe_a(default_alloc(), bus, crew_id); }
 
     if (a != 0) {
         sandhi_server_send_chunked_start_a(a, cfd, HTTP_OK, "text/event-stream",
@@ -182,29 +203,30 @@ fn agnosai_sse_crew_stream(state, cfd, id_raw: Str): i64 {
         # warning, which is the one of the three serialisation paths that does
         # not log.
         var nf = bayan_json_v_obj_new_a(fa);
-        bayan_json_v_obj_set_a(fa, nf, str_from("message"),
-          bayan_json_v_str_new_a(fa, str_from("crew not found")));
-        bayan_json_v_obj_set_a(fa, nf, str_from("crew_id"),
+        bayan_json_v_obj_set_a(fa, nf, str_from_a(fa, "message"),
+          bayan_json_v_str_new_a(fa, str_from_a(fa, "crew not found")));
+        bayan_json_v_obj_set_a(fa, nf, str_from_a(fa, "crew_id"),
           bayan_json_v_str_new_a(fa, crew_id));
-        var ev = agnosai_crew_event_new(crew_id, str_from("error"), nf);
-        _agnosai_sse_frame(fa, cfd, str_from("error"),
-          _agnosai_sse_event_json(fa, ev, str_from("")));
+        var ev = agnosai_crew_event_new_a(fa, crew_id, str_from_a(fa, "error"), nf);
+        _agnosai_sse_frame(fa, cfd, str_from_a(fa, "error"),
+          _agnosai_sse_event_json(fa, ev, str_from_a(fa, "")));
         sandhi_server_send_chunked_end(cfd);
+        if (o != 0) { agnosai_orchestrator_let_go(o, load64(&hold)); }
         return 0;
     }
 
     # `{"message": "SSE stream connected"}`.
     var cd = bayan_json_v_obj_new_a(fa);
-    bayan_json_v_obj_set_a(fa, cd, str_from("message"),
-      bayan_json_v_str_new_a(fa, str_from("SSE stream connected")));
-    var cev = agnosai_crew_event_new(crew_id, str_from("connected"), cd);
-    var cjson = _agnosai_sse_event_json(fa, cev, str_from(""));
+    bayan_json_v_obj_set_a(fa, cd, str_from_a(fa, "message"),
+      bayan_json_v_str_new_a(fa, str_from_a(fa, "SSE stream connected")));
+    var cev = agnosai_crew_event_new_a(fa, crew_id, str_from_a(fa, "connected"), cd);
+    var cjson = _agnosai_sse_event_json(fa, cev, str_from_a(fa, ""));
     if (str_len(cjson) == 0) {
         _agnosai_sse_warn("SSE: failed to serialize connected event", 40,
           "crew_id", 7, crew_id);
-        cjson = str_from("{\"event_type\":\"connected\"}");
+        cjson = str_from_a(fa, "{\"event_type\":\"connected\"}");
     }
-    _agnosai_sse_frame(fa, cfd, str_from("connected"), cjson);
+    _agnosai_sse_frame(fa, cfd, str_from_a(fa, "connected"), cjson);
 
     var last_ping = clock_epoch_secs();
     while (1 == 1) {
@@ -265,7 +287,13 @@ fn agnosai_sse_crew_stream(state, cfd, id_raw: Str): i64 {
         }
     }
 
-    agnosai_event_sender_unsubscribe(agnosai_event_bus_sender(bus, crew_id), sub);
+    # The subscription goes back to the bus once it is closed, and the crew is let go last, as its
+    # events were in the subscription until now.
+    var tx = agnosai_event_bus_sender_if(bus, crew_id);
+    if (tx != 0) { agnosai_event_sender_unsubscribe(tx, sub); }
+    else { _agnosai_event_sub_close(sub); }
+    agnosai_event_bus_recycle(bus, sub);
     sandhi_server_send_chunked_end(cfd);
+    if (o != 0) { agnosai_orchestrator_let_go(o, load64(&hold)); }
     return 0;
 }

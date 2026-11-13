@@ -15,6 +15,9 @@
 # already refused. So `agnosai_orchestrator_crew_ids` takes the id list under
 # the lock and this walks it unlocked, fetching each state as it goes.
 #
+# Each crew is held while its row is read, and what the row renders is copied, as a crew the
+# orchestrator owns may go back once its registry lets it go (2.5.1, ADR 037).
+#
 # **The observable consequence**: a crew that is removed between the id snapshot
 # and its fetch is skipped rather than rendered. A crew whose state *changes*
 # mid-walk renders its newer value, where the oracle would have rendered the
@@ -97,13 +100,16 @@ fn agnosai_route_crew_history_a(a, state): i64 {
     var arr = bayan_json_v_arr_new_a(a);
 
     for (var i = 0; i < vec_len(ids); i = i + 1) {
-        var c = agnosai_orchestrator_crew(o, vec_get(ids, i));
+        # Held while it is read, its id copied, as a crew its orchestrator owns may go back once
+        # the registry lets it go (ADR 037).
+        var hold: i64[1];
+        var c = agnosai_orchestrator_hold_crew(o, vec_get(ids, i), &hold);
         # Skipped rather than rendered when the crew left between the snapshot
         # and this fetch — see the module header.
         if (c != 0) {
             var obj = bayan_json_v_obj_new_a(a);
             bayan_json_v_obj_set_a(a, obj, AGN_JK_CREW_ID,
-              bayan_json_v_str_new_a(a, agnosai_crew_state_crew_id(c)));
+              bayan_json_v_str_new_a(a, str_clone_a(a, agnosai_crew_state_crew_id(c))));
             bayan_json_v_obj_set_a(a, obj, AGN_JK_STATUS,
               bayan_json_v_str_new_a(a,
                 _agnosai_route_status_debug_a(a, agnosai_crew_state_status(c))));
@@ -123,6 +129,7 @@ fn agnosai_route_crew_history_a(a, state): i64 {
               bayan_json_v_float_new_a(a, agnosai_micro_usd_to_f64(micro)));
             bayan_json_v_arr_push_a(a, arr, obj);
         }
+        agnosai_orchestrator_let_go(o, load64(&hold));
     }
     return agnosai_route_json_a(a, HTTP_OK, arr);
 }
@@ -151,7 +158,9 @@ fn agnosai_route_agent_performance_a(a, state): i64 {
     var seen = map_new_str_a(a);
     var arr = bayan_json_v_arr_new_a(a);
     for (var i = 0; i < vec_len(ids); i = i + 1) {
-        var c = agnosai_orchestrator_crew(o, vec_get(ids, i));
+        # Held while it is read, and what it renders copied (ADR 037).
+        var hold: i64[1];
+        var c = agnosai_orchestrator_hold_crew(o, vec_get(ids, i), &hold);
         if (c != 0) {
             var results = agnosai_crew_state_results(c);
             for (var j = 0; j < vec_len(results); j = j + 1) {
@@ -160,18 +169,19 @@ fn agnosai_route_agent_performance_a(a, state): i64 {
                 # The oracle's `if let Some(agent_key) = .. && seen.insert(..)`:
                 # no agent key, or one already recorded, contributes nothing.
                 if (str_len(key) > 0 && map_has(seen, key) == 0) {
-                    map_set(seen, str_clone_a(a, key), 1);
+                    var own = str_clone_a(a, key);
+                    map_set(seen, own, 1);
                     var obj = bayan_json_v_obj_new_a(a);
                     bayan_json_v_obj_set_a(a, obj, AGN_JK_AGENT_KEY,
-                      bayan_json_v_str_new_a(a, key));
+                      bayan_json_v_str_new_a(a, own));
 
                     var name = _agnosai_route_meta_str_a(a, meta, AGN_JK_AGENT_NAME);
                     if (str_len(name) == 0) { name = key; }
                     bayan_json_v_obj_set_a(a, obj, AGN_JK_NAME,
-                      bayan_json_v_str_new_a(a, name));
+                      bayan_json_v_str_new_a(a, str_clone_a(a, name)));
                     bayan_json_v_obj_set_a(a, obj, AGN_JK_ROLE,
-                      bayan_json_v_str_new_a(a,
-                        _agnosai_route_meta_str_a(a, meta, AGN_JK_AGENT_ROLE)));
+                      bayan_json_v_str_new_a(a, str_clone_a(a,
+                          _agnosai_route_meta_str_a(a, meta, AGN_JK_AGENT_ROLE))));
                     # Hardcoded 0 in the oracle. See the fn header.
                     bayan_json_v_obj_set_a(a, obj, AGN_JK_TOOL_COUNT,
                       bayan_json_v_int_new_a(a, 0));
@@ -179,6 +189,7 @@ fn agnosai_route_agent_performance_a(a, state): i64 {
                 }
             }
         }
+        agnosai_orchestrator_let_go(o, load64(&hold));
     }
     return agnosai_route_json_a(a, HTTP_OK, arr);
 }

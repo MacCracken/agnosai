@@ -211,6 +211,8 @@ fn main(): i64 {
     assert_eq(agnosai_event_bus_has(agnosai_app_state_events(s1), str_from(_T_UNKNOWN)), 0,
       "and the bus is NOT left holding an entry for a crew that does not exist");
     assert_eq(agnosai_event_bus_len(agnosai_app_state_events(s1)), 0, "so it stays empty");
+    assert_eq(_agnosai_event_bus_take_idle(agnosai_app_state_events(s1)), 0,
+      "and no subscription was made for it, to give back (2.5.1)");
 
     # --- oracle: `sse_endpoint_returns_event_stream_content_type` -----------
     # Same call, asserted for what that test asserts: the status and the type.
@@ -235,6 +237,11 @@ fn main(): i64 {
     _t_has(live, _T_CREW, "and the crew id");
     _t_lacks(live, "crew not found", "and never claims the crew is missing");
     _t_lacks(live, "id: ", "and the connected frame carries no id: it is no crew event (ADR 032)");
+    # 2.5.1: the stream's subscription goes back to the bus as it ends, and the next is that one.
+    var reused = _agnosai_event_bus_take_idle(bus);
+    assert_neq(reused, 0, "a stream's subscription goes back to the bus when the stream ends");
+    assert_eq(agnosai_event_sub_closed(reused), 0, "open again, for the next stream to take");
+    agnosai_event_bus_recycle(bus, reused);
 
     # --- past the oracle: a crew event's frame carries its seq as `id:` (ADR 032) ---
     var s5 = _t_state();

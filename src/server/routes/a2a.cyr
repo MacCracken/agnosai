@@ -82,14 +82,20 @@ fn agnosai_a2a_req_metadata(r): i64 { return load64(r + AGN_A2A_METADATA); }
 
 # The fields serde accepts. `A2ARequest` is `deny_unknown_fields` (`a2a.rs:34`).
 fn _agnosai_a2a_fields(): i64 {
-    var f = agnosai_route_fields();
-    agnosai_route_field(f, "task_id");
-    agnosai_route_field(f, "description");
-    agnosai_route_field(f, "domain");
-    agnosai_route_field(f, "size");
-    agnosai_route_field(f, "preset");
-    agnosai_route_field(f, "callback_url");
-    agnosai_route_field(f, "metadata");
+    return _agnosai_a2a_fields_a(default_alloc());
+}
+
+# `_agnosai_a2a_fields`, in `a`, the request's (2.5.1): through 2.5.0 the list was built on the
+# global heap for every request, 264 B each for good, as the crews route's had been until 2.2.x.
+fn _agnosai_a2a_fields_a(a): i64 {
+    var f = agnosai_route_fields_a(a);
+    agnosai_route_field_a(a, f, "task_id");
+    agnosai_route_field_a(a, f, "description");
+    agnosai_route_field_a(a, f, "domain");
+    agnosai_route_field_a(a, f, "size");
+    agnosai_route_field_a(a, f, "preset");
+    agnosai_route_field_a(a, f, "callback_url");
+    agnosai_route_field_a(a, f, "metadata");
     return f;
 }
 
@@ -101,7 +107,7 @@ fn _agnosai_a2a_fields(): i64 {
 # it is why the size cap below exists.
 fn agnosai_a2a_req_from_value_a(a, v): i64 {
     if (bayan_json_v_is_obj(v) == 0) { return 0; }
-    if (agnosai_route_no_unknown_fields(v, _agnosai_a2a_fields()) == 0) { return 0; }
+    if (agnosai_route_no_unknown_fields(v, _agnosai_a2a_fields_a(a)) == 0) { return 0; }
 
     var tid = bayan_json_v_obj_get_by_cstr(v, "task_id");
     if (tid == 0 || bayan_json_v_is_str(tid) == 0) { return 0; }
@@ -181,7 +187,8 @@ fn agnosai_route_a2a_receive_tp_a(a, state, body: Str, tp: Str): i64 {
     if (v == 0) {
         return agnosai_route_error_a(a, HTTP_BAD_REQUEST, str_from_a(a, "malformed JSON body"));
     }
-    var req = agnosai_a2a_req_from_value_a(default_alloc(), v);
+    # The request is the request arena's; what the crew keeps of it is copied into the crew's.
+    var req = agnosai_a2a_req_from_value_a(a, v);
     if (req == 0) {
         return agnosai_route_error_a(a, AGNOSAI_HTTP_UNPROCESSABLE,
           str_from_a(a, "body is not a valid A2A request"));
@@ -214,22 +221,30 @@ fn agnosai_route_a2a_receive_tp_a(a, state, body: Str, tp: Str): i64 {
         }
     }
 
+    # ⚠ **The crew lives in an arena of its orchestrator's, which gives it back when its registry
+    # lets it go (2.5.1, ADR 037)**, as `POST /api/v1/crews`'s does. Through 2.5.0 it was on the
+    # global heap for good.
+    var o = agnosai_app_state_orchestrator(state);
+    var ca = agnosai_orchestrator_crew_arena(o);
+
     # `format!("a2a-{}-{}", domain.unwrap_or("general"), task_id)`.
-    var name = str_builder_new();
-    str_builder_add_cstr(name, "a2a-");
+    var name = str_builder_new_a(ca);
+    str_builder_add_cstr_a(ca, name, "a2a-");
     var dom = agnosai_a2a_req_domain(req);
-    if (dom == 0) { str_builder_add_cstr(name, "general"); }
-    if (dom != 0) { str_builder_add_str(name, dom); }
-    str_builder_add_cstr(name, "-");
-    str_builder_add_str(name, tid);
+    if (dom == 0) { str_builder_add_cstr_a(ca, name, "general"); }
+    if (dom != 0) { str_builder_add_a(ca, name, dom); }
+    str_builder_add_cstr_a(ca, name, "-");
+    str_builder_add_a(ca, name, tid);
 
     # One task, and **an empty agent list** — the oracle builds `CrewSpec::new`
     # and sets only `tasks`, leaving `agents` at its default.
-    var spec = agnosai_crew_new(str_builder_build(name));
-    var tasks = vec_new();
-    vec_push(tasks, agnosai_task_new(agnosai_a2a_req_description(req)));
+    var spec = agnosai_crew_new_in(ca, str_builder_build_a(ca, name));
+    var tasks = vec_new_a(ca);
+    vec_push_a(ca, tasks, agnosai_task_new_a(ca, str_clone_a(ca, agnosai_a2a_req_description(req))));
     agnosai_crew_with_tasks(spec, tasks);
-    if (tp != 0) { agnosai_crew_with_trace_parent(spec, tp); }
+    if (tp != 0) { agnosai_crew_with_trace_parent(spec, str_clone_a(ca, tp)); }
+    # Held from here to the answer, as another request's crew may evict this one meanwhile.
+    var hold = agnosai_orchestrator_own_crew(o, spec);
 
     # ⚠ **The oracle sends the orchestrator's OWN error** — `a2a.rs:182` is
     # `error: Some(e.to_string())`, so the delegating system learns *why* its
@@ -239,12 +254,12 @@ fn agnosai_route_a2a_receive_tp_a(a, state, body: Str, tp: Str): i64 {
     # is not an error field.
     var run_err: i64[1];
     store64(&run_err, 0);
-    var st = agnosai_orchestrator_run_crew_err(agnosai_app_state_orchestrator(state),
-      spec, &run_err);
+    var st = agnosai_orchestrator_run_crew_err(o, spec, &run_err);
     if (st == 0) {
         var why = str_from_a(a, "crew execution failed");
-        if (load64(&run_err) != 0) { why = agnosai_error_message(load64(&run_err)); }
+        if (load64(&run_err) != 0) { why = str_clone_a(a, agnosai_error_message(load64(&run_err))); }
         _agnosai_a2a_warn("A2A crew execution failed", 25, tid);
+        agnosai_orchestrator_let_go(o, hold);
         return _agnosai_a2a_failed_a(a, HTTP_INTERNAL, tid, why);
     }
 
@@ -254,11 +269,13 @@ fn agnosai_route_a2a_receive_tp_a(a, state, body: Str, tp: Str): i64 {
         var res = vec_get(results, i);
         var e = bayan_json_v_obj_new_a(a);
         bayan_json_v_obj_set_a(a, e, AGN_JK_TASK_ID,
-          bayan_json_v_str_new_a(a, agnosai_task_result_task_id(res)));
+          bayan_json_v_str_new_a(a, str_clone_a(a, agnosai_task_result_task_id(res))));
         bayan_json_v_obj_set_a(a, e, AGN_JK_OUTPUT,
-          bayan_json_v_str_new_a(a, agnosai_task_result_output(res)));
+          bayan_json_v_str_new_a(a, str_clone_a(a, agnosai_task_result_output(res))));
         bayan_json_v_arr_push_a(a, arr, e);
     }
+    # Every string the answer takes from the crew is a copy now, so it may go.
+    agnosai_orchestrator_let_go(o, hold);
     var result = bayan_json_v_obj_new_a(a);
     bayan_json_v_obj_set_a(a, result, AGN_JK_TASKS, arr);
 
@@ -287,15 +304,10 @@ fn agnosai_route_a2a_receive_tp_a(a, state, body: Str, tp: Str): i64 {
 # because the description reaches the registered `CrewState` as a task
 # result's output and the task id reaches the audit trail.
 #
-# **The crew name must be *built* globally, and it is `str_builder_build` that
-# decides that — not `str_builder_new`.** The builder's scratch buffer can live
-# anywhere; `build` allocates the finished Str and copies into it, so a bare
-# `str_builder_build` yields a global Str however the builder was created.
-# Moving `str_builder_new` to the arena changes nothing and a mutation proves
-# it; moving `str_builder_build` there fails immediately, because
-# `_agnosai_orch_register` hands the name to `agnosai_audit_record`, which
-# stores its message **without cloning**. A tamper-evident log holding reclaimed
-# bytes is the worst version of this bug.
+# The request is read into the request arena, and the crew built in an arena of its orchestrator's
+# that goes back once its registry lets it go (2.5.1, ADR 037). Through 2.5.0 the request, and the
+# crew's name with it, were read onto the global heap, because the audit chain kept the name
+# without copying it; the chain copies every string it keeps now.
 fn agnosai_route_a2a_receive(state, body: Str): i64 {
     return agnosai_route_a2a_receive_a(default_alloc(), state, body);
 }

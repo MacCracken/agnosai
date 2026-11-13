@@ -56,6 +56,19 @@ include "src/orchestrator/approval.cyr"
 include "src/orchestrator/crew_runner.cyr"
 include "src/crew_arena.cyr"
 include "src/orchestrator/orchestrator.cyr"
+# The server's own routes, for the REST path's loop (2.5.1, ADR 037).
+include "src/learning/mod.cyr"
+include "src/llm/mod.cyr"
+include "src/server/auth.cyr"
+include "src/guarded_fetch.cyr"
+include "src/sandbox/mod.cyr"
+include "src/tools/mod.cyr"
+include "src/orchestrator/mod.cyr"
+include "src/server/state.cyr"
+include "src/server/routes/mod.cyr"
+include "src/server/routes/dashboard.cyr"
+include "src/server/routes/crews.cyr"
+include "src/server/routes/a2a.cyr"
 include "tests/test_helpers.cyr"
 
 fn _t_budget(): i64 {
@@ -929,6 +942,293 @@ fn _t_live_suite(): i64 {
     return 0;
 }
 
+# ── the server's own crews: the REST path (2.5.1, ADR 037) ─────────────────
+
+# A two-task request, as a client posts it.
+fn _t_rest_body(): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"name\":\"rest-crew\",\"agents\":[{\"agent_key\":\"tester\",");
+    str_builder_add_cstr(sb, "\"name\":\"Tester\",\"role\":\"tester\",\"goal\":\"test things\"}],");
+    str_builder_add_cstr(sb, "\"tasks\":[{\"description\":\"one\"},{\"description\":\"two\",");
+    str_builder_add_cstr(sb, "\"dependencies\":[0]}],\"process\":\"dag\"}");
+    return str_builder_build(sb);
+}
+
+fn _t_rest_state(o): i64 {
+    return agnosai_app_state_new(o, agnosai_tool_registry_new(), agnosai_auth_config_new(),
+      load64(o + AGN_OR_EVENTS), 0, agnosai_orchestrator_approval_gate(o));
+}
+
+# One request's worth, in request arena `ra`, reset after: post a crew, read it, its snapshot and
+# the dashboard, as a client of the binary would. Returns the crew's status word's first byte, or 0.
+fn _t_rest_cycle(state, ra, body): i64 {
+    var r = agnosai_route_create_crew_tp_a(ra, state, body, 0);
+    var ok = 0;
+    if (agnosai_route_status(r) == HTTP_OK) {
+        var id = bayan_json_v_str(bayan_json_v_obj_get_by_cstr(agnosai_route_body(r), "crew_id"));
+        var g = agnosai_route_get_crew_a(ra, state, id);
+        var sn = agnosai_route_crew_snapshot_a(ra, state, id);
+        agnosai_route_crew_history_a(ra, state);
+        if (agnosai_route_status(g) == HTTP_OK && agnosai_route_status(sn) == HTTP_OK) { ok = 1; }
+    }
+    reset_via(ra);
+    return ok;
+}
+
+# How many bytes `rounds` requests leave on the global heap, after enough to fill the registry
+# to its cap and have eviction give crews back, and to bring the registry's queue of ended crews to
+# its high-water mark: it is compacted once its head reaches 1,024, so its vec grows to about that
+# and no further.
+var _T_REST_WARM = 1100;
+
+fn _t_rest_growth(state, ra, body, rounds): i64 {
+    for (var w = 0; w < _T_REST_WARM; w = w + 1) { _t_rest_cycle(state, ra, body); }
+    var before = alloc_used();
+    var bad = 0;
+    for (var i = 0; i < rounds; i = i + 1) {
+        if (_t_rest_cycle(state, ra, body) == 0) { bad = bad + 1; }
+    }
+    assert_eq(bad, 0, "every request answers, and its crew reads back");
+    return alloc_used() - before;
+}
+
+# One A2A delegation, in `ra`, reset after.
+fn _t_a2a_cycle(state, ra, body): i64 {
+    var r = agnosai_route_a2a_receive_tp_a(ra, state, body, 0);
+    var ok = 0;
+    if (agnosai_route_status(r) == HTTP_OK) { ok = 1; }
+    reset_via(ra);
+    return ok;
+}
+
+# ── the copy a route answers with (ADR 037) ────────────────────────────────
+
+fn _t_copy_suite(): i64 {
+    var src = str_cat(str_from("{\"s\":\"text\",\"i\":-7,\"t\":true,\"f\":false,\"n\":null,"),
+      str_from("\"x\":0.5,\"a\":[1,\"two\",{}],\"o\":{\"k\":\"v\"}}"));
+    var from = arena_allocator_growable(4096);
+    var v = bayan_json_v_parse_buf_a(from, str_data(src), str_len(src));
+    var to = arena_allocator_growable(4096);
+    var c = agnosai_json_copy_a(to, v);
+    assert(str_eq(bayan_json_v_build(c), bayan_json_v_build(v)) == 1, "a copy renders as what it copied");
+    var text = bayan_json_v_build(v);
+    reset_via(from);
+    assert(str_eq(bayan_json_v_build(c), text) == 1, "and still does once the original's memory is gone");
+    assert_eq(agnosai_crew_arena_is(to), 0, "into any allocator it is given");
+    return 0;
+}
+
+# ── holds on a crew its orchestrator owns (ADR 037) ────────────────────────
+
+# An owned crew, built and run as the server builds and runs one. Returns its spec; its hold goes
+# through `out_hold`.
+fn _t_owned(o, out_hold): i64 {
+    var a = agnosai_orchestrator_crew_arena(o);
+    var spec = _t_spec(a, _T_SEQ, 1, 0);
+    store64(out_hold, agnosai_orchestrator_own_crew(o, spec));
+    agnosai_orchestrator_run_crew(o, spec);
+    return spec;
+}
+
+fn _t_holds_suite(): i64 {
+    var cap = AGNOSAI_MAX_RETAINED_CREWS;
+    var low = AGNOSAI_CREWS_LOW_WATER;
+    AGNOSAI_MAX_RETAINED_CREWS = 4;
+    AGNOSAI_CREWS_LOW_WATER = 2;
+    var bus = agnosai_event_bus_new();
+    var o = _t_new_orch(bus);
+
+    # A crew held past its eviction is given back only when let go.
+    var h0: i64[1];
+    var held = _t_owned(o, &h0);
+    var id = str_clone(agnosai_crew_id(held));
+    var reader: i64[1];
+    assert(agnosai_orchestrator_hold_crew(o, id, &reader) != 0, "a registered owned crew can be held");
+    assert_eq(load64(&reader), held, "and the hold is the crew");
+    agnosai_orchestrator_let_go(o, load64(&h0));
+    for (var i = 0; i < 6; i = i + 1) {
+        var hi: i64[1];
+        _t_owned(o, &hi);
+        agnosai_orchestrator_let_go(o, load64(&hi));
+    }
+    assert_eq(agnosai_orchestrator_crew(o, id), 0, "past the cap the held crew is evicted");
+    assert(str_eq(agnosai_crew_id(held), id) == 1, "and, held, it is still whole");
+    var hn: i64[1];
+    assert_eq(agnosai_orchestrator_hold_crew(o, id, &hn), 0, "an evicted crew cannot be held again");
+    agnosai_orchestrator_let_go(o, load64(&reader));
+    assert_eq(agnosai_crew_id(held), 0, "let go, it is given back: its memory is scrubbed");
+
+    # A crew that never reached the registry is given back when its last hold goes.
+    var a2 = agnosai_orchestrator_crew_arena(o);
+    var never = _t_spec(a2, _T_SEQ, 1, 0);
+    var hv = agnosai_orchestrator_own_crew(o, never);
+    agnosai_orchestrator_let_go(o, hv);
+    assert_eq(agnosai_crew_id(never), 0, "an owned crew never registered goes back at its last hold");
+
+    # Forgotten, an owned crew nothing holds goes back at once, and a held one when let go.
+    var hf: i64[1];
+    var fsp = _t_owned(o, &hf);
+    var fid = str_clone(agnosai_crew_id(fsp));
+    var farena = agnosai_crew_arena(fsp);
+    agnosai_orchestrator_let_go(o, load64(&hf));
+    assert_eq(_t_ended_in(o, farena), 1, "a finished crew waits in the ended queue");
+    assert_eq(agnosai_orchestrator_forget_crew(o, fid), 0, "an owned crew is forgotten");
+    assert_eq(agnosai_crew_id(fsp), 0, "and, with nothing holding it, given back");
+    assert_eq(_t_ended_in(o, farena), 0, "and the ended queue keeps no entry in the arena it gave back");
+    var hg: i64[1];
+    var gsp = _t_owned(o, &hg);
+    var gid = str_clone(agnosai_crew_id(gsp));
+    var garena = agnosai_crew_arena(gsp);
+    agnosai_orchestrator_forget_crew(o, gid);
+    assert(str_eq(agnosai_crew_id(gsp), gid) == 1, "one forgotten while held stays whole");
+    agnosai_orchestrator_let_go(o, load64(&hg));
+    assert_eq(agnosai_crew_id(gsp), 0, "until it is let go");
+    assert_eq(_t_ended_in(o, garena), 0, "and the ended queue keeps no entry in its arena either");
+
+    # A crew the orchestrator does not own is not held, and eviction leaves it to its consumer.
+    var pool = agnosai_crew_pool_new(AGNOSAI_CREW_ARENA_BYTES);
+    var ca = agnosai_crew_pool_acquire(pool);
+    var theirs = _t_spec(ca, _T_SEQ, 1, 0);
+    agnosai_orchestrator_run_crew(o, theirs);
+    var tid = str_clone(agnosai_crew_id(theirs));
+    var ht: i64[1];
+    assert(agnosai_orchestrator_hold_crew(o, tid, &ht) != 0, "a consumer's crew reads");
+    assert_eq(load64(&ht), 0, "with no hold taken");
+    for (var j = 0; j < 6; j = j + 1) {
+        var hj: i64[1];
+        _t_owned(o, &hj);
+        agnosai_orchestrator_let_go(o, load64(&hj));
+    }
+    assert_eq(agnosai_orchestrator_crew(o, tid), 0, "evicted");
+    assert(str_eq(agnosai_crew_id(theirs), tid) == 1, "and left whole, for its consumer to give back (ADR 028)");
+    agnosai_orchestrator_release_crew(o, theirs);
+
+    # The registry's ids are copies, not its keys in each crew's arena.
+    var hk: i64[1];
+    var ksp = _t_owned(o, &hk);
+    var ra = arena_allocator_growable(4096);
+    var ids = agnosai_orchestrator_crew_ids_a(ra, o);
+    var inside = 0;
+    for (var k = 0; k < vec_len(ids); k = k + 1) {
+        if (agnosai_crew_arena_holds(agnosai_crew_arena(ksp), vec_get(ids, k)) == 1) { inside = 1; }
+    }
+    assert(vec_len(ids) > 0, "the registry lists its crews");
+    assert_eq(inside, 0, "by copies, which a crew going back cannot scrub");
+    agnosai_orchestrator_let_go(o, load64(&hk));
+
+    # A snapshot of an owned crew is a copy too.
+    var hs: i64[1];
+    var ssp = _t_owned(o, &hs);
+    var snap = agnosai_orchestrator_crew_snapshot_a(ra, o, agnosai_crew_id(ssp));
+    var sid = bayan_json_v_str(bayan_json_v_obj_get_by_cstr(snap, "crew_id"));
+    assert(str_eq(sid, agnosai_crew_id(ssp)) == 1, "a snapshot names its crew");
+    assert_eq(agnosai_crew_arena_holds(agnosai_crew_arena(ssp), str_data(sid)), 0, "by a copy of its id");
+    agnosai_orchestrator_let_go(o, load64(&hs));
+    assert_eq(load64(ssp + AGN_CREW_HOLDS), 0, "and the snapshot's own hold is let go");
+
+    # A crew put back from its log at start-up evicts as a registration does, and an owned crew it
+    # evicts goes back too.
+    var hr: i64[1];
+    var rsp = _t_owned(o, &hr);
+    agnosai_orchestrator_let_go(o, load64(&hr));
+    for (var r = 0; r < 3; r = r + 1) {
+        var hx: i64[1];
+        _t_owned(o, &hx);
+        agnosai_orchestrator_let_go(o, load64(&hx));
+    }
+    var put = 0;
+    for (var q = 0; q < 6; q = q + 1) {
+        var back = agnosai_crew_state_new(agnosai_uuid_v4_str(), AGNOSAI_CREW_COMPLETED);
+        put = put + _agnosai_orch_restore_ended(o, back);
+    }
+    assert_eq(put, 6, "crews read back from their logs go in");
+    assert_eq(agnosai_crew_id(rsp), 0, "evicting an owned crew that nothing holds, which goes back");
+
+    # A spec on the global heap cannot go back, so it is not owned.
+    assert_eq(agnosai_orchestrator_own_crew(o, agnosai_crew_new(str_from("global"))), 0,
+      "a crew on the global heap is not owned");
+
+    AGNOSAI_MAX_RETAINED_CREWS = cap;
+    AGNOSAI_CREWS_LOW_WATER = low;
+    return 0;
+}
+
+fn _t_rest_suite(): i64 {
+    var cap = AGNOSAI_MAX_RETAINED_CREWS;
+    var low = AGNOSAI_CREWS_LOW_WATER;
+    AGNOSAI_MAX_RETAINED_CREWS = 8;
+    AGNOSAI_CREWS_LOW_WATER = 4;
+    var bus = agnosai_event_bus_new();
+    var o = _t_new_orch(bus);
+    var state = _t_rest_state(o);
+    var ra = arena_allocator_growable(65536);
+    var body = _t_rest_body();
+
+    # --- the measurement the roadmap asked for ---
+    assert_eq(_t_rest_growth(state, ra, body, 200), 0,
+      "a crew posted to the REST path, read, snapshotted and listed, leaves nothing once evicted");
+    var minted = agnosai_orchestrator_crew_arenas_minted(o);
+    assert(minted > 0 && minted <= AGNOSAI_MAX_RETAINED_CREWS + 2,
+      "its arenas are as many as the registry keeps, and are used again");
+
+    var a2a = str_from("{\"task_id\":\"t-1\",\"description\":\"look into it\",\"domain\":\"qa\"}");
+    for (var w = 0; w < _T_REST_WARM; w = w + 1) { _t_a2a_cycle(state, ra, a2a); }
+    var before = alloc_used();
+    var bad = 0;
+    for (var i = 0; i < 200; i = i + 1) {
+        if (_t_a2a_cycle(state, ra, a2a) == 0) { bad = bad + 1; }
+    }
+    assert_eq(bad, 0, "every A2A delegation answers");
+    assert_eq(alloc_used() - before, 0, "and its crew, evicted, leaves nothing");
+
+    # A request the route refuses gives its arena back at once.
+    var bad_body = str_from("{\"name\":\"\",\"agents\":[],\"tasks\":[]}");
+    for (var w2 = 0; w2 < 8; w2 = w2 + 1) {
+        agnosai_route_create_crew_tp_a(ra, state, bad_body, 0);
+        reset_via(ra);
+    }
+    var before2 = alloc_used();
+    var minted2 = agnosai_orchestrator_crew_arenas_minted(o);
+    for (var j = 0; j < 50; j = j + 1) {
+        assert_eq(agnosai_route_status(agnosai_route_create_crew_tp_a(ra, state, bad_body, 0)), HTTP_BAD_REQUEST,
+          "an invalid crew request is refused");
+        reset_via(ra);
+    }
+    assert_eq(agnosai_orchestrator_crew_arenas_minted(o), minted2, "and mints no arena, its own going back");
+    assert_eq(alloc_used() - before2, 0, "and keeps nothing, its warning on the stack");
+
+    _t_answers_outlive_their_crews(state, ra, body, a2a);
+    AGNOSAI_MAX_RETAINED_CREWS = cap;
+    AGNOSAI_CREWS_LOW_WATER = low;
+    return 0;
+}
+
+# An answer is a copy, so it says the same once its crew has gone back: each route's body, rendered
+# before its crew is evicted and given back and again after, is the same text.
+fn _t_answers_outlive_their_crews(state, ra, body, a2a): i64 {
+    var ka = arena_allocator_growable(65536);
+    var post = agnosai_route_create_crew_tp_a(ka, state, body, 0);
+    var id = bayan_json_v_str(bayan_json_v_obj_get_by_cstr(agnosai_route_body(post), "crew_id"));
+    var get = agnosai_route_get_crew_a(ka, state, id);
+    var snap = agnosai_route_crew_snapshot_a(ka, state, id);
+    var hist = agnosai_route_crew_history_a(ka, state);
+    var del = agnosai_route_a2a_receive_tp_a(ka, state, a2a, 0);
+    var p0 = str_clone(bayan_json_v_build(agnosai_route_body(post)));
+    var g0 = str_clone(bayan_json_v_build(agnosai_route_body(get)));
+    var s0 = str_clone(bayan_json_v_build(agnosai_route_body(snap)));
+    var h0 = str_clone(bayan_json_v_build(agnosai_route_body(hist)));
+    var d0 = str_clone(bayan_json_v_build(agnosai_route_body(del)));
+    for (var i = 0; i < 24; i = i + 1) { _t_rest_cycle(state, ra, body); }
+    var o = agnosai_app_state_orchestrator(state);
+    assert_eq(agnosai_orchestrator_crew(o, id), 0, "the crew the answers came from has been evicted, and given back");
+    assert(str_eq(bayan_json_v_build(agnosai_route_body(post)), p0) == 1, "a POST's answer says what it said");
+    assert(str_eq(bayan_json_v_build(agnosai_route_body(get)), g0) == 1, "and a GET's");
+    assert(str_eq(bayan_json_v_build(agnosai_route_body(snap)), s0) == 1, "and a snapshot's");
+    assert(str_eq(bayan_json_v_build(agnosai_route_body(hist)), h0) == 1, "and the dashboard's");
+    assert(str_eq(bayan_json_v_build(agnosai_route_body(del)), d0) == 1, "and an A2A delegation's");
+    return 0;
+}
+
 fn main() {
     alloc_init();
     # A crew with no `llm_model` needs a model to send, and which one is not what this suite is about.
@@ -943,6 +1243,9 @@ fn main() {
     _t_audit_suite();
     _t_submit_suite();
     _t_live_suite();
+    _t_copy_suite();
+    _t_holds_suite();
+    _t_rest_suite();
     return assert_summary();
 }
 

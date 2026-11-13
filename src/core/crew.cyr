@@ -30,7 +30,7 @@ enum AgnosaiCrewStatus {
     AGNOSAI_CREW_AWAITING_APPROVAL = 5;
 }
 
-# CrewSpec heap layout — 80 bytes.
+# CrewSpec heap layout — 144 bytes.
 #
 # `TRACE_PARENT` is the caller's W3C `traceparent`, or 0 (ADR 023). It is
 # per-execution transport, not part of the crew's definition, so it is never
@@ -62,7 +62,13 @@ enum AgnosaiCrewSpecOff {
     # The crew's own tool-loop limits, four words in its allocator, or 0 for the process's
     # (ADR 033). Like the tenant, how a crew runs and not what it is, so never serialised.
     AGN_CREW_TOOL_LIMITS = 112;
-    AGN_CREW_SIZE = 120;
+    # The orchestrator that gives this crew back itself, or 0 (ADR 037): one it built, in an arena
+    # from its own pool. `HOLDS` counts who is reading it, and `PLACED` is 1 while its registry holds
+    # it; it is given back once both are 0. All three under that orchestrator's registry lock.
+    AGN_CREW_OWNER = 120;
+    AGN_CREW_HOLDS = 128;
+    AGN_CREW_PLACED = 136;
+    AGN_CREW_SIZE = 144;
 }
 
 # CrewState heap layout — 40 bytes. `REASON` says why a crew did not complete, or is 0 (ADR 032).
@@ -152,6 +158,9 @@ fn agnosai_crew_new_a(a, name: Str): i64 {
     store64(c + AGN_CREW_MAX_COST, AGNOSAI_NO_LIMIT);
     store64(c + AGN_CREW_TENANT, 0);
     store64(c + AGN_CREW_TOOL_LIMITS, 0);
+    store64(c + AGN_CREW_OWNER, 0);
+    store64(c + AGN_CREW_HOLDS, 0);
+    store64(c + AGN_CREW_PLACED, 0);
     return c;
 }
 
