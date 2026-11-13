@@ -572,6 +572,21 @@ fn _b_resolve(name, path: Str, n): i64 {
     return 0;
 }
 
+# `_b_resolve` for a route that captures a parameter, under `method` (2.6.1): what checking the
+# parameter's bytes, and decoding one that has escapes, adds to a match.
+fn _b_resolve_m(name, method, path: Str, n): i64 {
+    var b = bench_new(name);
+    for (var _r = 0; _r < _BR; _r = _r + 1) {
+        bench_batch_start(b);
+        for (var i = 0; i < n / _BR; i = i + 1) {
+            agnosai_route_resolve(method, path);
+        }
+        bench_batch_stop(b, n / _BR);
+    }
+    bench_report(b);
+    return 0;
+}
+
 # --- Rate limiting -------------------------------------------------------
 #
 # ⚠ These rows did not exist until 2026-08-13, when [ADR 021](../docs/adr/021-rate-limit-mounted-by-default.md)
@@ -884,6 +899,12 @@ fn main(): i64 {
     _b_post_global(s2, "route_create_crew_global", crews_path, crew_body, 2000);
     _b_post_arena(s3, "route_create_crew_arena", crews_path, crew_body, 2000);
 
+    # 2.6.1: a captured parameter is checked as UTF-8, and decoded when it has an escape. Last, so
+    # no row above moves.
+    _b_resolve_m("route_resolve_param_uuid", AGNOSAI_METHOD_GET,
+      str_from("/api/v1/crews/3f2504e0-4f89-41d3-9a0c-0305e82c3301"), 200000);
+    _b_resolve_m("route_resolve_param_escaped", AGNOSAI_METHOD_DELETE,
+      str_from("/api/v1/tools/my%20tool%2Fv2"), 200000);
     return 0;
 }
 

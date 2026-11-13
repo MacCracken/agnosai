@@ -406,6 +406,26 @@ fn _t_v237_forms(): i64 {
     return 0;
 }
 
+# An input in an arena (2.6.1): its map, its keys and its tool's answer are the arena's, as `/mcp`'s
+# `tools/call` builds one in its request arena.
+fn _t_input_in_arena(): i64 {
+    var ra = arena_allocator_growable(4096);
+    var input = agnosai_tool_input_new_a(ra);
+    assert_eq(agnosai_tool_input_alloc(input), ra, "an arena input answers in the arena");
+    var key = str_from("message");
+    agnosai_tool_input_set_a(ra, input, key, bayan_json_v_str_new(str_from("hi")));
+    var got = agnosai_tool_input_get(input, str_from("message"));
+    assert(got != 0 && str_eq(bayan_json_v_str(got), str_from("hi")) == 1, "and holds what it is given");
+    var before = alloc_used();
+    for (var i = 0; i < 32; i = i + 1) {
+        var in2 = agnosai_tool_input_new_a(ra);
+        agnosai_tool_input_set_a(ra, in2, key, bayan_json_v_null_a(ra));
+        reset_via(ra);
+    }
+    assert_eq(alloc_used() - before, 0, "and costs the global heap nothing");
+    return 0;
+}
+
 fn main() {
     _t_release();
     _t_registry_concurrent_access();
@@ -414,6 +434,7 @@ fn main() {
     alloc_init();
 
     test_group("tools_native");
+    _t_input_in_arena();
 
     # --- tool_output_ok_has_correct_fields ---
     var ok = agnosai_tool_output_ok(bayan_json_v_int_new(42));

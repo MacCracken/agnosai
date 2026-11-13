@@ -24,11 +24,12 @@
 # 8-byte store of its pointer.
 #
 # The oracle's `receiver()` returns a clonable `watch::Receiver` for tasks that
-# want to *await* a change. Nothing in the tree does — `grep -rn "\.receiver()"
-# rust-old/src/` finds only the one test — so the port exposes the read side as
-# `agnosai_config_holder_get` and does not model change notification. If a
-# consumer ever needs to wake on reload, that is a channel, and it should be
-# added then rather than guessed at now.
+# want to *await* a change. Through 2.6.0 the port modelled only the read side,
+# `agnosai_config_holder_get`. **2.6.1 adds the rest of `watch`**, the part a
+# reader that must act on a reload needs: every update bumps a generation, and
+# `agnosai_config_holder_wait` blocks until the generation moves past the one the
+# reader saw, which is `changed().await`. Not a channel: `watch` keeps no queue,
+# and a reader that wakes late reads the latest config, never every one between.
 # =========================================================================
 
 # The oracle's `Default for RuntimeConfig` (`hot_config.rs:60-68`).
@@ -142,14 +143,58 @@ fn agnosai_runtime_config_from_value(v): i64 {
 
 enum AgnosaiConfigHolderOff {
     AGN_HOLD_CURRENT = 0;
-    AGN_CONFIG_HOLDER_SIZE = 8;
+    # How many updates have been published: what a waiter compares, and the futex word it parks on.
+    AGN_HOLD_GEN = 8;
+    AGN_CONFIG_HOLDER_SIZE = 16;
 }
 
-# A holder seeded with `initial` — the oracle's `ConfigHolder::new`.
+# A holder seeded with `initial` — the oracle's `ConfigHolder::new`. Its generation is 0.
 fn agnosai_config_holder_new(initial): i64 {
     var h = alloc(AGN_CONFIG_HOLDER_SIZE);
     atomic_store(h + AGN_HOLD_CURRENT, initial);
+    atomic_store(h + AGN_HOLD_GEN, 0);
     return h;
+}
+
+# How many updates the holder has published. A reader keeps the one it acted on, and asks whether
+# the holder has moved past it (`agnosai_config_holder_changed`) or waits until it has.
+fn agnosai_config_holder_generation(h): i64 {
+    return atomic_load(h + AGN_HOLD_GEN);
+}
+
+# 1 when an update has been published since generation `seen` — `watch::Receiver::has_changed`.
+fn agnosai_config_holder_changed(h, seen): i64 {
+    if (agnosai_config_holder_generation(h) != seen) { return 1; }
+    return 0;
+}
+
+# Block until an update is published past generation `seen`, or `timeout_ms` passes (below 0: no
+# limit). Answers the generation now: past `seen` when a config was published, `seen` on a timeout.
+# `changed().await`, with a deadline a thread can be given where a task would be cancelled.
+#
+# Parks on a futex, the generation's low 32 bits, so a waiter costs nothing until the update wakes
+# it. The update publishes the config before it bumps the generation, and this fences after seeing
+# it bumped, so `agnosai_config_holder_get` then reads the config that bump published, or a later one.
+fn agnosai_config_holder_wait(h, seen, timeout_ms): i64 {
+    var deadline = clock_now_ms() + timeout_ms;
+    while (1 == 1) {
+        var g = agnosai_config_holder_generation(h);
+        if (g != seen) {
+            atomic_fence();
+            return g;
+        }
+        var tsp = 0;
+        var ts[16];
+        if (timeout_ms >= 0) {
+            var left = deadline - clock_now_ms();
+            if (left <= 0) { return g; }
+            store64(&ts, left / 1000);
+            store64(&ts + 8, (left % 1000) * 1000000);
+            tsp = &ts;
+        }
+        syscall(SYS_FUTEX, h + AGN_HOLD_GEN, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, seen & 0xFFFFFFFF, tsp, 0, 0);
+    }
+    return 0;
 }
 
 # The current config — the oracle's `get()`, which clones an `Arc`.
@@ -180,8 +225,13 @@ fn agnosai_config_holder_get(h): i64 {
 # so on aarch64, which ships, a reader could otherwise see the pointer before the
 # new config's fields. Unlike a lazy build this happens with readers running, on
 # every reload. x86 cannot show this, and no suite here would.
+#
+# **Then the generation moves, and every waiter wakes (2.6.1).** The config is stored first, so a
+# waiter that sees the new generation finds the config it stands for.
 fn agnosai_config_holder_update(h, new_config): i64 {
     atomic_fence();
     atomic_store(h + AGN_HOLD_CURRENT, new_config);
+    atomic_fetch_add(h + AGN_HOLD_GEN, 1);
+    syscall(SYS_FUTEX, h + AGN_HOLD_GEN, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 2147483647, 0, 0, 0);
     return 0;
 }

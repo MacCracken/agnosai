@@ -49,7 +49,10 @@ enum AgnosaiAppStateOff {
     AGN_ST_DEF_MUTEX = 56;
     # The A2A v1.0 endpoint's settings (2.6.0, ADR 040), or 0 for its defaults.
     AGN_ST_A2A = 64;
-    AGN_ST_SIZE = 72;
+    # The origins `/mcp` lets a browser call it from (2.6.1), a vec of lowercase Strs, or 0 for none
+    # but loopback ones.
+    AGN_ST_MCP_ORIGINS = 72;
+    AGN_ST_SIZE = 80;
 }
 
 # Build the shared state from its already-constructed parts.
@@ -68,6 +71,7 @@ fn agnosai_app_state_new(orchestrator, tools, auth, events, audit, approval_gate
     store64(s + AGN_ST_DEFINITIONS, map_new_str());
     store64(s + AGN_ST_DEF_MUTEX, mutex_new());
     store64(s + AGN_ST_A2A, 0);
+    store64(s + AGN_ST_MCP_ORIGINS, 0);
     return s;
 }
 
@@ -80,6 +84,19 @@ fn agnosai_app_state_with_a2a(s, cfg): i64 {
 # The A2A endpoint's settings, or 0 for its defaults.
 fn agnosai_app_state_a2a(s): i64 {
     return load64(s + AGN_ST_A2A);
+}
+
+# Let `/mcp` be called from the browser origins in `origins` (2.6.1): a vec of Strs, each
+# `scheme://host[:port]` in lowercase, as `agnosai_mcp_origins_from` makes them, `*` among them
+# letting in every origin. Returns `s`.
+fn agnosai_app_state_with_mcp_origins(s, origins): i64 {
+    store64(s + AGN_ST_MCP_ORIGINS, origins);
+    return s;
+}
+
+# The origins `/mcp` lets in besides loopback ones, or 0.
+fn agnosai_app_state_mcp_origins(s): i64 {
+    return load64(s + AGN_ST_MCP_ORIGINS);
 }
 
 # The crew orchestrator.

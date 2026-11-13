@@ -316,6 +316,31 @@ fn _t_jwt_key_prepare(): i64 {
 
     var empty = agnosai_jwt_config_new(str_from(""));
     assert(agnosai_jwt_config_prepare(empty) == 0, "empty PEM is refused");
+
+    # A certificate is a key (2.6.1), as the Rust line's `from_rsa_pem` took one.
+    var cj = agnosai_jwt_config_new(_t_jwt_cert_pem());
+    assert(agnosai_jwt_config_prepare(cj) == 1, "a certificate PEM's RSA key is read");
+    assert_eq(agnosai_jwt_config_modulus_len(cj), 256, "the same 2048-bit modulus as the SPKI PEM's");
+    var cc = agnosai_auth_config_with_jwt(agnosai_jwt_config_with_audience(
+        agnosai_jwt_config_with_issuer(cj, str_from("test-issuer")), str_from("agnosai")));
+    assert_eq(_t_jwt_check(cc, _t_jwt_valid()), HTTP_OK, "and a token its key signed verifies through it");
+    assert_eq(_t_jwt_check(cc, _t_jwt_expired()), HTTP_UNAUTHORIZED, "while an expired one is still refused");
+    var ec = agnosai_jwt_config_new(_t_jwt_ec_cert_pem());
+    assert(agnosai_jwt_config_prepare(ec) == 0, "a certificate whose key is not RSA is refused");
+    var ctrunc = agnosai_jwt_config_new(str_from("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"));
+    assert(agnosai_jwt_config_prepare(ctrunc) == 0, "and so is one that does not parse");
+    var cnoend = agnosai_jwt_config_new(str_from("-----BEGIN CERTIFICATE-----\nMIIB\n"));
+    assert(agnosai_jwt_config_prepare(cnoend) == 0, "or has no END marker");
+    # A whole certificate whose END line is missing: what it holds would parse, and is refused as the
+    # PEM it is not.
+    var whole = _t_jwt_cert_pem();
+    var cut = agnosai_jwt_config_new(str_sub(whole, 0, str_index_of_cstr(whole, "-----END CERTIFICATE-----")));
+    assert(agnosai_jwt_config_prepare(cut) == 0, "a whole certificate with no END line is refused");
+    var small = agnosai_jwt_config_new(_t_jwt_small_cert_pem());
+    assert(agnosai_jwt_config_prepare(small) == 0, "and a certificate's key is held to the 2048-bit floor");
+    # A PEM holding a key and a certificate is read for its key, as through 2.6.0.
+    var both = agnosai_jwt_config_new(str_cat(_t_jwt_ec_cert_pem(), _t_jwt_pubkey_pem()));
+    assert(agnosai_jwt_config_prepare(both) == 1, "a key's PEM is read before a certificate's");
     return 0;
 }
 

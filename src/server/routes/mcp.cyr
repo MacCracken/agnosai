@@ -361,11 +361,16 @@ fn _agnosai_mcp_tools_call(a, id, params, state, tp: Str, m): i64 {
     # `params.get("arguments").cloned().unwrap_or(Value::Object(default))`, then
     # `arguments.as_object()` — a non-object `arguments` yields an EMPTY
     # parameter map rather than an error, so the tool runs with no arguments.
-    var input = agnosai_tool_input_new();
+    #
+    # **The call is the request's (2.6.1):** its input, and the output its tool answers in the input's
+    # allocator, are in the request arena, as the tool loop gives each call an arena of its own. A tool
+    # keeps nothing it answers, which that loop already holds it to. Through 2.6.0 both were built on
+    # the global heap, 601 bytes an echo call kept for good.
+    var input = agnosai_tool_input_new_a(a);
     var args = bayan_json_v_obj_get_by_cstr(params, "arguments");
     if (args != 0 && bayan_json_v_is_obj(args) == 1) {
         for (var i = 0; i < bayan_json_v_obj_len(args); i = i + 1) {
-            agnosai_tool_input_set(input, bayan_json_v_obj_key(args, i),
+            agnosai_tool_input_set_a(a, input, bayan_json_v_obj_key(args, i),
               bayan_json_v_obj_val(args, i));
         }
     }
@@ -659,13 +664,157 @@ fn agnosai_route_mcp_tp_a(a, state, body: Str, tp: Str): i64 {
     return agnosai_route_mcp_h_a(a, state, body, tp, 0);
 }
 
+# --- Origin (2.6.1) ----------------------------------------------------------
+#
+# Both revisions ask it of a server: *"Servers MUST validate the Origin header on all incoming
+# connections to prevent DNS rebinding attacks"*, and 2026-07-28 adds *"If the Origin header is present
+# and invalid, servers MUST respond with HTTP 403 Forbidden"*, its body optionally *"a JSON-RPC error
+# response that has no id"*. A rebinding page is served from the attacker's own name, which the
+# browser sends as `Origin`, while `Host` is that name too: so it is `Origin` that is checked, and
+# checked against a list, never against `Host`.
+#
+# - **No `Origin`**: let in. Only a browser sends one, and every other client sends none.
+# - **A loopback origin**, `http` or `https` on `localhost`, `127.0.0.1` or `[::1]`, any port: let in.
+#   A page whose origin is loopback was served from this machine, which a rebinding page is not.
+# - **One the operator lists** (`AGNOSAI_MCP_ALLOWED_ORIGINS`, and `AGNOSAI_PUBLIC_URL`'s own), compared
+#   in lowercase: let in. `*` in the list lets in every origin, turning the check off.
+# - **Anything else**, `null` (an opaque origin) and an `Origin` on two lines among them: 403.
+#
+# The check is before the era is decided, as the rule is both revisions', and its body is the
+# 2026-07-28 shape, which an earlier client reads as an error too. Through 2.6.0 `/mcp` read no
+# `Origin`, and with auth off, its default, any page a browser opened could call its tools.
+
+# The JSON-RPC code of the 403: JSON-RPC's range for errors a server defines, as the spec names none.
+var AGNOSAI_MCP_FORBIDDEN = 0 - 32000;
+
+# Whether cstr `s` begins with the `n` bytes of `lit`. Stops at `s`'s NUL, so it reads no further.
+fn _agnosai_mcp_cprefix(s, lit, n): i64 {
+    for (var i = 0; i < n; i = i + 1) {
+        var c = load8(s + i) & 255;
+        if (c == 0 || c != (load8(lit + i) & 255)) { return 0; }
+    }
+    return 1;
+}
+
+# Whether `o`, a lowercase cstr, is a loopback origin: `http://` or `https://`, then `localhost`,
+# `127.0.0.1` or `[::1]`, then nothing or a port.
+fn _agnosai_mcp_origin_loopback(o): i64 {
+    var p = 0;
+    if (_agnosai_mcp_cprefix(o, "http://", 7) == 1) { p = 7; }
+    elif (_agnosai_mcp_cprefix(o, "https://", 8) == 1) { p = 8; }
+    else { return 0; }
+    var q = 0 - 1;
+    if (_agnosai_mcp_cprefix(o + p, "localhost", 9) == 1) { q = p + 9; }
+    elif (_agnosai_mcp_cprefix(o + p, "127.0.0.1", 9) == 1) { q = p + 9; }
+    elif (_agnosai_mcp_cprefix(o + p, "[::1]", 5) == 1) { q = p + 5; }
+    if (q < 0) { return 0; }
+    var c = load8(o + q) & 255;
+    if (c == 0) { return 1; }
+    if (c != 58) { return 0; }
+    var d = q + 1;
+    if ((load8(o + d) & 255) == 0) { return 0; }
+    while ((load8(o + d) & 255) != 0) {
+        var dc = load8(o + d) & 255;
+        if (dc < 48 || dc > 57) { return 0; }
+        d = d + 1;
+    }
+    return 1;
+}
+
+# Whether `/mcp` lets in a request whose `Origin` is `origin`, a cstr, or 0 when there is none.
+fn agnosai_mcp_origin_ok_a(a, state, origin): i64 {
+    if (origin == 0) { return 1; }
+    var lo = _agnosai_to_ascii_lower_a(a, str_from_a(a, origin));
+    var lp = str_data(lo);
+    if (_agnosai_mcp_origin_loopback(lp) == 1) { return 1; }
+    var list = 0;
+    if (state != 0) { list = agnosai_app_state_mcp_origins(state); }
+    if (list == 0) { return 0; }
+    for (var i = 0; i < vec_len(list); i = i + 1) {
+        var e = vec_get(list, i);
+        if (str_eq_cstr(e, "*") == 1) { return 1; }
+        if (str_eq(e, lo) == 1) { return 1; }
+    }
+    return 0;
+}
+
+# `AGNOSAI_MCP_ALLOWED_ORIGINS`, `v` a cstr or 0, as the vec `agnosai_app_state_with_mcp_origins`
+# takes: comma-separated, each entry trimmed of spaces, lowercased and stripped of a trailing `/`,
+# empty ones skipped. Answers an empty vec for 0 or "".
+fn agnosai_mcp_origins_from(v): i64 {
+    var out = vec_new();
+    if (v == 0) { return out; }
+    var n = strlen(v);
+    var i = 0;
+    while (i <= n) {
+        var j = i;
+        while (j < n && (load8(v + j) & 255) != 44) { j = j + 1; }
+        var b = i;
+        var e = j;
+        while (b < e && ((load8(v + b) & 255) == 32 || (load8(v + b) & 255) == 9)) { b = b + 1; }
+        while (e > b && ((load8(v + e - 1) & 255) == 32 || (load8(v + e - 1) & 255) == 9)) { e = e - 1; }
+        while (e > b && (load8(v + e - 1) & 255) == 47) { e = e - 1; }
+        if (e > b) { vec_push(out, _agnosai_to_ascii_lower(str_new(v + b, e - b))); }
+        i = j + 1;
+    }
+    return out;
+}
+
+# The origin of `url`, `scheme://host[:port]` in lowercase, or 0 when it has no `://`: what a browser
+# sends as `Origin` for a page served from it.
+fn agnosai_url_origin(url: Str): i64 {
+    var p = str_data(url);
+    var n = str_len(url);
+    var at = 0 - 1;
+    for (var i = 0; i + 2 < n; i = i + 1) {
+        if ((load8(p + i) & 255) == 58 && (load8(p + i + 1) & 255) == 47 && (load8(p + i + 2) & 255) == 47) {
+            at = i;
+            break;
+        }
+    }
+    if (at <= 0) { return 0; }
+    var e = at + 3;
+    while (e < n) {
+        var c = load8(p + e) & 255;
+        if (c == 47 || c == 63 || c == 35) { break; }
+        e = e + 1;
+    }
+    if (e == at + 3) { return 0; }
+    return _agnosai_to_ascii_lower(str_new(p, e));
+}
+
+# The 403: a JSON-RPC error with no `id`, as the request it answers is not read.
+fn _agnosai_mcp_forbidden_a(a, origin): i64 {
+    if (sakshi_get_level() >= SK_WARN) {
+        var shown = origin;
+        if (agnosai_http_header_value_ok(origin) == 0) { shown = "(not printable)"; }
+        sakshi_log_kv(SK_WARN, "MCP request refused: Origin not allowed", 39, "origin", 6, shown, strlen(shown));
+    }
+    var e = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, e, AGN_JK_CODE, bayan_json_v_int_new_a(a, AGNOSAI_MCP_FORBIDDEN));
+    bayan_json_v_obj_set_a(a, e, AGN_JK_MESSAGE,
+      bayan_json_v_str_new_a(a, str_from_a(a, "Forbidden: Origin not allowed")));
+    var o = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, o, AGN_JK_JSONRPC, bayan_json_v_str_new_a(a, AGN_JV_JSONRPC_20));
+    bayan_json_v_obj_set_a(a, o, AGN_JK_ERROR, e);
+    return agnosai_route_json_a(a, HTTP_FORBIDDEN, o);
+}
+
 # `POST /mcp` with the request itself, `hdrs` (`src/http_headers.cyr`), or 0 (2.6.0, ADR 039).
 #
 # **The era is the request's.** One that names 2026-07-28, in `MCP-Protocol-Version` or in its
 # `_meta`, is served under that revision; one with no header, or a header naming 2025-03-26, is
 # served as this endpoint always served it, the oracle's wire. With `hdrs` of 0 there is no header,
 # so a request that names 2026-07-28 in its body alone is refused for the header it lacks.
+#
+# **Its `Origin` is checked first, in either era (2.6.1)**: see the section above.
 fn agnosai_route_mcp_h_a(a, state, body: Str, tp: Str, hdrs): i64 {
+    # The request's `Origin`, before anything of it is read (2.6.1).
+    var og_lines: i64[1];
+    store64(&og_lines, 0);
+    var og = agnosai_http_header_once_a(a, hdrs, "Origin", &og_lines);
+    if (load64(&og_lines) > 1) { return _agnosai_mcp_forbidden_a(a, "(on more than one line)"); }
+    if (agnosai_mcp_origin_ok_a(a, state, og) == 0) { return _agnosai_mcp_forbidden_a(a, og); }
     var v = bayan_json_v_parse_buf_a(a, str_data(body), str_len(body));
     var hv_lines: i64[1];
     var hv = agnosai_http_header_once_a(a, hdrs, "MCP-Protocol-Version", &hv_lines);

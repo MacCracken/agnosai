@@ -49,6 +49,11 @@ A path in this table requested with another method is **405**, with an `Allow`
 header naming the methods it takes (`Allow: GET, POST` for the definitions
 route; since 2.1.7). A path not in it is 404.
 
+**A path parameter is percent-decoded** (2.6.1): `DELETE /api/v1/tools/my%20tool` removes the tool named
+`my tool`, and `%2F` is a `/` inside the one parameter. `+` is a plus, and a `%` that starts no two-digit escape
+stands as it is. A parameter that decodes to invalid UTF-8 is **400**, after auth. Through 2.6.0 a parameter was
+the segment as it arrived.
+
 ## Rate limiting
 
 ⚠ **Mounted by DEFAULT** at **100 req/s per client key, burst 200**
@@ -596,6 +601,20 @@ cyrius build src/main.cyr build/agnosai
 
 The server binds to `0.0.0.0:8080` by default. Use `PORT` or `AGNOSAI_PORT` to change the port.
 
+### Stopping — SIGTERM and SIGINT
+
+A SIGTERM or SIGINT stops the server accepting, and then it **drains** (2.6.1,
+[ADR 041](../adr/041-a-stream-ends-when-its-client-or-the-server-does.md)): every request in flight is answered,
+for `AGNOSAI_SHUTDOWN_GRACE_SECS` at most (25 by default, so a Kubernetes pod's default 30-second grace period sees
+it finish), and every open stream ends whole within 50 ms, for its client to reconnect to a server that is not
+stopping. A second signal stops the wait. The log says how many requests were still in flight if the grace ran out.
+`AGNOSAI_SHUTDOWN_GRACE_SECS=0` waits for nothing.
+
+A crew running on its own, one `returnImmediately` or the `delegate` tool started, is not a request and is not
+waited for: it resumes at the next start when `AGNOSAI_STATE_DIR` keeps its log.
+
+A stream also ends when its client hangs up, within one 50 ms poll, which frees the worker it held. The crew goes on.
+
 ### Durable crews — `AGNOSAI_STATE_DIR`
 
 With `AGNOSAI_STATE_DIR` set, every crew keeps a log there, `<crew_id>.log`, one JSON line a record: its spec, every
@@ -637,6 +656,14 @@ One endpoint, two revisions, chosen per request ([ADR 039](../adr/039-mcp-serves
 
 - **2025-03-26**, for a request with no version header or one naming it: `initialize`, then the same methods, every
   answer HTTP 200, as through 2.5.x.
+
+**A browser's request is checked for its `Origin`** in both revisions (2.6.1), against DNS rebinding: a request with no
+`Origin`, which is every client but a browser, or from a loopback origin (`localhost`, `127.0.0.1`, `[::1]`, any port),
+or from one listed, is served; any other is **403** with a JSON-RPC error, code `-32000`, with no `id`.
+
+| Variable | Meaning |
+|---|---|
+| `AGNOSAI_MCP_ALLOWED_ORIGINS` | Comma-separated origins, `https://app.example.com[:port]`, a browser may call `/mcp` from. `AGNOSAI_PUBLIC_URL`'s own origin is always one. `*` turns the check off |
 
 ## A2A 1.0 — the Agent Card and `POST /a2a`
 

@@ -309,6 +309,15 @@ fn agnosai_tool_input_new(): i64 {
     return _agnosai_tool_input_over(map_new_str());
 }
 
+# `agnosai_tool_input_new` in allocator `a`, which also answers the call (2.6.1): the input, its map
+# and the tool's output all live as long as `a` does. For a caller that runs one call and is done
+# with it, as `/mcp`'s `tools/call` is, in its request arena.
+fn agnosai_tool_input_new_a(a): i64 {
+    var i = _agnosai_tool_input_over_a(a, map_new_str_a(a));
+    agnosai_tool_input_with_alloc(i, a);
+    return i;
+}
+
 # A tool input over `parameters`, belonging to no call yet.
 fn _agnosai_tool_input_over(parameters): i64 {
     return _agnosai_tool_input_over_a(default_alloc(), parameters);
@@ -426,6 +435,12 @@ fn agnosai_tool_input_with_alloc(input, a): i64 {
 # Set a parameter to a bayan JSON value. Returns the input so calls chain.
 fn agnosai_tool_input_set(input, key: Str, value): i64 {
     map_set(load64(input + AGN_INPUT_PARAMETERS), str_clone(key), value);
+    return input;
+}
+
+# `agnosai_tool_input_set` in allocator `a`: the key is copied there, and the map grows there.
+fn agnosai_tool_input_set_a(a, input, key: Str, value): i64 {
+    map_set_a(a, load64(input + AGN_INPUT_PARAMETERS), str_clone_a(a, key), value);
     return input;
 }
 

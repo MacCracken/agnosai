@@ -490,6 +490,79 @@ fn _t_partial_segments_do_not_match(): i64 {
     return 0;
 }
 
+# --- Path parameters are percent-decoded (2.6.1) ----------------------------
+
+fn _t_param_is(path, want, name): i64 {
+    var m = agnosai_route_resolve(AGNOSAI_METHOD_DELETE, str_from(path));
+    assert_eq(agnosai_route_match_bad_param(m), 0, name);
+    return assert(str_eq(agnosai_route_match_param(m), str_from(want)) == 1, name);
+}
+
+fn _t_param_bad(path, name): i64 {
+    var m = agnosai_route_resolve(AGNOSAI_METHOD_DELETE, str_from(path));
+    assert_eq(agnosai_route_match_id(m), AGN_ROUTE_REMOVE_TOOL, name);
+    return assert_eq(agnosai_route_match_bad_param(m), 1, name);
+}
+
+fn _t_params_are_decoded(): i64 {
+    _t_param_is("/api/v1/tools/echo", "echo", "a parameter with no escape is as it is");
+    _t_param_is("/api/v1/tools/my%20tool", "my tool", "%20 is a space");
+    _t_param_is("/api/v1/tools/a%2Fb", "a/b", "%2F is a slash, inside the one segment it matched as");
+    _t_param_is("/api/v1/tools/a%2fb", "a/b", "in either case");
+    _t_param_is("/api/v1/tools/a+b", "a+b", "+ is a plus: a space only in a query");
+    _t_param_is("/api/v1/tools/100%", "100%", "a % at the end starts no escape, and stands");
+    _t_param_is("/api/v1/tools/a%4", "a%4", "nor one with a digit missing");
+    _t_param_is("/api/v1/tools/a%zz", "a%zz", "nor one whose digits are not hex");
+    _t_param_is("/api/v1/tools/%25", "%", "%25 is a percent, decoded once");
+    _t_param_is("/api/v1/tools/%2541", "%41", "and not twice");
+    _t_param_is("/api/v1/tools/caf%C3%A9", "caf\xC3\xA9", "an escaped UTF-8 sequence is its character");
+    _t_param_is("/api/v1/tools/%F0%9F%A6%80", "\xF0\x9F\xA6\x80", "four bytes of one too");
+
+    _t_param_bad("/api/v1/tools/%C3", "a sequence cut short is not UTF-8");
+    _t_param_bad("/api/v1/tools/%FF", "nor a byte no UTF-8 holds");
+    _t_param_bad("/api/v1/tools/%C0%AF", "nor an overlong form");
+    _t_param_bad("/api/v1/tools/%E0%80%AF", "nor a three-byte overlong one");
+    _t_param_bad("/api/v1/tools/%ED%A0%80", "nor a surrogate");
+    _t_param_bad("/api/v1/tools/%F4%90%80%80", "nor anything above U+10FFFF");
+    _t_param_bad("/api/v1/tools/a%80", "nor a continuation byte on its own");
+    _t_param_bad("/api/v1/tools/%F0%80%80%80", "nor a four-byte overlong form");
+    _t_param_bad("/api/v1/tools/%E2%82%28", "nor a sequence whose third byte is no continuation");
+    _t_param_is("/api/v1/tools/%E2%82%AC", "\xE2\x82\xAC", "while the whole sequence is its character");
+    _t_param_is("/api/v1/tools/a%4zb", "a%4zb", "an escape whose second digit is not hex stands too");
+    _t_param_is("/api/v1/tools/a+b%20c", "a+b c", "and + is a plus beside an escape as well");
+    _t_param_bad("/api/v1/tools/a\xFFb", "a byte no UTF-8 holds is refused unescaped too");
+
+    # Called directly, as an embedding router would.
+    assert_eq(agnosai_utf8_valid("abc", 3), 1, "ASCII is UTF-8");
+    assert_eq(agnosai_utf8_valid("\xC3\xA9", 2), 1, "and so is a whole sequence");
+    assert_eq(agnosai_utf8_valid("\xC3\xA9", 1), 0, "and half of one is not");
+    assert(str_eq(agnosai_route_param_decode_a(default_alloc(), str_from("a%20b")), str_from("a b")) == 1,
+      "a parameter decodes in the allocator it is given");
+    assert_eq(agnosai_route_param_decode_a(default_alloc(), str_from("%FF")), 0, "or answers 0 for one not UTF-8");
+
+    # A crew id spelled with escapes is the crew's id.
+    var cm = agnosai_route_resolve(AGNOSAI_METHOD_GET,
+      str_from("/api/v1/crews/%33f2504e0-4f89-41d3-9a0c-0305e82c3301"));
+    assert_eq(agnosai_route_match_id(cm), AGN_ROUTE_GET_CREW, "an escaped crew id routes");
+    assert(str_eq(agnosai_route_match_param(cm), str_from("3f2504e0-4f89-41d3-9a0c-0305e82c3301")) == 1,
+      "as the id it spells");
+
+    # Dispatched: a tool named with a space is removed by its escaped name, and a parameter that is
+    # not UTF-8 is a 400, after auth.
+    var s = _t_guarded();
+    var reg = agnosai_app_state_tools(s);
+    agnosai_tool_registry_register(reg, agnosai_tool_new(str_from("my tool"), str_from("d"),
+        &_agnosai_echo_schema, &_agnosai_echo_execute, 0));
+    assert_eq(agnosai_route_status(_t_go_auth(s, AGNOSAI_METHOD_DELETE, "/api/v1/tools/my%20tool")),
+      HTTP_NO_CONTENT, "DELETE /api/v1/tools/my%20tool removes the tool named my tool");
+    assert(agnosai_tool_registry_get(reg, str_from("my tool")) == 0, "which is gone");
+    var bad = _t_go_auth(s, AGNOSAI_METHOD_DELETE, "/api/v1/tools/%FF");
+    assert_eq(agnosai_route_status(bad), HTTP_BAD_REQUEST, "a parameter that is not UTF-8 is a 400");
+    assert_eq(agnosai_route_status(_t_go(s, AGNOSAI_METHOD_DELETE, "/api/v1/tools/%FF")), 401,
+      "behind auth, as axum's extractor is");
+    return 0;
+}
+
 # --- Matching is allocation-free -----------------------------------------
 
 # The matcher walks both sides in place. The obvious vec-of-Str implementation
@@ -858,6 +931,7 @@ fn main(): i64 {
     _t_dispatch();
     _t_stream_is_501_not_404();
     _t_partial_segments_do_not_match();
+    _t_params_are_decoded();
     _t_matching_is_allocation_free();
     _t_resolve_is_equivalent();
     _t_selectors_are_exact();

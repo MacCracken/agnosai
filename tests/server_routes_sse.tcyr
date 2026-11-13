@@ -183,6 +183,76 @@ fn _t_run_live_sending(state, id_raw: Str, live_id: Str, ev): Str {
     return _t_captured();
 }
 
+# --- a client that leaves (2.6.1) ------------------------------------------
+
+# Read from `fd` until `needle` has arrived or 2 s pass. Answers 1 when it arrived.
+fn _t_read_until(fd, needle): i64 {
+    var buf = alloc(8192);
+    var got = 0;
+    var spins = 0;
+    while (spins < 200 && got < 8000) {
+        if (fd_wait_ready(fd, 0, 10) == 1) {
+            var n = sys_read(fd, buf + got, 8000 - got);
+            if (n <= 0) { return 0; }
+            got = got + n;
+            if (str_contains(str_from_buf(buf, got), str_from(needle)) == 1) { return 1; }
+        }
+        spins = spins + 1;
+    }
+    return 0;
+}
+
+# **A client that hangs up ends its stream within a poll, and leaves the crew running.** Through
+# 2.6.0 the loop slept and discarded every write's result, so this handler held its worker until the
+# crew ended, which here is never: the test would time out where it now passes in about 50 ms.
+fn _t_client_leaves(): i64 {
+    _sandhi_server_ignore_sigpipe();
+    var s = _t_state();
+    var bus = agnosai_app_state_events(s);
+    agnosai_event_bus_subscribe(bus, str_from(_T_CREW));
+    var tx = agnosai_event_bus_sender(bus, str_from(_T_CREW));
+    var fds[8];
+    assert_eq(sys_socketpair(1, 1, 0, &fds), 0, "a connected pair of sockets");
+    var srv = load32(&fds);
+    var cli = load32(&fds + 4);
+
+    _t_thread_state = s;
+    _t_thread_fd = srv;
+    _t_thread_id = str_from(_T_CREW);
+    _t_thread_done = 0;
+    assert_eq(thread_create_detached(&_t_stream_thread, 0), 1, "the handler thread starts");
+    assert_eq(_t_read_until(cli, "SSE stream connected"), 1, "the client reads the connected frame");
+    assert(agnosai_event_sender_receiver_count(tx) >= 2, "with the handler subscribed");
+
+    var t0 = clock_now_ms();
+    sys_close(cli);
+    var waited = 0;
+    while (waited < 400 && _t_thread_done == 0) {
+        sleep_ms(5);
+        waited = waited + 1;
+    }
+    assert_eq(_t_thread_done, 1, "a client that hangs up ends the stream, with the crew still live");
+    assert(clock_now_ms() - t0 < 1000, "within a poll or so, not at a keep-alive");
+    assert_eq(agnosai_event_bus_has(bus, str_from(_T_CREW)), 1, "and the crew is not touched");
+    assert_eq(agnosai_event_sender_receiver_count(tx), 1, "only the stream's subscription goes");
+    var back = _agnosai_event_bus_take_idle(bus);
+    assert_neq(back, 0, "back to the bus, for the next stream");
+    agnosai_event_bus_recycle(bus, back);
+    sys_close(srv);
+
+    # A connection that broke before the stream began: the first write fails, and nothing more
+    # is written or waited for.
+    var fds2[8];
+    sys_socketpair(1, 1, 0, &fds2);
+    sys_close(load32(&fds2 + 4));
+    var t1 = clock_now_ms();
+    agnosai_sse_crew_stream(s, load32(&fds2), str_from(_T_CREW));
+    assert(clock_now_ms() - t1 < 1000, "a client gone before the first byte ends it at once");
+    assert_eq(agnosai_event_sender_receiver_count(tx), 1, "and gives its subscription back too");
+    sys_close(load32(&fds2));
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
 
@@ -266,6 +336,8 @@ fn main(): i64 {
     _t_has(upper, "event: connected", "it connects to the lowercase crew");
     _t_has(upper, _T_CREW, "and the frames carry the CANONICAL lowercase id");
     _t_lacks(upper, _T_CREW_UPPER, "not the spelling the client sent");
+
+    _t_client_leaves();
 
     # 2.3.5: every scratch path this suite made goes, so two runs at once share none and a run
     # leaves nothing behind (`tests/test_tmp.cyr`).

@@ -60,12 +60,13 @@ bundle.
   earlier revision (`tests/server_routes_mcp_2026.tcyr`).
 - **Negative**: about 400 lines track the spec here, apart from bote's. A change to the revision's rules is made
   twice, in bote and here.
-- **Negative**: **an MCP `tools/call` keeps 601 B a call on the global heap**, in either era: the tool's input and
-  output are built there. It predates this release and is measured, not fixed, here.
+- **Negative**: **an MCP `tools/call` kept 601 B a call on the global heap**, in either era: the tool's input and
+  output were built there. It predated this release and was measured, not fixed, here. *2.6.1 fixed it: see the
+  addendum.*
 - **Not here**: the Tasks extension, `subscriptions/listen`, input-required results and `x-mcp-header` parameters,
   none advertised: no tool declares a parameter header, and nothing pushes. `logLevel` in `_meta` is not read, as
   this endpoint sends no log notifications. The `Origin` check against DNS rebinding that both revisions ask of a
-  server is not made, in either era, as before.
+  server was not made, in either era, as before. *2.6.1 makes it: see the addendum.*
 
 ## Alternatives considered
 
@@ -76,3 +77,29 @@ bundle.
   serve layer.
 - **2026-07-28 alone.** A client of an earlier revision would have no way in: it sends `initialize` and no version
   header.
+
+## Addendum, 2.6.1 — `Origin`, and a `tools/call` that costs the heap nothing
+
+**`/mcp` checks `Origin` in both eras, before anything of the request is read.** Both revisions ask it
+(*"Servers MUST validate the Origin header on all incoming connections to prevent DNS rebinding attacks"*), and
+2026-07-28's Streamable HTTP page adds *"If the Origin header is present and invalid, servers MUST respond with
+HTTP 403 Forbidden"*, its body optionally *"a JSON-RPC error response that has no id"*, with no code named.
+
+- **What is valid.** No `Origin` at all: every client but a browser sends none. A loopback origin, `http` or
+  `https` on `localhost`, `127.0.0.1` or `[::1]` with any port or none: a page whose origin is loopback was
+  served from this machine. One the operator lists in `AGNOSAI_MCP_ALLOWED_ORIGINS`, comma-separated, and
+  `AGNOSAI_PUBLIC_URL`'s own, compared in lowercase with any trailing `/` dropped, scheme and port included. `*`
+  in the list turns the check off, and the boot log says so at WARN.
+- **What is not compared: `Host`.** A rebinding page is served from the attacker's name, which the browser sends
+  as `Origin` *and* as `Host`, so a same-host rule would let in exactly the attack it is for.
+- **The refusal** is 403, a JSON-RPC 2.0 error with code `-32000`, JSON-RPC's range for errors a server defines,
+  message `Forbidden: Origin not allowed`, and no `id`: the body is not read, and MCP's schema has no null id. An
+  `Origin` on two lines, `null` (an opaque origin) and an empty one are refused. It is logged at WARN with the
+  origin, or `(not printable)`.
+- **Behaviour change**: a browser page on another origin that called `/mcp` now gets 403 until the operator lists
+  it. With auth off, the default, any page a browser opened could call the endpoint's tools before.
+
+**A `tools/call`'s input and output are the request arena's.** `agnosai_tool_input_new_a(a)` builds the input
+and its map in `a` and makes `a` the allocator the tool answers in, as the tool loop gives each call an arena of
+its own; `agnosai_tool_input_set_a` copies each argument's key there. The 601 B a call is 0, in both eras, which
+`tests/server_routes_mcp_2026.tcyr` now asserts where it asserted only that the two eras matched.

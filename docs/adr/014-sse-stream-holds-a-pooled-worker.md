@@ -86,7 +86,10 @@ Rejected alternatives:
 - **A stream that never ends holds its worker forever.** `agnosai_sse_crew_stream`
   exits on the subscription closing (`agnosai_event_bus_remove`) or on the client
   lagging. A crew that runs indefinitely and never lags keeps its worker
-  indefinitely — correctly, but at that cost.
+  indefinitely — correctly, but at that cost. *Since 2.6.1 it also exits when its client
+  hangs up or a write to it fails, and when the server stops
+  ([ADR 041](041-a-stream-ends-when-its-client-or-the-server-does.md)): before, a
+  client that left did not free the worker either.*
 - **Deployments that expect many concurrent watchers must raise the pool and
   size memory for it**, or front the endpoint with something that multiplexes.
   This is the one place where the port's capacity story is materially worse than

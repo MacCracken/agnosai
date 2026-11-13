@@ -80,6 +80,7 @@ include "src/done_word.cyr"
 include "src/semaphore.cyr"
 include "src/log_fields.cyr"
 include "src/http_headers.cyr"
+include "src/shutdown.cyr"
 include "src/jcs.cyr"
 include "src/tls_permit.cyr"
 # telemetry — depends on nothing in `src/` (sakshi, chrono and io only), so it
@@ -263,6 +264,26 @@ fn _agnosai_main_hoosh_url(): i64 {
 # id `AGNOSAI_A2A_SIGNING_KID` (`agnosai` unset) and with `AGNOSAI_A2A_JKU` in its header when set.
 # The card is signed once, for the public URL, so a key without one is an ERROR and the card goes
 # out unsigned; so does a key that will not read, as a bad JWT key boots too.
+# The browser origins `/mcp` lets in besides loopback ones (2.6.1): `AGNOSAI_MCP_ALLOWED_ORIGINS`,
+# comma-separated, and the origin of `AGNOSAI_PUBLIC_URL`, as a page served from it is the server's own.
+fn _agnosai_main_mcp_origins(): i64 {
+    var list = agnosai_mcp_origins_from(getenv("AGNOSAI_MCP_ALLOWED_ORIGINS"));
+    var pu = getenv("AGNOSAI_PUBLIC_URL");
+    if (pu != 0 && strlen(pu) > 0) {
+        var o = agnosai_url_origin(str_from(pu));
+        if (o != 0) { vec_push(list, o); }
+    }
+    for (var i = 0; i < vec_len(list); i = i + 1) {
+        var e = vec_get(list, i);
+        if (str_eq_cstr(e, "*") == 1) {
+            sakshi_warn("AGNOSAI_MCP_ALLOWED_ORIGINS is *: /mcp checks no Origin, against DNS rebinding", 78);
+        } else {
+            _agnosai_main_log_kv(SK_INFO, "MCP allows origin", 17, "origin", 6, e);
+        }
+    }
+    return list;
+}
+
 fn _agnosai_main_a2a_config(auth): i64 {
     var cfg = agnosai_a2a_config_new();
     var v = getenv("AGNOSAI_PUBLIC_URL");
@@ -566,6 +587,7 @@ fn main(): i64 {
       agnosai_orchestrator_audit(orchestrator), agnosai_orchestrator_approval_gate(orchestrator));
     # 2.6.0, ADR 040 — the A2A v1.0 endpoint's settings: the URL its card names it under.
     agnosai_app_state_with_a2a(state, _agnosai_main_a2a_config(auth));
+    agnosai_app_state_with_mcp_origins(state, _agnosai_main_mcp_origins());
 
     var port = _agnosai_main_port();
     if (sakshi_get_level() >= SK_INFO) {
@@ -585,6 +607,8 @@ fn main(): i64 {
     # A failure here is a warning, not a boot failure: a server that cannot
     # drain is strictly better than no server, and the oracle has no
     # corresponding refusal.
+    # How long a stop waits for the requests in flight (2.6.1).
+    AGNOSAI_SHUTDOWN_GRACE_SECS = agnosai_shutdown_grace_env();
     if (agnosai_serve_install_signals() == 0) {
         sakshi_warn(
           "could not install signal handlers — shutdown will not be graceful", 67);
@@ -608,7 +632,12 @@ fn main(): i64 {
         rc = agnosai_serve_with_rate_limit(state, INADDR_ANY(), port,
           rl_x1000, agnosai_rate_limit_env_burst());
     }
-    if (rc == 0) { sakshi_info("server shut down gracefully", 27); }
+    # "Gracefully" only when the drain found nothing left in flight (2.6.1): a second signal or a grace
+    # that ran out cut requests short, which the drain has already said at WARN.
+    if (rc == 0) {
+        if (agnosai_serve_drain_left() == 0) { sakshi_info("server shut down gracefully", 27); }
+        else { sakshi_info("server shut down", 16); }
+    }
 
     # The oracle's `_tracing_guard` flushes pending spans when it drops at the
     # end of `main`. Cyrius has no `Drop`, so the drop is written out — and it

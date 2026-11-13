@@ -395,6 +395,84 @@ fn _t_legacy_suite(): i64 {
     return 0;
 }
 
+# --- Origin, against DNS rebinding (2.6.1) ------------------------------------
+
+fn _t_origin(s, origin): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, _t_std("tools/list", 0));
+    if (origin != 0) {
+        str_builder_add_cstr(sb, "Origin: ");
+        str_builder_add_cstr(sb, origin);
+        str_builder_add_cstr(sb, "\r\n");
+    }
+    return _t_send(s, _t_body("tools/list", "", "9"), str_cstr(str_builder_build(sb)));
+}
+
+fn _t_let_in(s, origin, name): i64 { return assert_eq(agnosai_route_status(_t_origin(s, origin)), HTTP_OK, name); }
+fn _t_kept_out(s, origin, name): i64 {
+    return assert_eq(agnosai_route_status(_t_origin(s, origin)), HTTP_FORBIDDEN, name);
+}
+
+fn _t_origin_suite(): i64 {
+    var s = _t_state();
+    _t_let_in(s, 0, "no Origin: a client that is no browser is served");
+    _t_let_in(s, "http://localhost:6274", "a page served from localhost is let in");
+    _t_let_in(s, "http://localhost", "on any port, or none");
+    _t_let_in(s, "https://127.0.0.1:8443", "from 127.0.0.1");
+    _t_let_in(s, "http://[::1]:3000", "and from [::1]");
+    _t_let_in(s, "HTTP://LocalHost:9", "whatever its case");
+
+    var r = _t_origin(s, "https://evil.example");
+    assert_eq(agnosai_route_status(r), HTTP_FORBIDDEN, "any other origin is a 403, as both revisions ask");
+    assert_eq(_t_code(r), AGNOSAI_MCP_FORBIDDEN, "carrying a JSON-RPC error");
+    assert(_t_str_is(agnosai_route_body(r), "jsonrpc", "2.0") == 1, "a JSON-RPC 2.0 one");
+    assert_eq(_t_obj(agnosai_route_body(r), "id"), 0, "with no id, as the request is not read");
+    _t_kept_out(s, "null", "an opaque origin is kept out");
+    _t_kept_out(s, "http://localhost.evil.example", "a name that begins like localhost is not it");
+    _t_kept_out(s, "http://127.0.0.1.nip.io", "nor one that begins like 127.0.0.1");
+    _t_kept_out(s, "http://localhost:", "a port must have digits");
+    _t_kept_out(s, "http://localhost:80a", "and only digits");
+    _t_kept_out(s, "ftp://localhost", "and the scheme must be http or https");
+    _t_kept_out(s, "", "an empty Origin is no origin it lets in");
+    var two = _t_send(s, _t_body("tools/list", "", "9"),
+      str_cstr(str_cat(str_from(_t_std("tools/list", 0)),
+          str_from("Origin: http://localhost\r\nOrigin: https://evil.example\r\n"))));
+    assert_eq(agnosai_route_status(two), HTTP_FORBIDDEN, "an Origin on two lines is kept out");
+
+    # The earlier revision is held to it too.
+    var lr = _t_send(s, str_from("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}"),
+      "Origin: https://evil.example\r\n");
+    assert_eq(agnosai_route_status(lr), HTTP_FORBIDDEN, "a 2025-03-26 request from a foreign origin is a 403 too");
+
+    # The operator's list, and its parse.
+    var list = agnosai_mcp_origins_from(" https://App.Example.com/ , ,http://b.test:81// ,");
+    assert_eq(vec_len(list), 2, "a comma-separated list, its empty entries skipped");
+    assert(str_eq_cstr(vec_get(list, 0), "https://app.example.com") == 1, "each trimmed, lowercased, no trailing /");
+    assert(str_eq_cstr(vec_get(list, 1), "http://b.test:81") == 1, "every trailing / gone");
+    assert_eq(vec_len(agnosai_mcp_origins_from(0)), 0, "unset is none");
+    agnosai_app_state_with_mcp_origins(s, list);
+    assert_eq(agnosai_app_state_mcp_origins(s), list, "the state keeps the list it is given");
+    assert_eq(agnosai_mcp_origin_ok_a(default_alloc(), s, 0), 1, "no Origin is let in, called directly");
+    assert_eq(agnosai_mcp_origin_ok_a(default_alloc(), s, "https://app.example.com"), 1, "a listed one too");
+    assert_eq(agnosai_mcp_origin_ok_a(default_alloc(), s, "https://evil.example"), 0, "and no other");
+    assert_eq(agnosai_mcp_origin_ok_a(default_alloc(), 0, "http://localhost"), 1, "a loopback one with no state");
+    _t_let_in(s, "https://app.example.com", "an origin the operator lists is let in");
+    _t_let_in(s, "https://APP.example.com", "in any case");
+    _t_kept_out(s, "https://app.example.com:8443", "but on its own port only");
+    _t_kept_out(s, "http://app.example.com", "and its own scheme");
+    _t_kept_out(s, "https://evil.example", "and nothing else is");
+    agnosai_app_state_with_mcp_origins(s, agnosai_mcp_origins_from("*"));
+    _t_let_in(s, "https://evil.example", "* lets in every origin, turning the check off");
+    agnosai_app_state_with_mcp_origins(s, 0);
+
+    assert(str_eq_cstr(agnosai_url_origin(str_from("https://Agnosai.Example.com:8443/base?x#y")),
+        "https://agnosai.example.com:8443") == 1, "a public URL's origin is its scheme, host and port");
+    assert(str_eq_cstr(agnosai_url_origin(str_from("http://h.test")), "http://h.test") == 1, "with no path too");
+    assert_eq(agnosai_url_origin(str_from("h.test/x")), 0, "and a URL with no scheme has none");
+    assert_eq(agnosai_url_origin(str_from("https:///x")), 0, "nor one with no host");
+    return 0;
+}
+
 # --- through the router, as the binary dispatches it --------------------------
 
 fn _t_router_suite(): i64 {
@@ -433,8 +511,7 @@ fn _t_cost(s, body: Str, text: Str): i64 {
 
 # **The 2026-07-28 path adds nothing to the global heap**: its checks, its header copies, its
 # `_meta` and its extra result fields are all the request arena's, so each request costs what the
-# same method costs the earlier revision. Not 0: a `tools/call` builds its tool's input and output
-# on the global heap in both eras, which this release does not touch.
+# same method costs the earlier revision. Since 2.6.1 a `tools/call` costs it nothing in either.
 fn _t_heap_suite(): i64 {
     var s = _t_state();
     var mc = _t_body("tools/call", "\"name\":\"echo\",\"arguments\":{\"message\":\"hi\"},", "1");
@@ -443,8 +520,10 @@ fn _t_heap_suite(): i64 {
     var lc = str_cat(str_from("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","),
       str_from("\"params\":{\"name\":\"echo\",\"arguments\":{\"message\":\"hi\"}}}"));
     var lct = str_cat(str_from("POST /mcp HTTP/1.1\r\n\r\n"), lc);
-    assert_eq(_t_cost(s, mc, mct), _t_cost(s, lc, lct),
-      "a 2026-07-28 tools/call costs the heap what an earlier one does");
+    # **0 in either era (2.6.1)**: the call's input and its tool's output are the request arena's.
+    # 2.6.0 measured 601 bytes a call here, and asserted only that the two eras matched.
+    assert_eq(_t_cost(s, mc, mct), 0, "a 2026-07-28 tools/call leaves nothing on the global heap");
+    assert_eq(_t_cost(s, lc, lct), 0, "nor does an earlier one");
 
     var ml = _t_body("resources/read", "\"uri\":\"agnosai://agents/researcher\",", "2");
     var mlt = str_cat(str_cat(str_from("POST /mcp HTTP/1.1\r\nMCP-Protocol-Version: 2026-07-28\r\n"),
@@ -459,6 +538,12 @@ fn _t_heap_suite(): i64 {
         str_from("Mcp-Method: server/discover\r\n\r\n")),
       d);
     assert(_t_cost(s, d, dt) <= 1, "and server/discover costs it nothing to speak of");
+    var dot = str_cat(str_cat(str_from("POST /mcp HTTP/1.1\r\nMCP-Protocol-Version: 2026-07-28\r\n"),
+        str_from("Mcp-Method: server/discover\r\nOrigin: http://localhost:6274\r\n\r\n")), d);
+    assert(_t_cost(s, d, dot) <= 1, "nor does checking its Origin (2.6.1)");
+    var dbad = str_cat(str_cat(str_from("POST /mcp HTTP/1.1\r\nMCP-Protocol-Version: 2026-07-28\r\n"),
+        str_from("Mcp-Method: server/discover\r\nOrigin: https://evil.example\r\n\r\n")), d);
+    assert(_t_cost(s, d, dbad) <= 1, "nor refusing it");
     return 0;
 }
 
@@ -470,6 +555,7 @@ fn main(): i64 {
     _t_methods_suite();
     _t_refusals_suite();
     _t_legacy_suite();
+    _t_origin_suite();
     _t_router_suite();
     _t_heap_suite();
     return assert_summary();

@@ -1368,6 +1368,14 @@ fn _t_sse_transport_gates(): i64 {
     assert(_t_contains(&out, n, "text/event-stream") == 0,
       "...with no SSE headers written");
 
+    # A parameter that is not UTF-8 once decoded is the router's 400, here too (2.6.1).
+    var nb = _t_serve_over_pipe(str_from("GET /api/v1/crews/%FF/stream HTTP/1.1\r\nHost: x\r\n\r\n"), &out);
+    assert(_t_starts_with(&out, nb, "HTTP/1.1 400 Bad Request\r\n") == 1, "a stream id that is not UTF-8 is 400");
+    # And an escaped id is the crew's: decoded, then validated.
+    var ne = _t_serve_over_pipe(str_from(
+        "GET /api/v1/crews/%33f2504e0-4f89-41d3-9a0c-0305e82c3301/stream HTTP/1.1\r\nHost: x\r\n\r\n"), &out);
+    assert(_t_starts_with(&out, ne, "HTTP/1.1 200 OK\r\n") == 1, "an escaped crew id streams, as the id it spells");
+
     # With auth configured the stream is refused BEFORE any chunked header is
     # written — a 401 must be a normal buffered response, not a stream carrying
     # an error frame.
@@ -1437,6 +1445,51 @@ fn _t_shutdown_signal_sets_flag(): i64 {
     }
     assert(agnosai_serve_stop_requested() == 1,
       "a delivered SIGTERM sets the stop flag the serve loops poll");
+    assert_eq(agnosai_serve_force_requested(), 0, "and does not cut the drain short");
+
+    # A second signal ends the drain's wait (2.6.1): through 2.6.0 the thread read one and returned.
+    sys_kill(sys_getpid(), SIGTERM);
+    var w2 = 0;
+    while (w2 < 2000 && agnosai_serve_force_requested() == 0) { sleep_ms(10); w2 = w2 + 10; }
+    assert_eq(agnosai_serve_force_requested(), 1, "a second SIGTERM asks the drain to stop waiting");
+    return 0;
+}
+
+# --- Requests in flight (2.6.1) ---------------------------------------------------
+
+var _t_if_fd = 0;
+var _t_if_done = 0;
+
+fn _t_if_thread(arg): i64 {
+    var req = str_from("GET /api/v1/crews/3f2504e0-4f89-41d3-9a0c-0305e82c3301/stream HTTP/1.1\r\nHost: x\r\n\r\n");
+    agnosai_serve_handler(0, _t_if_fd, str_data(req), str_len(req));
+    atomic_store(&_t_if_done, 1);
+    return 0;
+}
+
+# **The handler counts a request in flight for as long as it runs**, every return included, so a stop
+# can wait for it. A stream is one, and leaves the count when its client does.
+fn _t_inflight_counted(): i64 {
+    assert_eq(agnosai_serve_inflight(), 0, "no request is in flight after every one this suite answered");
+    var s = _t_state();
+    agnosai_serve_mount(s, 0);
+    var bus = agnosai_app_state_events(s);
+    agnosai_event_bus_subscribe(bus, str_from("3f2504e0-4f89-41d3-9a0c-0305e82c3301"));
+    _sandhi_server_ignore_sigpipe();
+    var fds[8];
+    sys_socketpair(1, 1, 0, &fds);
+    _t_if_fd = load32(&fds);
+    _t_if_done = 0;
+    thread_create_detached(&_t_if_thread, 0);
+    var w = 0;
+    while (w < 400 && agnosai_serve_inflight() == 0) { sleep_ms(5); w = w + 1; }
+    assert_eq(agnosai_serve_inflight(), 1, "a stream is a request in flight while it streams");
+    sys_close(load32(&fds + 4));
+    var w2 = 0;
+    while (w2 < 400 && atomic_load(&_t_if_done) == 0) { sleep_ms(5); w2 = w2 + 1; }
+    assert_eq(atomic_load(&_t_if_done), 1, "and ends when its client leaves");
+    assert_eq(agnosai_serve_inflight(), 0, "leaving the count as it found it");
+    sys_close(load32(&fds));
     return 0;
 }
 
@@ -2071,10 +2124,11 @@ fn main(): i64 {
     _t_allocation_profile();
     _t_arena_overflow_degrades_not_faults();
     _t_spill_arena_still_costs_nothing_when_it_fits();
-    # LAST — installs a process-wide signal mask; see the fn's own note.
-    _t_shutdown_signal_sets_flag();
-
     _t_protocols_through_the_handler();
+    _t_inflight_counted();
+    # LAST — installs a process-wide signal mask, and a stop requested ends every stream after it;
+    # see the fn's own note.
+    _t_shutdown_signal_sets_flag();
     return assert_summary();
 }
 

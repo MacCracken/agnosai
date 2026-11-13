@@ -1,0 +1,193 @@
+# =========================================================================
+# shutdown — how the server stops, and how a connection it holds learns it is over.
+#
+# No rust-old origin. hyper learns that a client left when a write fails, and axum's graceful
+# shutdown ends a connection's future; the port has neither a runtime nor futures, so a stream that
+# lives on a pool worker (ADR 014) asks for itself, between its writes.
+#
+# A stream waits on its connection instead of sleeping: `agnosai_stream_wait` sleeps the same
+# interval, and wakes early when the client hangs up. Before 2.6.1 the crew stream slept and wrote
+# without reading a write's result, so a client that left was noticed by nothing, and its worker,
+# one of `AGNOSAI_SERVE_WORKERS`, stayed held until the crew ended.
+#
+# Port-local, at `src/` root, as it mirrors nothing in rust-old. The route modules that stream
+# include it themselves (include-once), so a suite that includes a route needs nothing more.
+# =========================================================================
+
+# `struct pollfd` events (Linux). `POLLRDHUP` is the peer's FIN: the client closed, or shut its
+# writing half. `POLLERR` and `POLLHUP` are reported whether asked for or not.
+var AGNOSAI_POLLERR = 0x8;
+var AGNOSAI_POLLHUP = 0x10;
+var AGNOSAI_POLLNVAL = 0x20;
+var AGNOSAI_POLLRDHUP = 0x2000;
+
+# What `agnosai_stream_wait` answers.
+var AGNOSAI_STREAM_WAITED = 0;
+var AGNOSAI_STREAM_GONE = 1;
+var AGNOSAI_STREAM_STOPPING = 2;
+
+# --- The stop, and what is in flight ----------------------------------------
+
+# The stop flag every serve loop polls (ADR 013). sandhi reads it and never writes it, so a plain
+# `store64` from the signal thread is sufficient: an aligned 8-byte store is single-copy-atomic on
+# every target here, with nothing to tear and no ordering to establish. Here rather than in
+# `src/server/serve.cyr` since 2.6.1, as the streams that read it are included before that file.
+var _agnosai_serve_stop = 0;
+
+# Set by a second shutdown signal: the drain stops waiting for what is in flight.
+var _agnosai_serve_force = 0;
+
+# How many requests a worker is running, from the moment the serve handler has a request to the
+# moment it has answered it. Atomic: every worker enters and leaves.
+var _agnosai_serve_inflight = 0;
+
+# How many requests the last drain left in flight when it stopped waiting: 0 when it drained.
+var _agnosai_serve_left = 0;
+
+# How long a stop waits for the requests in flight, in seconds (`AGNOSAI_SHUTDOWN_GRACE_SECS`).
+#
+# 25, so that under Kubernetes' default 30-second grace period the drain has finished, and its log
+# line is written and the spans are flushed, before the SIGKILL that follows it. 0 waits for nothing,
+# the stop as it was through 2.6.0.
+var AGNOSAI_SHUTDOWN_GRACE_SECS = 25;
+
+# How long no request may be in flight before the drain counts the server drained, in milliseconds.
+#
+# A connection sandhi accepted and queued for a worker is not in flight until a worker has read its
+# request, and a worker takes the next one microseconds after it answers the last. Without a quiet
+# period a drain that read 0 in that gap would end the process under a request about to start.
+var AGNOSAI_SHUTDOWN_QUIET_MS = 50;
+
+# `AGNOSAI_SHUTDOWN_GRACE_SECS` as whole seconds: `v` a C string, or 0 when unset. Unset, empty or not
+# a whole number is the default; a number is taken as it is, 0 included, up to a day. Read apart from
+# `getenv`, so a test can reach the interpretation with a value (the process has no `setenv`).
+fn agnosai_shutdown_grace_from(v): i64 {
+    if (v == 0) { return AGNOSAI_SHUTDOWN_GRACE_SECS; }
+    var n = strlen(v);
+    if (n == 0) { return AGNOSAI_SHUTDOWN_GRACE_SECS; }
+    var acc = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var c = load8(v + i) & 255;
+        if (c < 48 || c > 57) { return AGNOSAI_SHUTDOWN_GRACE_SECS; }
+        acc = acc * 10 + c - 48;
+        if (acc > 86400) { return 86400; }
+    }
+    return acc;
+}
+
+# The grace the environment asks for, in seconds.
+fn agnosai_shutdown_grace_env(): i64 {
+    return agnosai_shutdown_grace_from(getenv("AGNOSAI_SHUTDOWN_GRACE_SECS"));
+}
+
+# Whether a shutdown has been requested. Exposed so a test can observe the flag
+# without reaching into the module's globals.
+fn agnosai_serve_stop_requested(): i64 {
+    if (_agnosai_serve_stop != 0) { return 1; }
+    return 0;
+}
+
+# Whether a second signal asked the drain to stop waiting.
+fn agnosai_serve_force_requested(): i64 {
+    if (_agnosai_serve_force != 0) { return 1; }
+    return 0;
+}
+
+# How many requests the last drain left in flight: 0 when the server drained, or when it never stopped.
+# What `main` reads to say whether the stop was graceful.
+fn agnosai_serve_drain_left(): i64 {
+    return _agnosai_serve_left;
+}
+
+# How many requests are in flight now.
+fn agnosai_serve_inflight(): i64 {
+    return atomic_load(&_agnosai_serve_inflight);
+}
+
+# A worker has a request.
+fn _agnosai_serve_enter(): i64 {
+    atomic_fetch_add(&_agnosai_serve_inflight, 1);
+    return 0;
+}
+
+# A worker has answered it.
+fn _agnosai_serve_leave(): i64 {
+    atomic_fetch_add(&_agnosai_serve_inflight, 0 - 1);
+    return 0;
+}
+
+# Wait for the requests in flight to finish, for at most `grace_ms`. Answers how many were still in
+# flight when it stopped waiting: 0 when the server drained.
+#
+# Called once the serve loop has stopped accepting. Drained means nothing in flight for
+# `AGNOSAI_SHUTDOWN_QUIET_MS` together. A second signal ends the wait at once.
+#
+# What it waits for is requests, not crews: a crew submitted to run on its own (`returnImmediately`,
+# the `delegate` tool) is the orchestrator's, and stops with the process, to resume at the next start
+# when `AGNOSAI_STATE_DIR` keeps its log (ADR 036). A stream is a request, and ends at the stop
+# (`agnosai_stream_wait`), so it does not hold the drain.
+fn agnosai_serve_drain(grace_ms): i64 {
+    var start = clock_now_ms();
+    var quiet_since = 0 - 1;
+    while (1 == 1) {
+        var n = agnosai_serve_inflight();
+        var now = clock_now_ms();
+        if (n == 0) {
+            if (quiet_since < 0) { quiet_since = now; }
+            if (now - quiet_since >= AGNOSAI_SHUTDOWN_QUIET_MS) {
+                _agnosai_serve_left = 0;
+                return 0;
+            }
+        } else {
+            quiet_since = 0 - 1;
+        }
+        if (_agnosai_serve_force != 0 || now - start >= grace_ms) {
+            _agnosai_serve_left = n;
+            return n;
+        }
+        sleep_ms(5);
+    }
+    return 0;
+}
+
+# --- A stream's wait ---------------------------------------------------------
+
+# Wait up to `ms` milliseconds on `cfd`, waking early if the client has gone. Answers
+# `AGNOSAI_STREAM_GONE` when the peer closed, reset or half-closed the connection,
+# `AGNOSAI_STREAM_STOPPING` when the server is stopping, else `AGNOSAI_STREAM_WAITED` once `ms`
+# passed.
+#
+# **A stream ends at a stop, so a stop's drain does not wait on it.** A stream lasts its task's
+# life, which a drain's grace does not bound, and its client reconnects, an `EventSource` by itself,
+# to a server that is not stopping. The stop is read before the wait and after it, so it is seen
+# within one wait, 50 ms at most for either stream.
+#
+# **Only a hang-up wakes it, never data.** The events asked for are `POLLRDHUP` alone, so bytes a
+# client sends after its request (it should send none: the stream's answer says
+# `Connection: close`) neither wake the wait nor turn it into a busy loop. A half-close counts as
+# leaving, as nginx counts it for a proxied request: a client that will send nothing more and reads
+# a stream is not one a browser or an SDK makes.
+#
+# A file or a pipe's writing end, which the suites stream into, has no hang-up to report until its
+# reader goes: the wait is then the sleep it replaced. With no `ppoll`, it is that sleep.
+fn agnosai_stream_wait(cfd, ms): i64 {
+    if (_agnosai_serve_stop != 0) { return AGNOSAI_STREAM_STOPPING; }
+    var t = ms;
+    if (t < 0) { t = 0; }
+    var pfd[8];
+    store32(&pfd, cfd);
+    store16(&pfd + 4, AGNOSAI_POLLRDHUP);
+    store16(&pfd + 6, 0);
+    var ts[16];
+    store64(&ts, t / 1000);
+    store64(&ts + 8, (t % 1000) * 1000000);
+    var r = sys_ppoll(&pfd, 1, &ts, 0, 0);
+    if (r == 0 - 38 || r == 0 - 78) { sleep_ms(t); }
+    if (r > 0) {
+        var rev = load16(&pfd + 6);
+        var gone = AGNOSAI_POLLRDHUP | AGNOSAI_POLLHUP | AGNOSAI_POLLERR | AGNOSAI_POLLNVAL;
+        if ((rev & gone) != 0) { return AGNOSAI_STREAM_GONE; }
+    }
+    if (_agnosai_serve_stop != 0) { return AGNOSAI_STREAM_STOPPING; }
+    return AGNOSAI_STREAM_WAITED;
+}

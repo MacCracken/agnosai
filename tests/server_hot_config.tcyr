@@ -208,6 +208,67 @@ fn _t_holder_is_torn_free(): i64 {
     return 0;
 }
 
+# --- Change notification: the rest of `watch` (2.6.1) ------------------------
+
+var _t_w_holder = 0;
+var _t_w_delay = 0;
+var _t_w_next = 0;
+var _t_w_woke = 0;
+
+fn _t_updater(arg): i64 {
+    sleep_ms(_t_w_delay);
+    agnosai_config_holder_update(_t_w_holder, _t_w_next);
+    return 0;
+}
+
+# A waiter on its own thread: it waits from generation `arg`, and says it woke, and what it read.
+fn _t_waiter(arg): i64 {
+    var g = agnosai_config_holder_wait(_t_w_holder, arg, 5000);
+    if (g != arg) {
+        if (agnosai_runtime_config_max_concurrent_crews(agnosai_config_holder_get(_t_w_holder)) == 99) {
+            atomic_fetch_add(&_t_w_woke, 1);
+        }
+    }
+    return 0;
+}
+
+fn _t_holder_notifies(): i64 {
+    var h = agnosai_config_holder_new(agnosai_runtime_config_new());
+    assert_eq(agnosai_config_holder_generation(h), 0, "a new holder is at generation 0");
+    assert_eq(agnosai_config_holder_changed(h, 0), 0, "and has not changed since it");
+    agnosai_config_holder_update(h, agnosai_runtime_config_with_max_crews(agnosai_runtime_config_new(), 3));
+    assert_eq(agnosai_config_holder_generation(h), 1, "an update moves it on by one");
+    assert_eq(agnosai_config_holder_changed(h, 0), 1, "a reader that saw 0 has a change to read");
+    assert_eq(agnosai_config_holder_changed(h, 1), 0, "one that saw 1 has none");
+
+    var t0 = clock_now_ms();
+    assert_eq(agnosai_config_holder_wait(h, 0, 5000), 1, "a wait from a generation already passed answers at once");
+    assert(clock_now_ms() - t0 < 1000, "without waiting");
+    var t1 = clock_now_ms();
+    assert_eq(agnosai_config_holder_wait(h, 1, 60), 1, "with no update, the wait times out on the generation it had");
+    assert(clock_now_ms() - t1 >= 55, "after its timeout");
+
+    # An update on another thread wakes the waiter, which reads the config that update published.
+    _t_w_holder = h;
+    _t_w_delay = 50;
+    _t_w_next = agnosai_runtime_config_with_max_crews(agnosai_runtime_config_new(), 99);
+    _t_w_woke = 0;
+    thread_create_detached(&_t_waiter, 1);
+    thread_create_detached(&_t_waiter, 1);
+    thread_create_detached(&_t_updater, 0);
+    var t2 = clock_now_ms();
+    var g = agnosai_config_holder_wait(h, 1, 5000);
+    assert_eq(g, 2, "an update wakes a waiter");
+    var took = clock_now_ms() - t2;
+    assert(took >= 40 && took < 2000, "when it is published, not at a timeout");
+    assert_eq(agnosai_runtime_config_max_concurrent_crews(agnosai_config_holder_get(h)), 99,
+      "and the waiter reads the config it published");
+    var w = 0;
+    while (w < 400 && atomic_load(&_t_w_woke) < 2) { sleep_ms(5); w = w + 1; }
+    assert_eq(atomic_load(&_t_w_woke), 2, "every waiter wakes, each reading the new config");
+    return 0;
+}
+
 fn main(): i64 {
     alloc_init();
     sakshi_set_level(SK_FATAL);
@@ -218,6 +279,7 @@ fn main(): i64 {
     _t_deserialize_is_strict();
     _t_holder();
     _t_holder_is_torn_free();
+    _t_holder_notifies();
 
     return assert_summary();
 }

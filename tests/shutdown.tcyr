@@ -1,0 +1,193 @@
+# =========================================================================
+# shutdown.tcyr — src/shutdown.cyr: a stream's wait, and the drain a stop waits in (2.6.1).
+#
+# No rust-old counterpart: the module is port-local. The routes that stream (crew SSE, A2A) are
+# tested ending on a departed client in their own suites; this one pins the two primitives they and
+# the serve loop stand on, each answer of the wait and each way out of the drain, with times bounded
+# loosely enough for a loaded machine and tightly enough to tell a wake from a timeout.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/shutdown.cyr"
+include "tests/test_tmp.cyr"
+
+# --- the wait ---------------------------------------------------------------
+
+fn _t_pair(fds): i64 { return sys_socketpair(1, 1, 0, fds); }
+
+fn _t_wait_suite(): i64 {
+    var fds[8];
+    assert_eq(_t_pair(&fds), 0, "a connected pair of sockets");
+    var srv = load32(&fds);
+    var cli = load32(&fds + 4);
+
+    var t0 = clock_now_ms();
+    assert_eq(agnosai_stream_wait(srv, 60), AGNOSAI_STREAM_WAITED, "a client still there: the wait times out");
+    assert(clock_now_ms() - t0 >= 55, "after the interval, as the sleep it replaced did");
+
+    # Data is not a hang-up: a client that writes does not wake the wait or end the stream.
+    sys_write(cli, "x", 1);
+    var t1 = clock_now_ms();
+    assert_eq(agnosai_stream_wait(srv, 40), AGNOSAI_STREAM_WAITED, "bytes from the client are not leaving");
+    assert(clock_now_ms() - t1 >= 35, "and do not wake the wait early, so it is no busy loop");
+
+    sys_close(cli);
+    var t2 = clock_now_ms();
+    assert_eq(agnosai_stream_wait(srv, 5000), AGNOSAI_STREAM_GONE, "a client that hung up: gone");
+    assert(clock_now_ms() - t2 < 1000, "at once, not after the interval");
+    sys_close(srv);
+
+    # A half-close counts as leaving.
+    var hf[8];
+    _t_pair(&hf);
+    sock_shutdown(load32(&hf + 4), 1);
+    assert_eq(agnosai_stream_wait(load32(&hf), 5000), AGNOSAI_STREAM_GONE, "a client that shut its writing half: gone");
+    sys_close(load32(&hf));
+    sys_close(load32(&hf + 4));
+
+    # A file has no hang-up to report: the wait is a sleep.
+    var path = str_cstr(str_from(_tt_tmp_path("shutdown-wait", "")));
+    var fd = file_open(path, O_WRONLY | O_CREAT | O_TRUNC, 420);
+    var t3 = clock_now_ms();
+    assert_eq(agnosai_stream_wait(fd, 30), AGNOSAI_STREAM_WAITED, "a file: the wait is the sleep");
+    assert(clock_now_ms() - t3 >= 25, "for its interval");
+    file_close(fd);
+    sys_unlink(path);
+
+    # A stop requested before the wait answers at once; one requested during it, when it ends.
+    var sf[8];
+    _t_pair(&sf);
+    _agnosai_serve_stop = 1;
+    var t4 = clock_now_ms();
+    assert_eq(agnosai_stream_wait(load32(&sf), 5000), AGNOSAI_STREAM_STOPPING, "a stop: the stream ends");
+    assert(clock_now_ms() - t4 < 1000, "without waiting");
+    _agnosai_serve_stop = 0;
+    _t_stop_after_ms = 30;
+    thread_create_detached(&_t_stopper, 0);
+    var t5 = clock_now_ms();
+    assert_eq(agnosai_stream_wait(load32(&sf), 200), AGNOSAI_STREAM_STOPPING,
+      "a stop requested during the wait is answered as it ends");
+    assert(clock_now_ms() - t5 >= 150, "which is no later than the interval");
+    _agnosai_serve_stop = 0;
+    sys_close(load32(&sf));
+    sys_close(load32(&sf + 4));
+    return 0;
+}
+
+var _t_stop_after_ms = 0;
+
+fn _t_stopper(arg): i64 {
+    sleep_ms(_t_stop_after_ms);
+    _agnosai_serve_stop = 1;
+    return 0;
+}
+
+# --- the drain --------------------------------------------------------------
+
+var _t_hold_ms = 0;
+var _t_again_ms = 0;
+var _t_again_n = 1;
+
+# A request in flight for `_t_hold_ms`; with `_t_again_ms` above 0, `_t_again_n` more begin one after
+# another, each that long after the last ended.
+fn _t_request(arg): i64 {
+    sleep_ms(_t_hold_ms);
+    _agnosai_serve_leave();
+    if (_t_again_ms > 0) {
+        for (var k = 0; k < _t_again_n; k = k + 1) {
+            sleep_ms(_t_again_ms);
+            _agnosai_serve_enter();
+            sleep_ms(_t_hold_ms);
+            _agnosai_serve_leave();
+        }
+    }
+    return 0;
+}
+
+fn _t_drain_suite(): i64 {
+    assert_eq(agnosai_serve_inflight(), 0, "nothing in flight at rest");
+    var t0 = clock_now_ms();
+    assert_eq(agnosai_serve_drain(5000), 0, "with nothing in flight the server is drained");
+    assert_eq(agnosai_serve_drain_left(), 0, "leaving nothing");
+    var e0 = clock_now_ms() - t0;
+    assert(e0 >= AGNOSAI_SHUTDOWN_QUIET_MS - 5, "once the quiet period has passed");
+    assert(e0 < 1000, "and no later");
+
+    _t_hold_ms = 120;
+    _t_again_ms = 0;
+    _agnosai_serve_enter();
+    thread_create_detached(&_t_request, 0);
+    var t1 = clock_now_ms();
+    assert_eq(agnosai_serve_drain(5000), 0, "a request in flight is waited for");
+    assert(clock_now_ms() - t1 >= 115, "until it has finished");
+    assert_eq(agnosai_serve_inflight(), 0, "and the count is back to nothing");
+
+    # A worker that takes the next queued request just after answering one: the drain does not end
+    # in the gap between them.
+    _t_hold_ms = 60;
+    _t_again_ms = 10;
+    _agnosai_serve_enter();
+    thread_create_detached(&_t_request, 0);
+    var t2 = clock_now_ms();
+    assert_eq(agnosai_serve_drain(5000), 0, "two requests back to back are both waited for");
+    assert(clock_now_ms() - t2 >= 125, "the second as well as the first");
+
+    # And a third: the quiet period starts again at each gap, rather than once at the first.
+    _t_again_n = 2;
+    _agnosai_serve_enter();
+    thread_create_detached(&_t_request, 0);
+    var t2b = clock_now_ms();
+    assert_eq(agnosai_serve_drain(5000), 0, "three requests back to back are all waited for");
+    assert(clock_now_ms() - t2b >= 195, "the third as well");
+    _t_again_n = 1;
+
+    # One that outlasts the grace is left, and counted.
+    _agnosai_serve_enter();
+    var t3 = clock_now_ms();
+    assert_eq(agnosai_serve_drain(80), 1, "the grace ends the wait, saying what was left");
+    assert_eq(agnosai_serve_drain_left(), 1, "and keeping it for main to read");
+    var e3 = clock_now_ms() - t3;
+    assert(e3 >= 75 && e3 < 1000, "at the grace");
+    assert_eq(agnosai_serve_drain(0), 1, "a grace of 0 waits for nothing");
+
+    # A second signal ends it at once.
+    _agnosai_serve_force = 1;
+    var t4 = clock_now_ms();
+    assert_eq(agnosai_serve_drain(5000), 1, "a forced stop does not wait");
+    assert(clock_now_ms() - t4 < 1000, "at all");
+    _agnosai_serve_force = 0;
+    _agnosai_serve_leave();
+    assert_eq(agnosai_serve_inflight(), 0, "and the count is balanced");
+    assert_eq(agnosai_serve_drain(5000), 0, "a drain after them all finds the server drained");
+    assert_eq(agnosai_serve_drain_left(), 0, "and says so, whatever the last one left");
+    assert_eq(agnosai_serve_stop_requested(), 0, "no stop is requested by draining");
+    return 0;
+}
+
+fn _t_grace_suite(): i64 {
+    assert_eq(agnosai_shutdown_grace_from(0), 25, "unset: 25 seconds");
+    assert_eq(agnosai_shutdown_grace_from(""), 25, "empty: the default");
+    assert_eq(agnosai_shutdown_grace_from("10"), 10, "a number of seconds is taken");
+    assert_eq(agnosai_shutdown_grace_from("0"), 0, "0 is taken, and waits for nothing");
+    assert_eq(agnosai_shutdown_grace_from("10s"), 25, "anything but digits is the default");
+    assert_eq(agnosai_shutdown_grace_from("-1"), 25, "a sign too");
+    assert_eq(agnosai_shutdown_grace_from("99999999999999999999"), 86400, "and a day at most");
+    assert_eq(agnosai_shutdown_grace_env(), agnosai_shutdown_grace_from(getenv("AGNOSAI_SHUTDOWN_GRACE_SECS")),
+      "the environment's grace is read through the same parse");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    test_group("shutdown");
+    _t_wait_suite();
+    _t_drain_suite();
+    _t_grace_suite();
+    _tt_cleanup();
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+sys_exit_group(f);

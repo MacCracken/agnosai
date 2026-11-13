@@ -45,6 +45,7 @@
 include "src/http_headers.cyr"
 include "src/arena_pool.cyr"
 include "src/jcs.cyr"
+include "src/shutdown.cyr"
 
 # The protocol version this endpoint speaks, as `A2A-Version` and the card spell it: Major.Minor.
 var AGNOSAI_A2A_PROTOCOL_VERSION = "1.0";
@@ -1399,6 +1400,8 @@ fn _agnosai_a2a_stream_run(job, cfd): i64 {
     var pause = 1;
     while (gone == 0) {
         reset_via(sa);
+        # A stop is read each pass as well as in the wait (2.6.1).
+        if (agnosai_serve_stop_requested() == 1) { break; }
         var cur = agnosai_orchestrator_crew(o, crew_id);
         # Gone from the registry while streamed: evicted or forgotten, with nothing more to say.
         if (cur == 0) { break; }
@@ -1432,7 +1435,9 @@ fn _agnosai_a2a_stream_run(job, cfd): i64 {
                 if (sandhi_server_send_chunk(cfd, ":\n\n", 3) < 0) { break; }
                 last_ping = now;
             }
-            sleep_ms(pause);
+            # Waits on the connection, so a client that hung up ends the stream now, and a stop
+            # ends it whole, the task going on (2.6.1).
+            if (agnosai_stream_wait(cfd, pause) != AGNOSAI_STREAM_WAITED) { break; }
             pause = pause * 2;
             if (pause > AGNOSAI_A2A_POLL_MS) { pause = AGNOSAI_A2A_POLL_MS; }
         }

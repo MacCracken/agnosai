@@ -693,6 +693,71 @@ fn _t_stream_suite(): i64 {
     assert(str_eq_cstr(bayan_json_v_str(_t_obj(_t_obj(sl, "status"), "state")), "TASK_STATE_CANCELED") == 1,
       "and its last, canceled");
 
+    # **A client that leaves ends its stream, not its task (2.6.1).** The stream waits on its
+    # connection between polls, so a hang-up is seen within one, where a sleep saw nothing.
+    _sandhi_server_ignore_sigpipe();
+    var lid = _t_risky_task(s, "m-leave");
+    var lq = _t_id_params(lid);
+    _t_sub_resp = _t_call(s, "SubscribeToTask", lq);
+    var fds[8];
+    assert_eq(sys_socketpair(1, 1, 0, &fds), 0, "a connected pair of sockets");
+    var cli = load32(&fds + 4);
+    _t_sub_fd = load32(&fds);
+    _t_sub_done = 0;
+    assert(thread_create_detached(&_t_sub_thread, 0) != 0, "the subscription runs on a thread");
+    var rbuf = alloc(4096);
+    var rgot = 0;
+    for (var r3 = 0; r3 < 200 && rgot == 0; r3 = r3 + 1) {
+        if (fd_wait_ready(cli, 0, 10) == 1) { rgot = sys_read(cli, rbuf, 4096); }
+    }
+    assert(rgot > 0, "and the client reads its first event");
+    # Past the first poll's 1 ms, so the stream is in its longest wait when the client goes.
+    sleep_ms(120);
+    var lt0 = clock_now_ms();
+    sys_close(cli);
+    for (var w3 = 0; w3 < 400 && atomic_load(&_t_sub_done) == 0; w3 = w3 + 1) { sleep_ms(2); }
+    assert_eq(atomic_load(&_t_sub_done), 1, "a client that hangs up ends the stream");
+    assert(clock_now_ms() - lt0 < 400, "within a poll");
+    assert(_t_task_state_is(_t_result(_t_call(s, "GetTask", lq)), "TASK_STATE_WORKING") == 1,
+      "and the task works on");
+    _t_call(s, "CancelTask", lq);
+
+    # **A stop ends a stream whole, and the task works on (2.6.1)**: its last chunk is sent, for the client
+    # to resubscribe to a server that is not stopping.
+    var sid = _t_risky_task(s, "m-stop");
+    var sq = _t_id_params(sid);
+    _t_sub_resp = _t_call(s, "SubscribeToTask", sq);
+    var sfds[8];
+    sys_socketpair(1, 1, 0, &sfds);
+    var scli = load32(&sfds + 4);
+    _t_sub_fd = load32(&sfds);
+    _t_sub_done = 0;
+    thread_create_detached(&_t_sub_thread, 0);
+    var sbuf = alloc(8192);
+    var sgot = 0;
+    for (var r4 = 0; r4 < 200 && sgot == 0; r4 = r4 + 1) {
+        if (fd_wait_ready(scli, 0, 10) == 1) { sgot = sys_read(scli, sbuf, 8192); }
+    }
+    assert(sgot > 0, "a subscriber reads its first event");
+    sleep_ms(120);
+    var st0 = clock_now_ms();
+    _agnosai_serve_stop = 1;
+    for (var w4 = 0; w4 < 400 && atomic_load(&_t_sub_done) == 0; w4 = w4 + 1) { sleep_ms(2); }
+    _agnosai_serve_stop = 0;
+    assert_eq(atomic_load(&_t_sub_done), 1, "a stop ends the stream");
+    assert(clock_now_ms() - st0 < 400, "within a poll");
+    for (var r5 = 0; r5 < 50; r5 = r5 + 1) {
+        if (fd_wait_ready(scli, 0, 10) == 1) {
+            var more = sys_read(scli, sbuf + sgot, 8192 - sgot);
+            if (more <= 0) { break; }
+            sgot = sgot + more;
+        }
+    }
+    assert(str_ends_with(str_from_buf(sbuf, sgot), str_from("0\r\n\r\n")) == 1, "whole, its last chunk sent");
+    assert(_t_task_state_is(_t_result(_t_call(s, "GetTask", sq)), "TASK_STATE_WORKING") == 1, "and the task works on");
+    _t_call(s, "CancelTask", sq);
+    sys_close(scli);
+
     # Through the router, as the binary dispatches it.
     var body = _t_rpc("SendStreamingMessage", _t_send_params("via the router", ""));
     var h = _t_hdrs("A2A-Version: 1.0\r\n", body);

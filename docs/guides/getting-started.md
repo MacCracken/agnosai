@@ -36,8 +36,8 @@ One crew, one task, no LLM. The file's header shows how to attach a hoosh client
 
 It listens on `PORT`, else `AGNOSAI_PORT`, else 8080, and reaches hoosh at `HOOSH_URL`.
 Auth is off unless `AGNOSAI_AUTH_ENABLED` is set — a shared secret via
-`AGNOSAI_AUTH_SECRET`, or RS256 JWTs via `AGNOSAI_JWT_PUBLIC_KEY` (with optional
-`AGNOSAI_JWT_ISSUER` / `AGNOSAI_JWT_AUDIENCE`). Rate limiting is on by default; see
+`AGNOSAI_AUTH_SECRET`, or RS256 JWTs via `AGNOSAI_JWT_PUBLIC_KEY`, a PEM public key or, since 2.6.1, a
+certificate holding one (with optional `AGNOSAI_JWT_ISSUER` / `AGNOSAI_JWT_AUDIENCE`). Rate limiting is on by default; see
 [ADR 021](../adr/021-rate-limit-mounted-by-default.md). The README lists every route.
 
 ## Run the tests

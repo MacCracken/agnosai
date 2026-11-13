@@ -217,7 +217,8 @@ fn _agnosai_auth_load_marker(dst, s, len): i64 {
 #
 # Both labels are accepted because the oracle's `DecodingKey::from_rsa_pem` does:
 # `-----BEGIN PUBLIC KEY-----` (SPKI, what openssl emits and what the oracle's
-# fixture uses) and `-----BEGIN RSA PUBLIC KEY-----` (PKCS#1).
+# fixture uses) and `-----BEGIN RSA PUBLIC KEY-----` (PKCS#1). Its third,
+# `-----BEGIN CERTIFICATE-----`, is `_agnosai_auth_cert_der`'s (2.6.1).
 fn _agnosai_auth_pem_to_der(pem: Str, der_out, der_max): i64 {
     _pem_init();
     var p = str_data(pem);
@@ -255,6 +256,51 @@ fn _agnosai_auth_pem_to_der(pem: Str, der_out, der_max): i64 {
     return _pem_b64_decode(p, body, epos, der_out, der_max);
 }
 
+# The DER of the first `CERTIFICATE` block in `pem`, into `der_out`. Returns its length, or -1 when
+# the PEM holds none.
+fn _agnosai_auth_cert_der(pem: Str, der_out, der_max): i64 {
+    _pem_init();
+    var p = str_data(pem);
+    var n = str_len(pem);
+    if (n <= 0) { return 0 - 1; }
+    var b_cert[27];
+    var e_cert[25];
+    _agnosai_auth_load_marker(&b_cert, "-----BEGIN CERTIFICATE-----", 27);
+    _agnosai_auth_load_marker(&e_cert, "-----END CERTIFICATE-----", 25);
+    var bpos = _pem_find(p, n, 0, &b_cert, 27);
+    if (bpos < 0) { return 0 - 1; }
+    var body = bpos + 27;
+    var epos = _pem_find(p, n, body, &e_cert, 25);
+    if (epos < 0) { return 0 - 1; }
+    return _pem_b64_decode(p, body, epos, der_out, der_max);
+}
+
+# The RSA key of the certificate `der`, its modulus into `nbuf` and its exponent into `ebuf`, as
+# `rsa_pubkey_from_der` answers them. Returns the modulus's length, or -1 for a certificate sigil will
+# not parse or whose key is not RSA.
+#
+# **A certificate is a key here, not a chain (2.6.1).** The Rust line's `DecodingKey::from_rsa_pem`
+# took one and used its key, and so does this: nothing about the certificate is checked but that it
+# parses and holds an RSA key, its validity dates and issuer included, as `jsonwebtoken` checked
+# none. Its `SubjectPublicKeyInfo` is what an SPKI PEM would have held.
+fn _agnosai_auth_cert_rsa(der, dlen, nbuf, nmax, ebuf, emax, elen_out): i64 {
+    var c = x509_cert_alloc();
+    if (c == 0) { return 0 - 1; }
+    if (x509_parse_into(der, dlen, c, 0) == 0) { return 0 - 1; }
+    # An RSA block only an RSA certificate has: 0 for any other key.
+    var blk = x509_cert_rsa_pubkey(c);
+    if (blk == 0) { return 0 - 1; }
+    var nl = load64(blk + 528);
+    var el = load64(blk + 536);
+    # The buffers' bounds, before the copies into them. sigil's block caps both at the same sizes, so
+    # no certificate it parses reaches them; they hold if either cap moves.
+    if (nl <= 0 || nl > nmax || el <= 0 || el > emax) { return 0 - 1; }
+    memcpy(nbuf, blk, nl);
+    memcpy(ebuf, blk + 512, el);
+    store64(elen_out, el);
+    return nl;
+}
+
 # Decode the configured PEM into the modulus and exponent this config verifies
 # with. Returns 1 on success, 0 on a PEM the key parser rejects.
 #
@@ -284,9 +330,15 @@ fn agnosai_jwt_config_prepare(j): i64 {
     if (st == AGNOSAI_JWT_KEY_OK) { return 1; }
     if (st == AGNOSAI_JWT_KEY_BAD) { return 0; }
 
+    # A key's PEM first, SPKI or PKCS#1, as through 2.6.0; then a certificate's (2.6.1), its DER in
+    # 8 KiB, room for a 4096-bit key's certificate and its extensions.
+    var pem = agnosai_jwt_config_public_key_pem(j);
     var der[1024];
-    var dlen = _agnosai_auth_pem_to_der(agnosai_jwt_config_public_key_pem(j), &der, 1024);
-    if (dlen <= 0) {
+    var dlen = _agnosai_auth_pem_to_der(pem, &der, 1024);
+    var cder[8192];
+    var clen = 0 - 1;
+    if (dlen <= 0) { clen = _agnosai_auth_cert_der(pem, &cder, 8192); }
+    if (dlen <= 0 && clen <= 0) {
         store64(j + AGN_JC_PREPARED, AGNOSAI_JWT_KEY_BAD);
         return 0;
     }
@@ -294,8 +346,14 @@ fn agnosai_jwt_config_prepare(j): i64 {
     var nbuf = alloc(AGNOSAI_JWT_MAX_MODULUS);
     var ebuf = alloc(AGNOSAI_JWT_MAX_EXPONENT);
     var elen_out = alloc(8);
-    var nlen = rsa_pubkey_from_der(&der, dlen, nbuf, AGNOSAI_JWT_MAX_MODULUS,
-      ebuf, AGNOSAI_JWT_MAX_EXPONENT, elen_out);
+    var nlen = 0;
+    if (dlen > 0) {
+        nlen = rsa_pubkey_from_der(&der, dlen, nbuf, AGNOSAI_JWT_MAX_MODULUS,
+          ebuf, AGNOSAI_JWT_MAX_EXPONENT, elen_out);
+    } else {
+        nlen = _agnosai_auth_cert_rsa(&cder, clen, nbuf, AGNOSAI_JWT_MAX_MODULUS,
+          ebuf, AGNOSAI_JWT_MAX_EXPONENT, elen_out);
+    }
     if (nlen <= 0) {
         store64(j + AGN_JC_PREPARED, AGNOSAI_JWT_KEY_BAD);
         return 0;

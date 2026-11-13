@@ -50,7 +50,6 @@ Carried from the Rust line as *goals*, not as comparisons: the Cyrius baseline s
 
 | Release | What it does |
 |---|---|
-| **2.6.1** | Server edges: SSE, shutdown, paths, config, JWT keys |
 | **2.6.2** | The tracing export: the remaining spans, and trace ids in log lines |
 | **2.7.0** | Tests and benchmarks for what nothing covers yet |
 | **2.7.1** | Benchmark levels that measure the code, not the heap |
@@ -115,20 +114,13 @@ headers checked against the body, by hand after bote's era rules
 operator can sign and a JSON-RPC endpoint whose tasks are crews, streamed over SSE
 ([ADR 040](../adr/040-a2a-v1-tasks-are-crews.md)).
 
-#### 2.6.1 — server edges: SSE, shutdown, paths, config, JWT keys
-
-An SSE stream holds one of the 100 pool workers for the crew's life and does not notice a departed client:
-`src/server/routes/sse.cyr` discards all six write results sandhi now returns. Shutdown does not drain in-flight
-requests. Path parameters are not percent-decoded. `/mcp` does not check `Origin`, in either MCP era, which both
-revisions ask of a server against DNS rebinding (ADR 039). An MCP `tools/call` keeps **601 B a call** on the global
-heap, in either era, its tool's input and output built there: measured at 2.6.0 in
-`tests/server_routes_mcp_2026.tcyr`, which asserts only that the newer era adds nothing to it. `hot_config` has no change notification. A certificate-format JWT
-key is refused, where the Rust line took one: `auth.cyr` takes SPKI and PKCS#1 PEM only.
-
-**The serve handler's arena read of `traceparent` is not covered.** `sandhi_server_find_header_a(…, "traceparent")`
-runs only on the arena branch, which needs a sandhi worker arena, and the pipe harness reaches only the bare branch, as
-it does for every header. **Fix:** a harness that runs one request through a real pooled worker with an arena,
-asserting that the crew's spans carry the inbound trace id.
+2.6.1 closed the server's edges. A stream ends when its client hangs up or a write to it fails, within a poll, and
+when the server stops; a stop drains the requests in flight, for a grace, and a second signal ends the wait
+([ADR 041](../adr/041-a-stream-ends-when-its-client-or-the-server-does.md)). Path parameters are percent-decoded;
+`/mcp` checks `Origin` against DNS rebinding in both eras, and its `tools/call` costs the global heap nothing, where
+it kept 601 B (ADR 039's addendum); `hot_config` wakes a reader on a reload; a JWT key can come in a certificate; and
+`tests/server_live.tcyr` runs the server on real pooled workers, where the arena branch of the `traceparent` read is
+asserted.
 
 #### 2.6.2 — the tracing export: the remaining spans, and trace ids in log lines
 
@@ -232,8 +224,8 @@ request to raise only if a definition file needs one, and it is not owed.
 ### Deleting `rust-old/` — the release after `personality`
 
 **The Rust port is not done while bhava is missing** (*Settled decisions*), so this has no number until bhava lands.
-Everything else the Rust line had is pinned above: the
-certificate JWT key at 2.6.1 and the spans at 2.6.2 (`StateStore` shipped in 2.5.0). Every Rust spec stays reachable after:
+Everything else the Rust line had is pinned above: the spans at
+2.6.2 (`StateStore` shipped in 2.5.0, the certificate JWT key in 2.6.1). Every Rust spec stays reachable after:
 `git show 2.1.0:rust-old/src/<path>`.
 
 - [ ] `git rm -r rust-old`, then delete the ignored `rust-old/target/` (~13 GB) from disk, which `git rm` leaves.
@@ -389,7 +381,7 @@ and log fields at 2.3.6.
 | B5 | `personality` (*Waiting on another project*) |
 | B6 | shipped in 2.4.1, budgets and caps (ADR 033) |
 | B7 | 2.6.2, the tracing export (its item 8 and 9 shipped in 2.3.0) |
-| B8 | 2.6.1, server edges; RSA over 4096 bits is *Waiting on another project* |
+| B8 | shipped in 2.6.1, server edges (ADR 041); RSA over 4096 bits is *Waiting on another project* |
 | B9, B32 | shipped in 2.3.5, WASM tools (ADR 019's 2.3.5 addendum) |
 | B10, B11 | 2.3.7, JSON forms and log fields |
 | B12, B14 | 2.7.0, tests and benchmarks |
@@ -397,7 +389,7 @@ and log fields at 2.3.6.
 | B15 | `StateStore` shipped in 2.5.0 (ADR 036); the rest at 2.7.2, housekeeping |
 | B16 | chunked request bodies (*Waiting on another project*) |
 | B18, B20, B27 | 2.7.1, benchmark levels |
-| B25 | 2.6.1, server edges |
+| B25 | shipped in 2.6.1, server edges |
 | B34 | 2.7.2, housekeeping |
 | B33 | 2.3.1, and its hoosh half in 2.3.3 |
 | B35, B40 | shipped: confinement in 2.3.4 (ADR 031), and B40's WASM half in 2.3.3 with kavach 3.14.7 |

@@ -37,6 +37,12 @@
 # extracted value is handed to the handler which validates it — `get_crew`
 # answers 422 for a malformed UUID, not 404, because axum's `Path<Uuid>`
 # extractor runs after routing.
+#
+# **A parameter is percent-decoded (2.6.1)**, as axum's `Path` decodes it: matched on the raw path,
+# so `%2F` is part of one segment, then decoded, `%XX` to its byte and anything else as it stands,
+# `+` included, which is a space only in a query. One that decodes to invalid UTF-8 is a 400, after
+# auth, where axum's extractor refuses it. Through 2.6.0 a parameter was the raw segment, so
+# `DELETE /api/v1/tools/my%20tool` looked for a tool named `my%20tool`.
 # =========================================================================
 
 # The oracle's `MAX_BODY_BYTES` (`mod.rs:38`) — 10 MiB.
@@ -99,7 +105,8 @@ enum AgnosaiRouteMatchOff {
     AGN_RM_PARAM = 8;
     AGN_RM_METHOD_MISMATCH = 16;
     AGN_RM_ALLOW = 24;   # on a mismatch, the methods the path takes (2.1.7)
-    AGN_ROUTE_MATCH_SIZE = 32;
+    AGN_RM_BAD_PARAM = 32;   # 1 when the parameter decodes to invalid UTF-8 (2.6.1)
+    AGN_ROUTE_MATCH_SIZE = 40;
 }
 
 # The methods a matched path takes, as bits — what a 405's `Allow` lists (2.1.7, roadmap B8).
@@ -111,8 +118,12 @@ enum AgnosaiAllowBit {
 
 # The resolved route, or `AGN_ROUTE_NONE` when nothing matched.
 fn agnosai_route_match_id(m): i64 { return load64(m + AGN_RM_ID); }
-# The captured path parameter, or 0 for a route that takes none.
+# The captured path parameter, percent-decoded, or 0 for a route that takes none. For one that
+# decodes to invalid UTF-8 it is the segment as it arrived, and `agnosai_route_match_bad_param` is 1.
 fn agnosai_route_match_param(m): i64 { return load64(m + AGN_RM_PARAM); }
+
+# 1 when the path parameter decodes to bytes that are not UTF-8, which is a 400.
+fn agnosai_route_match_bad_param(m): i64 { return load64(m + AGN_RM_BAD_PARAM); }
 
 # Whether the path matched a known route but the method did not — axum answers
 # **405**, not 404, when a path exists under a different method.
@@ -126,7 +137,92 @@ fn _agnosai_rm_new_a(a, id, param, mismatch): i64 {
     store64(m + AGN_RM_PARAM, param);
     store64(m + AGN_RM_METHOD_MISMATCH, mismatch);
     store64(m + AGN_RM_ALLOW, 0);
+    store64(m + AGN_RM_BAD_PARAM, 0);
+    if (param != 0) {
+        var d = agnosai_route_param_decode_a(a, param);
+        if (d == 0) { store64(m + AGN_RM_BAD_PARAM, 1); }
+        else { store64(m + AGN_RM_PARAM, d); }
+    }
     return m;
+}
+
+# The value of hex digit `c`, or -1.
+fn _agnosai_route_hex(c): i64 {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    return 0 - 1;
+}
+
+# Whether `n` bytes at `p` are UTF-8 as RFC 3629 has it, as Rust's `str::from_utf8` reads them: no
+# overlong form, no surrogate, nothing above U+10FFFF, no sequence cut short.
+fn agnosai_utf8_valid(p, n): i64 {
+    var i = 0;
+    while (i < n) {
+        var c = load8(p + i) & 255;
+        if (c < 0x80) { i = i + 1; continue; }
+        var len = 0;
+        var lo = 0x80;
+        var hi = 0xBF;
+        if (c >= 0xC2 && c <= 0xDF) { len = 2; }
+        elif (c == 0xE0) { len = 3; lo = 0xA0; }
+        elif (c >= 0xE1 && c <= 0xEC) { len = 3; }
+        elif (c == 0xED) { len = 3; hi = 0x9F; }
+        elif (c >= 0xEE && c <= 0xEF) { len = 3; }
+        elif (c == 0xF0) { len = 4; lo = 0x90; }
+        elif (c >= 0xF1 && c <= 0xF3) { len = 4; }
+        elif (c == 0xF4) { len = 4; hi = 0x8F; }
+        else { return 0; }
+        if (i + len > n) { return 0; }
+        var c1 = load8(p + i + 1) & 255;
+        if (c1 < lo || c1 > hi) { return 0; }
+        for (var k = 2; k < len; k = k + 1) {
+            var ck = load8(p + i + k) & 255;
+            if (ck < 0x80 || ck > 0xBF) { return 0; }
+        }
+        i = i + len;
+    }
+    return 1;
+}
+
+# Path parameter `raw`, percent-decoded in `a`: `%` and two hex digits is that byte, and every other
+# byte, a `%` that starts no escape and `+` among them, stands as it is, which is the
+# `percent-encoding` crate's decode under axum's `Path`. Answers 0 when the bytes are not UTF-8.
+#
+# With no `%` the parameter is answered as it is, checked and not copied: most are UUIDs.
+fn agnosai_route_param_decode_a(a, raw: Str): i64 {
+    var p = str_data(raw);
+    var n = str_len(raw);
+    var pct = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        if ((load8(p + i) & 255) == 37) { pct = 1; break; }
+    }
+    if (pct == 0) {
+        if (agnosai_utf8_valid(p, n) == 0) { return 0; }
+        return raw;
+    }
+    var out = alloc_via(a, n + 1);
+    var o = 0;
+    var j = 0;
+    while (j < n) {
+        var c = load8(p + j) & 255;
+        if (c == 37 && j + 2 < n) {
+            var h1 = _agnosai_route_hex(load8(p + j + 1) & 255);
+            var h2 = _agnosai_route_hex(load8(p + j + 2) & 255);
+            if (h1 >= 0 && h2 >= 0) {
+                store8(out + o, h1 * 16 + h2);
+                o = o + 1;
+                j = j + 3;
+                continue;
+            }
+        }
+        store8(out + o, c);
+        o = o + 1;
+        j = j + 1;
+    }
+    store8(out + o, 0);
+    if (agnosai_utf8_valid(out, o) == 0) { return 0; }
+    return str_new_a(a, out, o);
 }
 
 # A method mismatch: the path matched, under methods `allow` (`AGN_ALLOW_*` bits).
@@ -346,7 +442,10 @@ fn _agnosai_seg_is(path: Str, at, lit): i64 {
 # table plus every near-miss that could cross a group boundary, under all four
 # method values including the 0 that every unmapped verb resolves to.
 fn agnosai_route_resolve_a(a, method, path: Str): i64 {
-    var param = alloc_via(a, 8);
+    # On the stack (2.6.1): the slot lives no longer than this call, and costs `a` nothing.
+    var pslot: i64[1];
+    store64(&pslot, 0);
+    var param = &pslot;
     var seen = 0;
 
     var api = _agnosai_path_prefix_end(path, "/api/v1");
@@ -654,6 +753,12 @@ fn _agnosai_route_dispatch_inner(a, state, method, path: Str, auth_header: Str, 
     if (json_ct == 0 && _agnosai_route_takes_json(id) == 1) {
         return agnosai_route_error_a(al, AGNOSAI_HTTP_UNSUPPORTED_MEDIA_TYPE,
           str_from_a(al, "expected request with `Content-Type: application/json`"));
+    }
+
+    # After auth, as axum's `Path` extractor runs in the handler, behind the auth layer (2.6.1).
+    if (agnosai_route_match_bad_param(m) == 1) {
+        return agnosai_route_error_a(al, HTTP_BAD_REQUEST,
+          str_from_a(al, "path parameter is not valid UTF-8"));
     }
 
     var param = agnosai_route_match_param(m);

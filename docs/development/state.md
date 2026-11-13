@@ -2,9 +2,28 @@
 
 > Refreshed every release. CLAUDE.md is preferences/process/procedures
 > (durable); this file is **state** (volatile).
-> Last refreshed: 2026-11-13 (the 2.6.0 release gate).
+> Last refreshed: 2026-11-13 (the 2.6.1 release gate).
 
-## Now — 2.6.0
+## Now — 2.6.1
+
+| | |
+|---|---|
+| **version** | **2.6.1** (cut 2026-11-13, `version-bump.sh`'s UTC date): server edges. A stream ends when its client hangs up or the server stops, and a stop drains the requests in flight, for a grace (ADR 041); path parameters are percent-decoded; `/mcp` checks `Origin` in both eras, and its `tools/call` costs the global heap nothing (ADR 039's addendum); `hot_config` wakes a reader on a reload; a JWT key can come in a certificate |
+| **cyrius pin** | **6.7.18**, unchanged |
+| **tests** | **120 suites, 13,858 assertions, 0 failed** under `CYRIUS_DCE=1` with wasmtime 50.0.1, counted from each suite's printed line as well as its exit code, run with `TMPDIR` under `build/` as `/tmp`'s quota was full (a first run there failed suites on EDQUOT, as compile errors). 2.6.0's tree read 13,632: +226, the two new suites `shutdown` (44: each answer of a stream's wait, each way out of the drain, the grace's parse) and `server_live` (24: the server on a loopback port with pooled workers and real sockets, a crew joining the inbound `traceparent` through a worker's arena, and a stop that answers the request in flight and ends a stream whole), and `server_router` 963 (decoding), `server_routes_mcp_2026` 157 (`Origin`, a `tools/call` at 0 B), `server_hot_config` 41, `server_routes_sse` 51 and `a2a_v1` 214 (a client that leaves, a stop), `server_auth` 143 (certificate keys), `server_serve` 346. **74 mutants** in two groups run side by side in copies of the tree: 65 killed on the first pass, and of the 9 that got through, 4 were gaps each closed by a test (an unescaped byte no UTF-8 holds, an escape with one hex digit, `+` beside an escape, a whole certificate with no END line), 1 a curve check the RSA block's own check made dead, removed, and 4 no input reaches: the truncation check and a lead byte above F4 (the byte after a parameter is always `/` or its end), the stream's first write (the next write fails too), and the certificate's buffer bound (sigil caps its block at the same sizes). Writing them found three gaps no test had: a third request back to back in a drain, a four-byte overlong form, and a broken third byte |
+| **coverage** | **99%**: 117/117 files, 2,121/2,131 fns (gate `--min 80`), the same 10 unreferenced as 2.6.0. A first run read 2,114/2,131: seven new functions only other code reached, each now named by a test |
+| **dist** | `dist/agnosai.cyr` 54,348 lines + `dist/agnosai-guard.cyr` 1,034, both v2.6.1, by `wc -l` (2.6.0's read 53,685 and 1,034). Sidecars unchanged. `[lib]` gains `src/shutdown.cyr`, 126 modules |
+| **binary** | `build/agnosai` **3,273,816 B** (2.6.0: 3,260,888). aarch64 **7,307,888 B** (7,307,248), not compacted, built and not started. The native binary answers `/ready` with `"version":"2.6.1"`; over real HTTP `/mcp` answers a foreign `Origin` 403 with `-32000` and no `id`, a loopback one 200, and `DELETE /api/v1/tools/%FF` 400. **Its drain, against a Python gateway that answers in 2 s**: a crew POST in flight at the SIGTERM was answered 200, `completed`, with the model's answer, and the process exited 1.58 s after the signal, logging `requests in flight at the stop finished` and `server shut down gracefully`; against one that answers in 10 s, a second SIGTERM ended the wait and the process 67 ms later, logging both signals, `stopping with requests still in flight` and `server shut down` |
+| **deps** | Unchanged from 2.6.0, and not re-checked against GitHub this release |
+| **lock** | `cyrius.lock` unchanged: 119 files, 8 commit pins |
+| **gates** | `check-symbols.sh`: 3,869 top-level definitions across 127 files, no duplicates, all prefixed. `check-clean.sh`: fmt, lint, doc, doctest, vet, deny, `deps --verify` 119, lib snapshot 113, generated sources, log lengths, dist matches src. Fuzz 4/4. The example builds. CI replica (ubuntu:26.04, wasmtime 47.0.3, fresh user, all 8 pins from GitHub): **every `ci.yml` step passed**, 120 suites, 13,708 assertions, 0 failed, coverage 2,121/2,131, the example, fuzz 4/4 and `cyrius bench` |
+| **benchmarks** | Interleaved against a 2.6.0 build on the same `lib/`, three rounds of `server`, `protocols`, `core`, `rest_crews` and `orch` at a load of about 5: median **−0.3%** across 170 rows, 139 within 5%. `route_resolve_probe` 142 → 127 ns (−10.6%) and `route_resolve` 341 → 330 ns, the resolver's parameter slot on the stack. The full run read the four MCP rows +6% to +11%; `protocols.bcyr` alone in six interleaved pairs puts the `Origin` check at +1.6% to +4.7%, 0.1 to 0.4 µs a request, one header pass (`mcp_tools_list_2026_07_28` 8.27 → 8.55 µs), and the rest at run order. New rows: `mcp_tools_list_2026_07_28_origin` 9.26 µs, `route_resolve_param_uuid` 496 ns, `route_resolve_param_escaped` 485 ns. `bench-history.sh` appended 284 rows for 2.6.1 at a load of about 5; both kept-bytes lines read 0 |
+| **memory** | **An MCP `tools/call` keeps 0 B a call** on the global heap in either revision, where 2.6.0 measured 601 (`tests/server_routes_mcp_2026.tcyr`, which now asserts 0); checking an `Origin`, or refusing one, costs it nothing. The serve handler's stream check no longer keeps 48 B of every GET's route match. Both of `benches/rest_crews.bcyr`'s kept-bytes lines read 0 |
+| **build warnings** | Unchanged from 2.6.0: large static data, the DCE note, the two "refusing to overwrite stdlib leaf" lines, and the two `src/tool_loop.cyr` "assigning non-pointer to typed pointer" lines, at 1005 and 1182 |
+| **consumer** | Not re-run. agnostic pins 2.2.4 |
+| **upstream filings** | ⚠ **Seven not committed**, so not visible upstream, unchanged from 2.6.0: sigil (RSA over 4096 bits; the lane pool), sandhi (bytes per exchange; chunked bodies; the pooled connection's allocator), bote (MCP client), bayan (its escape one builder call a byte) |
+
+### 2.6.0 — the release (2026-11-13)
 
 | | |
 |---|---|

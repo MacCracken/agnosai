@@ -80,6 +80,9 @@ strictly better than no server, and the oracle has no corresponding refusal.
   1 = failed. Callers written against the old contract still behave correctly,
   because the failure value is unchanged — but anything treating *any* return as
   fatal now over-reports.
+- *2.6.1: in-flight requests are drained, and a second signal ends the wait
+  ([ADR 041](041-a-stream-ends-when-its-client-or-the-server-does.md)). The bullet below is the record
+  of why that was owed.*
 - **In-flight requests are not drained, and the binary is stricter about that
   than this ADR originally said.** The stop is "stop accepting", not "wait for
   quiescence".

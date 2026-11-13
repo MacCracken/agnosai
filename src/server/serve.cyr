@@ -64,6 +64,8 @@
 # the choice moved from the call site to `main`.
 # =========================================================================
 
+include "src/shutdown.cyr"
+
 # Per-worker request arena. Sized for the largest thing sandhi puts in it: the
 # request line, the header scan, and one response write. 64 KiB is generous
 # against sandhi's own 64 KiB default request cap.
@@ -172,22 +174,20 @@ var _agnosai_serve_limiter = 0;
 # it; sandhi 1.9.9 added `sandhi_server_options_stop_flag`, and 6.5.6 vendors
 # it. ADR 013 supersedes 012.
 #
-# The stop flag every serve loop polls. sandhi reads it and never writes it, so
-# a plain `store64` from the signal thread is sufficient — an aligned 8-byte
-# store is single-copy-atomic on every target here, with nothing to tear and no
-# ordering to establish.
-var _agnosai_serve_stop = 0;
+# The stop flag every serve loop polls is `_agnosai_serve_stop`, in `src/shutdown.cyr` since 2.6.1
+# beside the count of requests in flight and the drain that waits for them.
 
 # SIGINT | SIGTERM as a sigset_t bitmask. Bit `n-1` is signal `n`, so SIGINT (2)
 # is 0x2 and SIGTERM (15) is 0x4000.
 var AGNOSAI_SHUTDOWN_SIGMASK = 0x4002;
 
-# Read one signal off `sfd` and ask the serve loop to stop.
+# Read signals off `sfd`: the first asks the serve loop to stop, the second asks the drain to stop
+# waiting.
 #
-# Runs on its own thread for the whole process lifetime. It blocks in `read`,
-# which costs nothing, and the single `read` is all it needs: the flag is
-# level-triggered, so a second signal has nothing to add — the loop is already
-# stopping and re-reporting would only race the teardown.
+# Runs on its own thread for the whole process lifetime. It blocks in `read`, which costs nothing.
+# Through 2.6.0 it read one signal and returned, as a stop did not wait for anything a second could
+# cut short. Since the drain (2.6.1) waits up to `AGNOSAI_SHUTDOWN_GRACE_SECS` for the requests in
+# flight, a second Ctrl-C or SIGTERM ends that wait, as an operator pressing it twice means.
 #
 # `arg` is the signalfd. `signalfd_siginfo` is 128 bytes and every field is
 # discarded: *which* of the two signals arrived changes nothing about what
@@ -197,6 +197,11 @@ fn _agnosai_serve_signal_thread(arg): i64 {
     var n = sys_read(arg, &buf, 128);
     if (n > 0) { sakshi_info("received shutdown signal, draining", 34); }
     _agnosai_serve_stop = 1;
+    n = sys_read(arg, &buf, 128);
+    if (n > 0) {
+        sakshi_warn("received a second shutdown signal, not waiting for requests in flight", 69);
+        _agnosai_serve_force = 1;
+    }
     return 0;
 }
 
@@ -225,13 +230,6 @@ fn agnosai_serve_install_signals(): i64 {
     if (sfd < 0) { return 0; }
     thread_create(&_agnosai_serve_signal_thread, sfd);
     return 1;
-}
-
-# Whether a shutdown has been requested. Exposed so a test can observe the flag
-# without reaching into the module's globals.
-fn agnosai_serve_stop_requested(): i64 {
-    if (_agnosai_serve_stop != 0) { return 1; }
-    return 0;
 }
 
 # --- Method mapping -------------------------------------------------------
@@ -397,7 +395,19 @@ fn agnosai_serve_dispatch_callback(body: Str, resp): i64 {
 # arena (blocker #3). `sandhi_server_request_arena()` answers 0 under `run` /
 # `run_async`, which have no worker to own one; the bare forms are the fallback
 # so this handler still works if it is ever mounted on a non-pooled server.
+#
+# **Every request is counted in flight while it runs (2.6.1)**, so a stop can wait for it
+# (`agnosai_serve_drain`). The count is taken here, around the whole of it, rather than at each of
+# its returns.
 fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
+    _agnosai_serve_enter();
+    _agnosai_serve_handle(cfd, buf, blen);
+    _agnosai_serve_leave();
+    return 0;
+}
+
+# The request, answered. Its returns are all 0: there is nothing for the caller to decide.
+fn _agnosai_serve_handle(cfd, buf, blen): i64 {
     # **Wrapped so an oversized response degrades instead of faulting.** See
     # `_agnosai_arena_or_global_alloc` — a full arena answers 0, and nothing
     # downstream checks, so the raw arena turns a large render into a segfault.
@@ -525,7 +535,11 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
     # before any handler runs. Reproducing that ordering here rather than
     # short-circuiting on the path string is what keeps the two paths agreeing.
     if (method == AGNOSAI_METHOD_GET && head_only == 0) {
-        var sm = agnosai_route_resolve(method, path);
+        # In the request arena (2.6.1): through 2.6.0 the global heap kept 48 bytes of every GET's
+        # match, and would have kept a decoded parameter's copy as well.
+        var ra = a;
+        if (ra == 0) { ra = default_alloc(); }
+        var sm = agnosai_route_resolve_a(ra, method, path);
         if (agnosai_route_match_id(sm) == AGN_ROUTE_CREW_STREAM) {
             var ok = 1;
             # `agnosai_route_resolve` matches `/api/v1/crews/*/stream` on shape
@@ -541,10 +555,15 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
             # three wire-UUID sites are — see `_agnosai_uuid_key_a`. An uppercase
             # id would otherwise stream an empty history for a crew that exists.
             var stream_id = _agnosai_uuid_key_a(a, agnosai_route_match_param(sm));
-            if (stream_id == 0) {
+            # A parameter that is not UTF-8 once decoded is the dispatcher's 400 (2.6.1).
+            if (agnosai_route_match_bad_param(sm) == 1) {
+                _agnosai_serve_send(a, cfd, agnosai_route_error_a(ra, HTTP_BAD_REQUEST,
+                    str_from_a(ra, "path parameter is not valid UTF-8")), 0);
+                ok = 0;
+            } elif (stream_id == 0) {
                 _agnosai_serve_send(a, cfd,
-                  agnosai_route_error(AGNOSAI_HTTP_UNPROCESSABLE,
-                    str_from("crew id is not a valid UUID")), 0);
+                  agnosai_route_error_a(ra, AGNOSAI_HTTP_UNPROCESSABLE,
+                    str_from_a(ra, "crew id is not a valid UUID")), 0);
                 ok = 0;
             }
             if (ok == 1) { if (agnosai_route_needs_auth(AGN_ROUTE_CREW_STREAM) == 1) {
@@ -552,7 +571,7 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
                       agnosai_app_state_auth(_agnosai_serve_state), has_auth, auth_str);
                     if (st != HTTP_OK) {
                         _agnosai_serve_send(a, cfd,
-                          agnosai_route_error(st, str_from("unauthorized")), 0);
+                          agnosai_route_error_a(ra, st, str_from_a(ra, "unauthorized")), 0);
                         ok = 0;
                     }
                 } }
@@ -797,8 +816,10 @@ fn agnosai_serve_mount(state, limiter): i64 {
 # ask the loop to stop (ADR 012). Callers written against that contract still
 # behave correctly, since the failure value is unchanged.
 #
-# In-flight requests are not drained. A worker already holding a connection
-# finishes it; `idle_ms` bounds how long that can take.
+# **A stop drains what is in flight (2.6.1).** Once the loop has stopped accepting this waits, for
+# `AGNOSAI_SHUTDOWN_GRACE_SECS` at most, until no request is in flight, every stream having ended at
+# the stop, and logs what it found; a second signal ends the wait. Through 2.6.0 it returned at once,
+# and `main`'s exit then cut every request in flight short.
 #
 # **`addr` is a network-order IPv4 u32, not a string.** It is passed unmodified
 # to `sock_bind` → `sockaddr_in` → `store32(sa + 4, addr)` (`lib/net.cyr:99`),
@@ -809,7 +830,30 @@ fn agnosai_serve(state, addr, port): i64 {
     var opts = agnosai_serve_mount(state, 0);
     var rc = sandhi_server_run_pooled(addr, port, &agnosai_serve_handler, 0, opts);
     if (rc != 0) { _agnosai_serve_report_failure(opts); }
+    else { _agnosai_serve_drain_logged(AGNOSAI_SHUTDOWN_GRACE_SECS * 1000); }
     return rc;
+}
+
+# Drain, and say what was found. Answers what `agnosai_serve_drain` does.
+fn _agnosai_serve_drain_logged(grace_ms): i64 {
+    var at = agnosai_serve_inflight();
+    var left = agnosai_serve_drain(grace_ms);
+    if (left == 0) {
+        if (at > 0 && sakshi_get_level() >= SK_INFO) {
+            var sb = str_builder_new();
+            str_builder_add_int(sb, at);
+            var n = str_builder_build(sb);
+            sakshi_log_kv(SK_INFO, "requests in flight at the stop finished", 39, "requests", 8,
+              str_data(n), str_len(n));
+        }
+        return 0;
+    }
+    var wb = str_builder_new();
+    str_builder_add_int(wb, left);
+    var w = str_builder_build(wb);
+    sakshi_log_kv(SK_WARN, "stopping with requests still in flight", 38, "requests", 8,
+      str_data(w), str_len(w));
+    return left;
 }
 
 # The same, with rate limiting mounted — **what `src/main.cyr` calls by default**
@@ -819,6 +863,7 @@ fn agnosai_serve_with_rate_limit(state, addr, port, rate_x1000, burst): i64 {
     var opts = agnosai_serve_mount(state, agnosai_rate_limit_new(rate_x1000, burst));
     var rc = sandhi_server_run_pooled(addr, port, &agnosai_serve_handler, 0, opts);
     if (rc != 0) { _agnosai_serve_report_failure(opts); }
+    else { _agnosai_serve_drain_logged(AGNOSAI_SHUTDOWN_GRACE_SECS * 1000); }
     return rc;
 }
 

@@ -56,6 +56,8 @@
 # discards — a silent divergence that looks like being more helpful.
 # =========================================================================
 
+include "src/shutdown.cyr"
+
 # Poll interval for the stream loop, in milliseconds.
 #
 # The floor on how fast an event reaches the client, and the granularity of the
@@ -83,6 +85,8 @@ var AGNOSAI_SSE_KEEPALIVE_FRAME = ":ping\n\n";
 # `payload` must not contain a newline — every payload here is `bayan`-built
 # JSON, which escapes them, so the multi-line `data:` continuation the SSE spec
 # allows is unreachable and deliberately not implemented.
+#
+# Answers the write's result: 0, or below 0 when the client cannot be written to.
 fn _agnosai_sse_frame(a, cfd, name: Str, payload: Str): i64 {
     return _agnosai_sse_frame_seq(a, cfd, name, payload, 0);
 }
@@ -103,8 +107,7 @@ fn _agnosai_sse_frame_seq(a, cfd, name: Str, payload: Str, seq): i64 {
     str_builder_add_a(a, sb, payload);
     str_builder_add_cstr_a(a, sb, "\n\n");
     var f = str_builder_build_a(a, sb);
-    sandhi_server_send_chunk(cfd, str_data(f), str_len(f));
-    return 0;
+    return sandhi_server_send_chunk(cfd, str_data(f), str_len(f));
 }
 
 # Serialise a CrewEvent, or fall back the way the oracle does.
@@ -129,10 +132,17 @@ fn _agnosai_sse_warn(msg, msg_len, key, key_len, val: Str): i64 {
     return 0;
 }
 
-# Stream `crew_id`'s events to `cfd` until the crew ends or the client lags.
+# Stream `crew_id`'s events to `cfd` until the crew ends, the client lags, or the client leaves.
 #
 # `id_raw` is the `{id}` path segment exactly as it arrived. Returns 0 always —
 # the connection is finished either way, and the caller has nothing to decide.
+#
+# **A client that leaves ends the stream, not the crew (2.6.1).** Every write's result is read, and
+# the loop waits on the connection rather than sleeping (`agnosai_stream_wait`), so a client that
+# hung up frees the worker at the next poll, and one whose connection broke at the next write.
+# Through 2.6.0 all six writes were discarded and the loop slept, so the worker stayed held for the
+# crew's life whoever was reading. **A stop ends the stream too**, whole, within one poll, so a
+# stopping server's drain is not held by a crew it cannot finish.
 #
 # **`id_raw` is canonicalised before anything else touches it.** The oracle
 # extracts `Path<Uuid>` and immediately does `id.to_string()`
@@ -183,11 +193,13 @@ fn agnosai_sse_crew_stream(state, cfd, id_raw: Str): i64 {
     var sub = 0;
     if (crew_exists == 1) { sub = agnosai_event_bus_subscribe_a(default_alloc(), bus, crew_id); }
 
+    # A write that fails says the client is gone: below 0 from here on means nothing more is sent.
+    var w = 0;
     if (a != 0) {
-        sandhi_server_send_chunked_start_a(a, cfd, HTTP_OK, "text/event-stream",
+        w = sandhi_server_send_chunked_start_a(a, cfd, HTTP_OK, "text/event-stream",
           "Cache-Control: no-cache\r\n");
     } else {
-        sandhi_server_send_chunked_start(cfd, HTTP_OK, "text/event-stream",
+        w = sandhi_server_send_chunked_start(cfd, HTTP_OK, "text/event-stream",
           "Cache-Control: no-cache\r\n");
     }
 
@@ -208,9 +220,11 @@ fn agnosai_sse_crew_stream(state, cfd, id_raw: Str): i64 {
         bayan_json_v_obj_set_a(fa, nf, str_from_a(fa, "crew_id"),
           bayan_json_v_str_new_a(fa, crew_id));
         var ev = agnosai_crew_event_new_a(fa, crew_id, str_from_a(fa, "error"), nf);
-        _agnosai_sse_frame(fa, cfd, str_from_a(fa, "error"),
-          _agnosai_sse_event_json(fa, ev, str_from_a(fa, "")));
-        sandhi_server_send_chunked_end(cfd);
+        if (w >= 0) {
+            w = _agnosai_sse_frame(fa, cfd, str_from_a(fa, "error"),
+              _agnosai_sse_event_json(fa, ev, str_from_a(fa, "")));
+        }
+        if (w >= 0) { sandhi_server_send_chunked_end(cfd); }
         if (o != 0) { agnosai_orchestrator_let_go(o, load64(&hold)); }
         return 0;
     }
@@ -226,11 +240,14 @@ fn agnosai_sse_crew_stream(state, cfd, id_raw: Str): i64 {
           "crew_id", 7, crew_id);
         cjson = str_from_a(fa, "{\"event_type\":\"connected\"}");
     }
-    _agnosai_sse_frame(fa, cfd, str_from_a(fa, "connected"), cjson);
+    if (w >= 0) { w = _agnosai_sse_frame(fa, cfd, str_from_a(fa, "connected"), cjson); }
 
     var last_ping = clock_epoch_secs();
-    while (1 == 1) {
+    while (w >= 0) {
         if (a != 0) { reset_via(a); }
+        # A stop is read each pass as well as in the wait, so a stream whose events never let it wait
+        # still ends at one (2.6.1).
+        if (agnosai_serve_stop_requested() == 1) { break; }
 
         # BEFORE try_recv — see the module header. A lag ends the stream and the
         # events still buffered are never delivered, matching tokio surfacing
@@ -250,7 +267,7 @@ fn agnosai_sse_crew_stream(state, cfd, id_raw: Str): i64 {
               bayan_json_v_str_new_a(fa, str_builder_build_a(fa, lb)));
             var lj = bayan_json_v_build_a(fa, ld);
             if (lj == 0) { lj = str_from_a(fa, "{\"event_type\":\"error\"}"); }
-            _agnosai_sse_frame(fa, cfd, str_from_a(fa, "error"), lj);
+            w = _agnosai_sse_frame(fa, cfd, str_from_a(fa, "error"), lj);
             break;
         }
 
@@ -272,7 +289,7 @@ fn agnosai_sse_crew_stream(state, cfd, id_raw: Str): i64 {
                 str_builder_add_cstr_a(fa, fb, "\",\"error\":\"serialization failed\"}");
                 j = str_builder_build_a(fa, fb);
             }
-            _agnosai_sse_frame_seq(fa, cfd, etype, j, agnosai_crew_event_seq(e));
+            w = _agnosai_sse_frame_seq(fa, cfd, etype, j, agnosai_crew_event_seq(e));
             last_ping = clock_epoch_secs();
         } else {
             # Empty. `chan_try_recv` cannot tell empty from closed, so the
@@ -280,11 +297,22 @@ fn agnosai_sse_crew_stream(state, cfd, id_raw: Str): i64 {
             if (agnosai_event_sub_closed(sub) == 1) { break; }
             var now = clock_epoch_secs();
             if (now - last_ping >= AGNOSAI_SSE_KEEPALIVE_SECS) {
-                sandhi_server_send_chunk(cfd, AGNOSAI_SSE_KEEPALIVE_FRAME, 7);
+                w = sandhi_server_send_chunk(cfd, AGNOSAI_SSE_KEEPALIVE_FRAME, 7);
                 last_ping = now;
             }
-            sleep_ms(AGNOSAI_SSE_POLL_MS);
+            if (w >= 0) {
+                var wr = agnosai_stream_wait(cfd, AGNOSAI_SSE_POLL_MS);
+                if (wr == AGNOSAI_STREAM_GONE) { w = 0 - 1; }
+                # The server is stopping: the stream ends whole, and the client reconnects to a
+                # server that is not (2.6.1).
+                if (wr == AGNOSAI_STREAM_STOPPING) { break; }
+            }
         }
+    }
+    # INFO, not a warning: a client that stops reading is what every client does in the end.
+    if (w < 0 && sakshi_get_level() >= SK_INFO) {
+        sakshi_log_kv(SK_INFO, "SSE: client left, closing stream", 32, "crew_id", 7,
+          str_data(crew_id), str_len(crew_id));
     }
 
     # The subscription goes back to the bus once it is closed, and the crew is let go last, as its
@@ -293,7 +321,7 @@ fn agnosai_sse_crew_stream(state, cfd, id_raw: Str): i64 {
     if (tx != 0) { agnosai_event_sender_unsubscribe(tx, sub); }
     else { _agnosai_event_sub_close(sub); }
     agnosai_event_bus_recycle(bus, sub);
-    sandhi_server_send_chunked_end(cfd);
+    if (w >= 0) { sandhi_server_send_chunked_end(cfd); }
     if (o != 0) { agnosai_orchestrator_let_go(o, load64(&hold)); }
     return 0;
 }

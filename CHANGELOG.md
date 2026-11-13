@@ -7,6 +7,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.1] — 2026-11-13
+
+Server edges: a stream ends when its client leaves or the server stops, and a stop drains what is in flight
+([ADR 041](docs/adr/041-a-stream-ends-when-its-client-or-the-server-does.md)); path parameters are decoded; `/mcp`
+checks `Origin` and its `tools/call` costs the global heap nothing (ADR 039's 2.6.1 addendum); `hot_config` wakes
+a reader on a reload; a JWT key can come in a certificate.
+
+### ⚠ Behaviour changes
+
+- **A stop waits for the requests in flight**, for `AGNOSAI_SHUTDOWN_GRACE_SECS` at most (25 by default), and ends
+  every open stream whole within 50 ms. Through 2.6.0 a SIGTERM cut every request in flight short. A second SIGTERM
+  or SIGINT stops the wait. `AGNOSAI_SHUTDOWN_GRACE_SECS=0` is the stop as it was.
+- **`/mcp` answers 403 to a browser request from an origin it does not let in**, in both MCP revisions: one that is
+  not loopback, not in `AGNOSAI_MCP_ALLOWED_ORIGINS` and not `AGNOSAI_PUBLIC_URL`'s own. A request with no `Origin`,
+  which is every client but a browser, is served as before. `*` in the list turns the check off.
+- **A path parameter is percent-decoded**: `DELETE /api/v1/tools/my%20tool` removes the tool named `my tool`, where
+  it looked for one named `my%20tool`. One that decodes to invalid UTF-8 is 400, after auth.
+- **A crew stream ends when its client hangs up**, within one poll, and the crew goes on. Through 2.6.0 it held its
+  pool worker until the crew ended, whoever was reading.
+- **The route match is 40 bytes**, from 32: it says whether its parameter decoded to UTF-8.
+
+### Added
+
+- **shutdown** (`src/shutdown.cyr`, new, port-local): `agnosai_stream_wait`, a stream's wait on its connection that
+  answers when the client hangs up (`POLLRDHUP`, a reset or an error) or the server stops, and otherwise sleeps the
+  interval the streams slept; `agnosai_serve_drain(grace_ms)` and the count of requests in flight it waits on
+  (`agnosai_serve_inflight`) and what it left (`agnosai_serve_drain_left`); `agnosai_serve_force_requested`;
+  `agnosai_shutdown_grace_from` and `_env`. The stop flag
+  moved here from `src/server/serve.cyr`.
+- **router**: `agnosai_route_param_decode_a`, `agnosai_utf8_valid` (RFC 3629, as Rust's `str::from_utf8` reads it:
+  no overlong form, no surrogate, nothing above U+10FFFF) and `agnosai_route_match_bad_param`.
+- **MCP**: `agnosai_mcp_origin_ok_a`, `agnosai_mcp_origins_from`, `agnosai_url_origin`, and
+  `agnosai_app_state_with_mcp_origins` / `agnosai_app_state_mcp_origins` (the app state is 80 bytes, from 72).
+- **tools**: `agnosai_tool_input_new_a(a)`, an input whose map and whose tool's answer are `a`'s, and
+  `agnosai_tool_input_set_a`.
+- **hot_config**: the rest of `watch`. `agnosai_config_holder_generation`, `agnosai_config_holder_changed` and
+  `agnosai_config_holder_wait(h, seen, timeout_ms)`, which parks on a futex until an update is published past `seen`;
+  `agnosai_config_holder_update` bumps the generation and wakes every waiter.
+- **auth**: a certificate PEM (`-----BEGIN CERTIFICATE-----`) is a JWT key, its RSA key read through sigil's X.509
+  parser, as the Rust line's `DecodingKey::from_rsa_pem` took one. Its dates and issuer are not checked, as they were
+  not there. A key's PEM in the same text is read first, as through 2.6.0.
+- **`tests/server_live.tcyr`** (new): the server on a loopback port with pooled workers and their arenas, real
+  sockets, a gateway on another: a crew joins the inbound `traceparent` through a worker's arena, which no suite
+  reached before; a request in flight at a stop is answered whole and the loop returns after it; a stream open at the
+  stop ends whole within a poll. **`tests/shutdown.tcyr`** (new): each answer of the wait, each way out of the drain,
+  and the grace's parse.
+- **ADR 041**; ADR 039's 2.6.1 addendum; pointers in ADRs 013 and 014.
+- Bench rows, at the end of their files: `route_resolve_param_uuid`, `route_resolve_param_escaped`
+  (`benches/server.bcyr`) and `mcp_tools_list_2026_07_28_origin` (`benches/protocols.bcyr`).
+
+### Changed
+
+- **The crew stream reads every write's result** (`src/server/routes/sse.cyr`), where it discarded all six: a failed
+  write ends the stream, and nothing more is written to the connection. Its poll waits on the connection instead of
+  sleeping, and so does the A2A streams' backoff. Both read the stop on every pass as well as in the wait, so a
+  stream whose events never let it wait still ends at one. A departure is logged at INFO.
+- **The serve handler counts each request in flight**, around the whole of it, and `agnosai_serve` drains once the
+  loop stops for a stop, logging how many finished, or how many were left when the grace ran out.
+- **The signal thread reads a second signal**, which ends the drain's wait, where it read one and returned.
+- `main` logs `server shut down gracefully` only when the drain left nothing in flight, and `server shut down` when a
+  second signal or the grace cut requests short (`agnosai_serve_drain_left`).
+- **The serve handler's stream check resolves the route in the request arena**, as do its 400, 422 and 401: through
+  2.6.0 the global heap kept 48 bytes of every GET's match. The resolver's parameter slot is on the stack.
+- `main` reads `AGNOSAI_SHUTDOWN_GRACE_SECS` and `AGNOSAI_MCP_ALLOWED_ORIGINS`, logging each origin it lets in, and
+  `*` at WARN.
+
+### Fixed
+
+- **A crew stream held its worker after its client left** (every write's result discarded, a sleep between polls →
+  each write read and a wait on the connection). With `AGNOSAI_SERVE_WORKERS` streams whose clients had gone, the
+  server answered nothing more until their crews ended.
+- **A stop cut every request in flight short** (sandhi's stop returns at once, and `main` exited → the drain).
+- **A path parameter was the segment as it arrived** (no decoding → the `percent-encoding` crate's decode under
+  axum's `Path`, then a UTF-8 check).
+- **`/mcp` read no `Origin`**, which both MCP revisions require of a server against DNS rebinding, and with auth off,
+  its default, any page a browser opened could call its tools.
+- **An MCP `tools/call` kept 601 bytes a call on the global heap**, in either revision (its input, its map, its keys
+  and its tool's output built there → the request arena). `tests/server_routes_mcp_2026.tcyr` asserts 0.
+- **A certificate-format JWT key was refused**, where the Rust line took one.
+
+### Performance
+
+- **Against 2.6.0**, three interleaved rounds of `server`, `protocols`, `core`, `rest_crews` and `orch` on the same
+  `lib/`, at a load of about 5: median **−0.3%** across 170 rows, 139 within 5%.
+- `route_resolve_probe` 142 → 127 ns (**−10.6%**), `route_resolve` 341 → 330 ns (−3.2%): the resolver's parameter slot
+  is on the stack, where every resolve allocated it.
+- **The `Origin` check costs `/mcp` one header pass**, about 0.1 to 0.4 µs a request. `benches/protocols.bcyr` alone,
+  six interleaved pairs: `mcp_tools_list_2025_03_26` 3.46 → 3.56 µs (+3.0%), `mcp_tools_list_2026_07_28` 8.27 → 8.55 µs
+  (+3.5%), `mcp_tools_call_2025_03_26` +1.6%, `mcp_tools_call_2026_07_28` +1.9%, `mcp_server_discover` +4.7%; every A2A
+  row within 2.2% but `jcs_agent_card`, +3.6%, which nothing here touched. A loopback `Origin` that is present and let
+  in reads 9.26 µs (`mcp_tools_list_2026_07_28_origin`, new). The full five-file run read these rows +6% to +11%, which
+  the pairs, run alone, put down to run order.
+- **An MCP `tools/call` keeps 0 bytes on the global heap**, from 601, in either revision.
+- New: `route_resolve_param_uuid` 496 ns and `route_resolve_param_escaped` 485 ns, a parameter checked as UTF-8 and,
+  with an escape, decoded.
+
 ## [2.6.0] — 2026-11-13
 
 Protocol currency: `/mcp` serves MCP 2026-07-28 beside the revision it spoke
