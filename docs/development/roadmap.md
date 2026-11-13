@@ -6,7 +6,7 @@
 > [`cyrius-port-plan.md`](cyrius-port-plan.md) is the port's reasoning archive, and
 > [`known-unreachable.md`](known-unreachable.md) records code kept for oracle shape.
 
-**Status as of 2.5.2 (2026-11-13).**
+**Status as of 2.6.0 (2026-11-13).**
 
 **How releases are ordered.** A release holds only work that can ship now. Work that waits on another project is not
 given a number: it is listed under [*Waiting on another project*](#waiting-on-another-project), with its filed issue,
@@ -50,7 +50,6 @@ Carried from the Rust line as *goals*, not as comparisons: the Cyrius baseline s
 
 | Release | What it does |
 |---|---|
-| **2.6.0** | MCP 2026-07-28 on `/mcp`, and A2A 1.0 |
 | **2.6.1** | Server edges: SSE, shutdown, paths, config, JWT keys |
 | **2.6.2** | The tracing export: the remaining spans, and trace ids in log lines |
 | **2.7.0** | Tests and benchmarks for what nothing covers yet |
@@ -110,20 +109,20 @@ given back. With the server's chain on the REST loop reads 0 B a crew, where it 
 
 ### 2.6.x — protocol and server currency
 
-#### 2.6.0 — MCP 2026-07-28 on `/mcp`, and A2A 1.0
-
-(a) `/mcp` speaks the `initialize`-handshake revision. MCP 2026-07-28 removed the handshake and `Mcp-Session-Id`, added
-the `Mcp-Method` and `Mcp-Name` headers, made **Tasks** an official extension, and deprecated Sampling, Roots and
-Logging. **bote already serves both eras** (bote 3.8.15, `src/http_era.cyr`), so nothing waits upstream. `/mcp`
-hand-builds its JSON-RPC envelope as the oracle did, rather than delegating to bote's `Dispatcher`: adopt bote's era
-handling, or follow it by hand, and say which in an ADR. `capabilities` advertises no `subscribe` or `listChanged`
-([ADR 015](../adr/015-mcp-resources-project-agent-definitions.md)). (b) Target A2A v1.0.x.
+2.6.0 brought the protocols current: `/mcp` serves MCP 2026-07-28 beside 2025-03-26, deciding per request, its
+headers checked against the body, by hand after bote's era rules
+([ADR 039](../adr/039-mcp-serves-both-eras-on-one-endpoint.md)); and agnosai speaks A2A 1.0, an Agent Card the
+operator can sign and a JSON-RPC endpoint whose tasks are crews, streamed over SSE
+([ADR 040](../adr/040-a2a-v1-tasks-are-crews.md)).
 
 #### 2.6.1 — server edges: SSE, shutdown, paths, config, JWT keys
 
 An SSE stream holds one of the 100 pool workers for the crew's life and does not notice a departed client:
 `src/server/routes/sse.cyr` discards all six write results sandhi now returns. Shutdown does not drain in-flight
-requests. Path parameters are not percent-decoded. `hot_config` has no change notification. A certificate-format JWT
+requests. Path parameters are not percent-decoded. `/mcp` does not check `Origin`, in either MCP era, which both
+revisions ask of a server against DNS rebinding (ADR 039). An MCP `tools/call` keeps **601 B a call** on the global
+heap, in either era, its tool's input and output built there: measured at 2.6.0 in
+`tests/server_routes_mcp_2026.tcyr`, which asserts only that the newer era adds nothing to it. `hot_config` has no change notification. A certificate-format JWT
 key is refused, where the Rust line took one: `auth.cyr` takes SPKI and PKCS#1 PEM only.
 
 **The serve handler's arena read of `traceparent` is not covered.** `sandhi_server_find_header_a(…, "traceparent")`
@@ -412,5 +411,5 @@ and log fields at 2.3.6.
 | F3 | shipped in 2.4.0, the crew lifecycle (ADR 032); its resync snapshot in 2.5.0 (ADR 036) |
 | F4 | shipped in 2.5.0, durable execution (ADR 036) |
 | F5 | shipped in 2.4.1, budgets and caps (ADR 033); the delegated worker's level in 2.4.3 (ADR 035) |
-| F8 | 2.6.0, MCP 2026-07-28 and A2A 1.0 |
+| F8 | shipped in 2.6.0: MCP 2026-07-28 (ADR 039) and A2A 1.0 (ADR 040) |
 | F9 | shipped in 2.4.2, the hand-off of a dependency's answer (ADR 034) |

@@ -36,11 +36,14 @@ in the oracle), and left out `GET /api/v1/approvals`.
 | POST | `/api/v1/approvals` | yes | Submit a human-in-the-loop decision |
 | POST | `/api/v1/a2a/receive` | yes | Accept a delegated task |
 | POST | `/api/v1/a2a/status` | yes | A2A status |
-| POST | `/mcp` | yes | Model Context Protocol JSON-RPC |
+| POST | `/mcp` | yes | Model Context Protocol JSON-RPC, 2026-07-28 and 2025-03-26 (2.6.0) |
+| GET | `/.well-known/agent-card.json` | no | The A2A 1.0 Agent Card (2.6.0) |
+| POST | `/a2a` | yes | A2A 1.0, the JSON-RPC binding (2.6.0) |
 
-The three probes are the only unauthenticated routes, and the allow-list is
+The three probes and the Agent Card are the only unauthenticated routes, and the allow-list is
 written that way deliberately — a route added without thought defaults to
-**protected**.
+**protected**. The card is public because discovery cannot carry a token: it says how to
+authenticate to the endpoint it names.
 
 A path in this table requested with another method is **405**, with an `Allow`
 header naming the methods it takes (`Allow: GET, POST` for the definitions
@@ -612,6 +615,60 @@ A log is written `0600`, as it holds answers and tool arguments, and is removed 
 Unset or empty, crews keep no log and a restart loses them, as through 2.4.3. A server claims its directory as it
 starts, a lock on `<dir>/.owner`, so a second on the same directory refuses to start rather than resume the first's
 live crews.
+
+## MCP — `POST /mcp`
+
+One endpoint, two revisions, chosen per request ([ADR 039](../adr/039-mcp-serves-both-eras-on-one-endpoint.md)):
+
+- **2026-07-28**, when `MCP-Protocol-Version: 2026-07-28` is sent. Every request carries `_meta` with
+  `io.modelcontextprotocol/protocolVersion` and `io.modelcontextprotocol/clientCapabilities`, and the headers
+  `Mcp-Method` and, for `tools/call`, `prompts/get` and `resources/read`, `Mcp-Name`, which must say what the body
+  says. `server/discover` answers what the endpoint speaks and can do; there is no `initialize`. A header that is
+  missing or disagrees is 400 with `-32020`, an unsupported revision 400 with `-32022` and the supported ones in
+  `data.supported`, an unknown method 404, and a notification 202.
+
+  ```bash
+  curl -s localhost:8080/mcp -H 'Content-Type: application/json' \
+    -H 'MCP-Protocol-Version: 2026-07-28' -H 'Mcp-Method: tools/call' -H 'Mcp-Name: echo' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"message":"hi"},
+        "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                 "io.modelcontextprotocol/clientCapabilities":{}}}}'
+  ```
+
+- **2025-03-26**, for a request with no version header or one naming it: `initialize`, then the same methods, every
+  answer HTTP 200, as through 2.5.x.
+
+## A2A 1.0 — the Agent Card and `POST /a2a`
+
+`GET /.well-known/agent-card.json` answers the Agent Card, and `POST /a2a` the JSON-RPC binding at 1.0, whose tasks
+are crews ([ADR 040](../adr/040-a2a-v1-tasks-are-crews.md)). Every request sends `A2A-Version: 1.0`; without it the
+request is 0.3's and refused with `VersionNotSupportedError` (`-32009`). Every answer is HTTP 200, an error in band.
+
+| Method | What it does |
+|---|---|
+| `SendMessage` | Starts a crew for the message's text and data parts, waits for it unless `returnImmediately`, and answers `{"task": Task}` |
+| `GetTask` | The task, with `historyLength` messages of its history |
+| `ListTasks` | The tasks this endpoint started, by id, filtered by `contextId` and `status`, `pageSize` at a time |
+| `CancelTask` | Cancels it; a task that has ended is `TaskNotCancelableError` |
+| `SendStreamingMessage`, `SubscribeToTask` | An SSE stream: the task, its status updates, its artifacts, and its end |
+
+Push notifications and the extended card are not supported, and the card says so. A task lives as long as its crew is
+in the registry.
+
+```bash
+curl -s localhost:8080/a2a -H 'Content-Type: application/json' -H 'A2A-Version: 1.0' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"messageId":"m-1",
+      "role":"ROLE_USER","parts":[{"text":"review the release notes"}]}}}'
+```
+
+| Variable | |
+|---|---|
+| `AGNOSAI_PUBLIC_URL` | The URL clients reach the server at, `https://host[:port]`, which the card names `/a2a` under. Unset, the card names each request's `Host`, over `http` |
+| `AGNOSAI_A2A_SIGNING_KEY` | A PEM private key, P-256 (ES256) or RSA (RS256), that signs the card once at start-up. Needs `AGNOSAI_PUBLIC_URL` |
+| `AGNOSAI_A2A_SIGNING_KID` | The key's id in each signature's header; `agnosai` unset |
+| `AGNOSAI_A2A_JKU` | Where the key's public half is published, a JWKS URL, named in the header when set |
+
+`POST /api/v1/a2a/receive`, the Rust line's delegation shape, is unchanged.
 
 ## Content Type
 

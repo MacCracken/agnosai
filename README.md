@@ -25,6 +25,7 @@ AgnosAI replaces Python/CrewAI orchestration with a compiled Cyrius binary -- re
 | No ceiling on what a crew spends | Token and cost budgets per tenant, crew and task, checked before every model call, and a cap on crews at once |
 | A long-lived server grows with every crew | A crew the server built goes back once its registry evicts it and nothing is reading it: 0 B a crew for good, where 2.5.0 kept 13 KiB |
 | A restart loses the crew | A crew keeps a log and resumes from it after a restart; a task whose tool call may already have taken effect waits for a reviewer before it runs again |
+| Yesterday's protocol revisions | MCP 2026-07-28 on `/mcp`, beside 2025-03-26; A2A 1.0, an Agent Card the operator can sign and a JSON-RPC endpoint whose tasks are crews, streamed over SSE |
 
 ## Architecture
 

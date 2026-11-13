@@ -79,6 +79,8 @@ include "src/arena_pool.cyr"
 include "src/done_word.cyr"
 include "src/semaphore.cyr"
 include "src/log_fields.cyr"
+include "src/http_headers.cyr"
+include "src/jcs.cyr"
 include "src/tls_permit.cyr"
 # telemetry — depends on nothing in `src/` (sakshi, chrono and io only), so it
 # sits first and is available to every module below for the JSON log formatter.
@@ -123,6 +125,7 @@ include "src/server/routes/dashboard.cyr"
 include "src/server/routes/crews.cyr"
 include "src/server/routes/a2a.cyr"
 include "src/server/routes/mcp.cyr"
+include "src/a2a_v1.cyr"
 include "src/server/routes/sse.cyr"
 include "src/server/hot_config.cyr"
 include "src/server/rate_limit.cyr"
@@ -250,6 +253,53 @@ fn _agnosai_main_hoosh_url(): i64 {
     var v = getenv("HOOSH_URL");
     if (v == 0) { return agnosai_hoosh_default_url(); }
     return str_from(v);
+}
+
+# The A2A v1.0 endpoint's settings (ADR 040): `AGNOSAI_PUBLIC_URL`, the URL clients reach this server
+# at, which its Agent Card names its endpoint under. Unset or empty, the card names each request's
+# `Host`, over `http`, which is right only where nothing stands in between.
+#
+# `AGNOSAI_A2A_SIGNING_KEY` names a PEM private key, P-256 or RSA, that signs the card, under the key
+# id `AGNOSAI_A2A_SIGNING_KID` (`agnosai` unset) and with `AGNOSAI_A2A_JKU` in its header when set.
+# The card is signed once, for the public URL, so a key without one is an ERROR and the card goes
+# out unsigned; so does a key that will not read, as a bad JWT key boots too.
+fn _agnosai_main_a2a_config(auth): i64 {
+    var cfg = agnosai_a2a_config_new();
+    var v = getenv("AGNOSAI_PUBLIC_URL");
+    if (v != 0 && strlen(v) > 0) {
+        agnosai_a2a_config_with_public_url(cfg, str_from(v));
+        _agnosai_main_log_kv(SK_INFO, "A2A agent card url", 18, "url", 3, str_from(v));
+    }
+    var kp = getenv("AGNOSAI_A2A_SIGNING_KEY");
+    if (kp != 0 && strlen(kp) > 0) {
+        var buf = alloc(65536);
+        var n = file_read_all(kp, buf, 65536);
+        var kid = getenv("AGNOSAI_A2A_SIGNING_KID");
+        var kids = str_from("agnosai");
+        if (kid != 0 && strlen(kid) > 0) { kids = str_from(kid); }
+        var jku = getenv("AGNOSAI_A2A_JKU");
+        var jkus = 0;
+        if (jku != 0 && strlen(jku) > 0) { jkus = str_from(jku); }
+        var signer = 0;
+        if (n > 0) { signer = agnosai_a2a_signer_from_pem(str_from_buf(buf, n), kids, jkus); }
+        memset(buf, 0, 65536);
+        if (signer == 0) {
+            _agnosai_main_log_kv(SK_ERROR, "A2A signing key not read, card unsigned", 39, "path", 4, str_from(kp));
+        } elif (agnosai_a2a_config_public_url(cfg) == 0) {
+            _agnosai_main_log_kv(SK_ERROR, "A2A signing needs AGNOSAI_PUBLIC_URL, card unsigned", 51, "path", 4,
+              str_from(kp));
+        } else {
+            agnosai_a2a_config_with_signer(cfg, signer);
+            _agnosai_main_log_kv(SK_INFO, "A2A agent card signed", 21, "alg", 3,
+              str_from(agnosai_a2a_signer_alg(signer)));
+        }
+    }
+    if (agnosai_a2a_config_public_url(cfg) != 0 && agnosai_a2a_config_seal(cfg, auth) != 0) {
+        sakshi_error("A2A agent card would not sign; it is served unsigned", 52);
+        agnosai_a2a_config_with_signer(cfg, 0);
+        agnosai_a2a_config_seal(cfg, auth);
+    }
+    return cfg;
 }
 
 # Where crews' logs go (ADR 036): `AGNOSAI_STATE_DIR`, or 0 when it is unset or empty, and crews
@@ -514,6 +564,8 @@ fn main(): i64 {
 
     var state = agnosai_app_state_new(orchestrator, tools, auth, events,
       agnosai_orchestrator_audit(orchestrator), agnosai_orchestrator_approval_gate(orchestrator));
+    # 2.6.0, ADR 040 — the A2A v1.0 endpoint's settings: the URL its card names it under.
+    agnosai_app_state_with_a2a(state, _agnosai_main_a2a_config(auth));
 
     var port = _agnosai_main_port();
     if (sakshi_get_level() >= SK_INFO) {

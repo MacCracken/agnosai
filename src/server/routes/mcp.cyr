@@ -56,7 +56,23 @@
 # means building the envelope here. The 3.3.0 fix removes the blocker for the
 # surface that comes after — MCP prompts and resources, which bote already
 # ships (18 + 15 fns in the pinned core bundle).
+#
+# ## Two eras on one endpoint (2.6.0, ADR 039)
+#
+# MCP 2026-07-28 has no `initialize` and no session: every request names its
+# revision, in `params._meta` and in the `MCP-Protocol-Version` header, and
+# carries the client's capabilities, and a POST says its method and the name it
+# acts on in `Mcp-Method` and `Mcp-Name`, which the server compares with the
+# body. `/mcp` serves it and the revision it spoke before, 2025-03-26, on one
+# endpoint, deciding per request as bote's `src/http_era.cyr` does: a request
+# that names 2026-07-28 is served under it; one with no header, or naming
+# 2025-03-26, is served as it always was, byte for byte. The rules are followed
+# here by hand, not delegated: bote's era layer is in its full bundle, not the
+# core one this pins, and answers on the socket itself, where this route's
+# answer goes through the serve layer's auth, limits, metrics and arena.
 # =========================================================================
+
+include "src/http_headers.cyr"
 
 # The MCP protocol revision the oracle advertises (`mcp.rs:69`). A literal
 # there and a literal here — it is a wire constant, not a capability check.
@@ -106,6 +122,38 @@ var AGN_JK_URI = str_from("uri");
 var AGN_JK_MIME_TYPE = str_from("mimeType");
 var AGN_JV_APPLICATION_JSON = str_from("application/json");
 var AGN_JK_CONTENTS = str_from("contents");
+# 2026-07-28's (2.6.0).
+var AGN_JK_META = str_from("_meta");
+var AGN_JK_RESULT_TYPE = str_from("resultType");
+var AGN_JV_COMPLETE = str_from("complete");
+var AGN_JK_TTL_MS = str_from("ttlMs");
+var AGN_JK_CACHE_SCOPE = str_from("cacheScope");
+var AGN_JV_PRIVATE = str_from("private");
+var AGN_JK_SUPPORTED_VERSIONS = str_from("supportedVersions");
+var AGN_JK_SUPPORTED = str_from("supported");
+var AGN_JK_REQUESTED = str_from("requested");
+var AGN_JK_DATA = str_from("data");
+var AGN_JK_MCP_SERVER_INFO = str_from("io.modelcontextprotocol/serverInfo");
+
+# --- MCP 2026-07-28 (2.6.0, ADR 039) ---------------------------------------
+
+# The revision with no `initialize`, which a request names to be served under it.
+var AGNOSAI_MCP_MODERN_VERSION = "2026-07-28";
+
+# The `_meta` keys every 2026-07-28 request carries.
+var AGNOSAI_MCP_META_VERSION = "io.modelcontextprotocol/protocolVersion";
+var AGNOSAI_MCP_META_CAPS = "io.modelcontextprotocol/clientCapabilities";
+
+# 2026-07-28's error codes this route sends: a header that is missing, malformed or says other than
+# the body (HTTP 400), and a revision it does not speak (HTTP 400, naming the ones it does).
+var AGNOSAI_MCP_HEADER_MISMATCH = 0 - 32020;
+var AGNOSAI_MCP_UNSUPPORTED_VERSION = 0 - 32022;
+var AGNOSAI_MCP_PARSE_ERROR = 0 - 32700;
+var AGNOSAI_MCP_INVALID_REQUEST = 0 - 32600;
+
+# How long a client may keep `server/discover`'s answer. It changes only with the process; a
+# minute keeps a client that polls it off the endpoint without outliving an upgrade by long.
+var AGNOSAI_MCP_DISCOVER_TTL_MS = 60000;
 
 # --- Envelope -------------------------------------------------------------
 
@@ -131,6 +179,13 @@ fn _agnosai_mcp_error(a, id, code, message: Str): i64 {
     return o;
 }
 
+# `_agnosai_mcp_error` with `data`, which only 2026-07-28's errors carry.
+fn _agnosai_mcp_error_data(a, id, code, message: Str, data): i64 {
+    var o = _agnosai_mcp_error(a, id, code, message);
+    bayan_json_v_obj_set_a(a, bayan_json_v_obj_get_by_cstr(o, "error"), AGN_JK_DATA, data);
+    return o;
+}
+
 # The MCP `content` payload every `tools/call` outcome uses — including the
 # failures, which are JSON-RPC **successes** carrying `isError: true`.
 fn _agnosai_mcp_content(a, text: Str, is_error): i64 {
@@ -148,14 +203,18 @@ fn _agnosai_mcp_content(a, text: Str, is_error): i64 {
 
 # --- initialize -----------------------------------------------------------
 
-fn _agnosai_mcp_initialize(a, id): i64 {
+# The server's `Implementation`: `"agnosai"`, NOT bote's `"bote"` — the reason this module does not
+# delegate. See the header.
+fn _agnosai_mcp_server_info(a): i64 {
     var info = bayan_json_v_obj_new_a(a);
-    # `"agnosai"`, NOT bote's `"bote"` — the reason this module does not
-    # delegate. See the header.
     bayan_json_v_obj_set_a(a, info, AGN_JK_NAME, bayan_json_v_str_new_a(a, AGN_JV_AGNOSAI));
     bayan_json_v_obj_set_a(a, info, AGN_JK_VERSION,
       bayan_json_v_str_new_a(a, str_from_a(a, AGNOSAI_VERSION)));
+    return info;
+}
 
+# What the server can do, in either era: `tools`, `prompts` and `resources`, each an empty object.
+fn _agnosai_mcp_capabilities(a): i64 {
     # `"capabilities": {"tools": {}}` — an empty object, not null and not
     # absent. A client reads the presence of the `tools` key as the capability.
     var caps = bayan_json_v_obj_new_a(a);
@@ -173,13 +232,45 @@ fn _agnosai_mcp_initialize(a, id): i64 {
     # `notifications/resources/updated`, and claiming otherwise leaves a client
     # waiting for an event that never comes.
     bayan_json_v_obj_set_a(a, caps, AGN_JK_RESOURCES, bayan_json_v_obj_new_a(a));
+    return caps;
+}
 
+fn _agnosai_mcp_initialize(a, id): i64 {
     var r = bayan_json_v_obj_new_a(a);
     bayan_json_v_obj_set_a(a, r, AGN_JK_PROTOCOL_VERSION,
       bayan_json_v_str_new_a(a, str_from_a(a, AGNOSAI_MCP_PROTOCOL_VERSION)));
-    bayan_json_v_obj_set_a(a, r, AGN_JK_SERVER_INFO, info);
-    bayan_json_v_obj_set_a(a, r, AGN_JK_CAPABILITIES, caps);
+    bayan_json_v_obj_set_a(a, r, AGN_JK_SERVER_INFO, _agnosai_mcp_server_info(a));
+    bayan_json_v_obj_set_a(a, r, AGN_JK_CAPABILITIES, _agnosai_mcp_capabilities(a));
     return _agnosai_mcp_success(a, id, r);
+}
+
+# A 2026-07-28 result's own fields, on `r`, when `m` is 1: `resultType`, the caching hints a
+# cacheable one carries (`ttl` of -1 for one that is not), and the server's identity in `_meta`.
+# With `m` 0, `r` as it is, which is the earlier revision's wire.
+fn _agnosai_mcp_finish(a, m, r, ttl): i64 {
+    if (m == 0) { return r; }
+    bayan_json_v_obj_set_a(a, r, AGN_JK_RESULT_TYPE, bayan_json_v_str_new_a(a, AGN_JV_COMPLETE));
+    if (ttl >= 0) {
+        bayan_json_v_obj_set_a(a, r, AGN_JK_TTL_MS, bayan_json_v_int_new_a(a, ttl));
+        # `private`: every answer is behind the endpoint's auth, so no shared cache may keep one.
+        bayan_json_v_obj_set_a(a, r, AGN_JK_CACHE_SCOPE, bayan_json_v_str_new_a(a, AGN_JV_PRIVATE));
+    }
+    var meta = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, meta, AGN_JK_MCP_SERVER_INFO, _agnosai_mcp_server_info(a));
+    bayan_json_v_obj_set_a(a, r, AGN_JK_META, meta);
+    return r;
+}
+
+# `server/discover`, which 2026-07-28 servers MUST answer in place of `initialize`: the revisions
+# this endpoint speaks, newest first, what it can do, and who it is.
+fn _agnosai_mcp_discover(a, id): i64 {
+    var versions = bayan_json_v_arr_new_a(a);
+    bayan_json_v_arr_push_a(a, versions, bayan_json_v_str_new_a(a, str_from_a(a, AGNOSAI_MCP_MODERN_VERSION)));
+    bayan_json_v_arr_push_a(a, versions, bayan_json_v_str_new_a(a, str_from_a(a, AGNOSAI_MCP_PROTOCOL_VERSION)));
+    var r = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, r, AGN_JK_SUPPORTED_VERSIONS, versions);
+    bayan_json_v_obj_set_a(a, r, AGN_JK_CAPABILITIES, _agnosai_mcp_capabilities(a));
+    return _agnosai_mcp_success(a, id, _agnosai_mcp_finish(a, 1, r, AGNOSAI_MCP_DISCOVER_TTL_MS));
 }
 
 # --- tools/list -----------------------------------------------------------
@@ -215,7 +306,7 @@ fn _agnosai_mcp_input_schema(a, schema): i64 {
     return s;
 }
 
-fn _agnosai_mcp_tools_list(a, id, state): i64 {
+fn _agnosai_mcp_tools_list(a, id, state, m): i64 {
     var schemas = agnosai_tool_registry_list_a(a, agnosai_app_state_tools(state));
     var arr = bayan_json_v_arr_new_a(a);
     for (var i = 0; i < vec_len(schemas); i = i + 1) {
@@ -230,7 +321,8 @@ fn _agnosai_mcp_tools_list(a, id, state): i64 {
     }
     var r = bayan_json_v_obj_new_a(a);
     bayan_json_v_obj_set_a(a, r, AGN_JK_TOOLS, arr);
-    return _agnosai_mcp_success(a, id, r);
+    # A ttl of 0: a tool registered after this answer is not announced, so no copy stays good.
+    return _agnosai_mcp_success(a, id, _agnosai_mcp_finish(a, m, r, 0));
 }
 
 # --- tools/call -----------------------------------------------------------
@@ -244,7 +336,11 @@ fn _agnosai_mcp_tools_list(a, id, state): i64 {
 # `tp` is the request's `traceparent`, or 0 (ADR 023). Parsed in the request
 # arena, and only with telemetry on: the tool span is its child, and this is
 # the only `execute_tool` producer until F1's tool loop.
-fn _agnosai_mcp_tools_call(a, id, params, state, tp: Str): i64 {
+#
+# **2026-07-28 makes the unknown tool a protocol error too** (`m` 1): `-32602`, as its tools page has
+# it, where the earlier revision's oracle answered a success with `isError`. A tool that ran and
+# failed is `isError` in both.
+fn _agnosai_mcp_tools_call(a, id, params, state, tp: Str, m): i64 {
     var name_v = 0;
     if (params != 0) { name_v = bayan_json_v_obj_get_by_cstr(params, "name"); }
     if (name_v == 0 || bayan_json_v_is_str(name_v) == 0) {
@@ -258,6 +354,7 @@ fn _agnosai_mcp_tools_call(a, id, params, state, tp: Str): i64 {
         var sb = str_builder_new_a(a);
         str_builder_add_cstr_a(a, sb, "Tool not found: ");
         str_builder_add_a(a, sb, name);
+        if (m == 1) { return _agnosai_mcp_error(a, id, AGNOSAI_MCP_INVALID_PARAMS, str_builder_build_a(a, sb)); }
         return _agnosai_mcp_success(a, id, _agnosai_mcp_content(a, str_builder_build_a(a, sb), 1));
     }
 
@@ -287,19 +384,20 @@ fn _agnosai_mcp_tools_call(a, id, params, state, tp: Str): i64 {
     # a tool-level failure, `isError: true` with the oracle's fallback text.
     if (out == 0) {
         _agnosai_mcp_log_call(name, 0, took_ms);
-        return _agnosai_mcp_success(a, id, _agnosai_mcp_content(a, str_from_a(a, "Unknown error"), 1));
+        return _agnosai_mcp_success(a, id,
+          _agnosai_mcp_finish(a, m, _agnosai_mcp_content(a, str_from_a(a, "Unknown error"), 1), 0 - 1));
     }
     _agnosai_mcp_log_call(name, agnosai_tool_output_success(out), took_ms);
 
     if (agnosai_tool_output_success(out) == 1) {
-        return _agnosai_mcp_success(a, id,
-          _agnosai_mcp_content(a, _agnosai_mcp_result_text(a, agnosai_tool_output_result(out)), 0));
+        return _agnosai_mcp_success(a, id, _agnosai_mcp_finish(a, m,
+            _agnosai_mcp_content(a, _agnosai_mcp_result_text(a, agnosai_tool_output_result(out)), 0), 0 - 1));
     }
 
     # `output.error.unwrap_or_else(|| "Unknown error".to_string())`.
     var err = agnosai_tool_output_error(out);
     if (err == 0 || str_len(err) == 0) { err = str_from_a(a, "Unknown error"); }
-    return _agnosai_mcp_success(a, id, _agnosai_mcp_content(a, err, 1));
+    return _agnosai_mcp_success(a, id, _agnosai_mcp_finish(a, m, _agnosai_mcp_content(a, err, 1), 0 - 1));
 }
 
 # The oracle's `match output.result { Value::String(s) => s, other => other.to_string() }`
@@ -355,7 +453,7 @@ fn _agnosai_mcp_prompt_of(a, def): i64 {
 }
 
 # `prompts/list` — one prompt per stored agent definition.
-fn _agnosai_mcp_prompts_list(a, id, state): i64 {
+fn _agnosai_mcp_prompts_list(a, id, state, m): i64 {
     var defs = agnosai_app_state_definitions_a(a, state);
     var arr = bayan_json_v_arr_new_a(a);
     for (var i = 0; i < vec_len(defs); i = i + 1) {
@@ -363,7 +461,8 @@ fn _agnosai_mcp_prompts_list(a, id, state): i64 {
     }
     var r = bayan_json_v_obj_new_a(a);
     bayan_json_v_obj_set_a(a, r, AGN_JK_PROMPTS, arr);
-    return _agnosai_mcp_success(a, id, r);
+    # 0: a definition posted after this answer is not announced either.
+    return _agnosai_mcp_success(a, id, _agnosai_mcp_finish(a, m, r, 0));
 }
 
 # `prompts/get` — the agent's own system prompt, optionally with a task appended.
@@ -373,7 +472,7 @@ fn _agnosai_mcp_prompts_list(a, id, state): i64 {
 # would give that agent, so what a client previews and what a crew executes
 # cannot drift. A separate template here would be a second source of truth for
 # the same string.
-fn _agnosai_mcp_prompts_get(a, id, params, state): i64 {
+fn _agnosai_mcp_prompts_get(a, id, params, state, m): i64 {
     if (params == 0 || bayan_json_v_is_obj(params) == 0) {
         return _agnosai_mcp_error(a, id, AGNOSAI_MCP_INVALID_PARAMS,
           str_from_a(a, "params must be an object"));
@@ -423,7 +522,8 @@ fn _agnosai_mcp_prompts_get(a, id, params, state): i64 {
     bayan_json_v_obj_set_a(a, r, AGN_JK_DESCRIPTION,
       bayan_json_v_str_new_a(a, agnosai_agent_role(def)));
     bayan_json_v_obj_set_a(a, r, AGN_JK_MESSAGES, msgs);
-    return _agnosai_mcp_success(a, id, r);
+    # Not cacheable: 2026-07-28 lists `prompts/get` among the results that carry no caching hints.
+    return _agnosai_mcp_success(a, id, _agnosai_mcp_finish(a, m, r, 0 - 1));
 }
 
 var AGNOSAI_MCP_RESOURCE_PREFIX = "agnosai://agents/";
@@ -459,7 +559,7 @@ fn _agnosai_mcp_resource_of(a, def): i64 {
     return o;
 }
 
-fn _agnosai_mcp_resources_list(a, id, state): i64 {
+fn _agnosai_mcp_resources_list(a, id, state, m): i64 {
     var defs = agnosai_app_state_definitions_a(a, state);
     var arr = bayan_json_v_arr_new_a(a);
     for (var i = 0; i < vec_len(defs); i = i + 1) {
@@ -467,7 +567,7 @@ fn _agnosai_mcp_resources_list(a, id, state): i64 {
     }
     var r = bayan_json_v_obj_new_a(a);
     bayan_json_v_obj_set_a(a, r, AGN_JK_RESOURCES, arr);
-    return _agnosai_mcp_success(a, id, r);
+    return _agnosai_mcp_success(a, id, _agnosai_mcp_finish(a, m, r, 0));
 }
 
 # `resources/read` — the definition's own JSON, under MCP's `contents` envelope.
@@ -476,7 +576,9 @@ fn _agnosai_mcp_resources_list(a, id, state): i64 {
 # "isError" affordance here the way `tools/call` does, so the only way to say
 # "no such resource" is the error channel; answering `contents: []` would read
 # as "this resource exists and is empty".
-fn _agnosai_mcp_resources_read(a, id, params, state): i64 {
+#
+# 2026-07-28 (`m` 1) says which resource was missing, in `data.uri`.
+fn _agnosai_mcp_resources_read(a, id, params, state, m): i64 {
     if (params == 0 || bayan_json_v_is_obj(params) == 0) {
         return _agnosai_mcp_error(a, id, AGNOSAI_MCP_INVALID_PARAMS,
           str_from_a(a, "params must be an object with a uri"));
@@ -494,6 +596,11 @@ fn _agnosai_mcp_resources_read(a, id, params, state): i64 {
     }
     var def = agnosai_app_state_definition_get(state, name);
     if (def == 0) {
+        if (m == 1) {
+            var d = bayan_json_v_obj_new_a(a);
+            bayan_json_v_obj_set_a(a, d, AGN_JK_URI, bayan_json_v_str_new_a(a, uri));
+            return _agnosai_mcp_error_data(a, id, AGNOSAI_MCP_INVALID_PARAMS, str_from_a(a, "no such resource"), d);
+        }
         return _agnosai_mcp_error(a, id, AGNOSAI_MCP_INVALID_PARAMS,
           str_from_a(a, "no such resource"));
     }
@@ -511,7 +618,8 @@ fn _agnosai_mcp_resources_read(a, id, params, state): i64 {
     bayan_json_v_arr_push_a(a, arr, item);
     var r = bayan_json_v_obj_new_a(a);
     bayan_json_v_obj_set_a(a, r, AGN_JK_CONTENTS, arr);
-    return _agnosai_mcp_success(a, id, r);
+    # 0: a definition can be replaced at any time, and nothing says so.
+    return _agnosai_mcp_success(a, id, _agnosai_mcp_finish(a, m, r, 0));
 }
 
 fn _agnosai_mcp_result_text(a, result): Str {
@@ -548,7 +656,48 @@ fn agnosai_route_mcp_a(a, state, body: Str): i64 {
 # `POST /mcp` with the request's `traceparent` header, or 0 (ADR 023). Only
 # `tools/call` reads it; every response is byte-identical to the `_a` form's.
 fn agnosai_route_mcp_tp_a(a, state, body: Str, tp: Str): i64 {
+    return agnosai_route_mcp_h_a(a, state, body, tp, 0);
+}
+
+# `POST /mcp` with the request itself, `hdrs` (`src/http_headers.cyr`), or 0 (2.6.0, ADR 039).
+#
+# **The era is the request's.** One that names 2026-07-28, in `MCP-Protocol-Version` or in its
+# `_meta`, is served under that revision; one with no header, or a header naming 2025-03-26, is
+# served as this endpoint always served it, the oracle's wire. With `hdrs` of 0 there is no header,
+# so a request that names 2026-07-28 in its body alone is refused for the header it lacks.
+fn agnosai_route_mcp_h_a(a, state, body: Str, tp: Str, hdrs): i64 {
     var v = bayan_json_v_parse_buf_a(a, str_data(body), str_len(body));
+    var hv_lines: i64[1];
+    var hv = agnosai_http_header_once_a(a, hdrs, "MCP-Protocol-Version", &hv_lines);
+    var bv = _agnosai_mcp_body_version(v);
+    var modern_body = 0;
+    if (bv != 0 && str_eq_cstr(bv, AGNOSAI_MCP_MODERN_VERSION) == 1) { modern_body = 1; }
+
+    # A batch has no headers of its own to check, so 2026-07-28 takes one message a POST.
+    if (v != 0 && bayan_json_v_is_arr(v) == 1 && _agnosai_mcp_batch_is_modern(v) == 1) {
+        return _agnosai_mcp_refuse(a, HTTP_BAD_REQUEST, bayan_json_v_null_a(a), AGNOSAI_MCP_INVALID_REQUEST,
+          str_from_a(a, "a POST carries one message"));
+    }
+    if (hv == 0) {
+        if (modern_body == 1) {
+            return _agnosai_mcp_refuse(a, HTTP_BAD_REQUEST, _agnosai_mcp_id_of(a, v), AGNOSAI_MCP_HEADER_MISMATCH,
+              str_from_a(a, "missing required header: MCP-Protocol-Version"));
+        }
+        return _agnosai_mcp_legacy(a, state, v, tp);
+    }
+    if (streq(hv, AGNOSAI_MCP_MODERN_VERSION) == 0 && streq(hv, AGNOSAI_MCP_PROTOCOL_VERSION) == 0) {
+        return _agnosai_mcp_unsupported(a, _agnosai_mcp_id_of(a, v), hv);
+    }
+    if (bv != 0 && str_eq_cstr(bv, hv) == 0) {
+        return _agnosai_mcp_refuse(a, HTTP_BAD_REQUEST, _agnosai_mcp_id_of(a, v), AGNOSAI_MCP_HEADER_MISMATCH,
+          _agnosai_mcp_mismatch_a(a, "MCP-Protocol-Version", hv, _agnosai_mcp_cstr_a(a, bv)));
+    }
+    if (streq(hv, AGNOSAI_MCP_MODERN_VERSION) == 0) { return _agnosai_mcp_legacy(a, state, v, tp); }
+    return _agnosai_mcp_modern(a, state, v, bv, tp, hdrs, load64(&hv_lines));
+}
+
+# The earlier revision's answer, the oracle's: every arm HTTP 200, and an absent `id` echoed as null.
+fn _agnosai_mcp_legacy(a, state, v, tp: Str): i64 {
     if (v == 0 || bayan_json_v_is_obj(v) == 0) {
         return agnosai_route_error_a(a, HTTP_BAD_REQUEST, str_from_a(a, "malformed JSON body"));
     }
@@ -571,35 +720,300 @@ fn agnosai_route_mcp_tp_a(a, state, body: Str, tp: Str): i64 {
     var id = bayan_json_v_obj_get_by_cstr(v, "id");
     if (id == 0) { id = bayan_json_v_null_a(a); }
 
-    if (str_eq_cstr(method, "initialize") == 1) {
-        return agnosai_route_json_a(a, HTTP_OK, _agnosai_mcp_initialize(a, id));
+    var r = _agnosai_mcp_dispatch(a, state, v, method, id, tp, 0);
+    if (r == 0) {
+        _agnosai_mcp_unknown(method);
+        r = _agnosai_mcp_error(a, id, AGNOSAI_MCP_METHOD_NOT_FOUND, str_from_a(a, "Method not found"));
     }
+    return agnosai_route_json_a(a, HTTP_OK, r);
+}
+
+# The method's answer, in either era (`m` 1 for 2026-07-28), or 0 for a method this endpoint does
+# not have. `server/discover` is the newer revision's; `initialize` the earlier's.
+fn _agnosai_mcp_dispatch(a, state, v, method: Str, id, tp: Str, m): i64 {
+    var params = bayan_json_v_obj_get_by_cstr(v, "params");
+    if (m == 0 && str_eq_cstr(method, "initialize") == 1) { return _agnosai_mcp_initialize(a, id); }
+    if (m == 1 && str_eq_cstr(method, "server/discover") == 1) { return _agnosai_mcp_discover(a, id); }
     if (str_eq_cstr(method, "tools/list") == 1) {
-        return agnosai_route_json_a(a, HTTP_OK, _agnosai_mcp_tools_list(a, id, state));
+        if (m == 1 && _agnosai_mcp_cursor_bad(params) == 1) { return _agnosai_mcp_bad_cursor(a, id); }
+        return _agnosai_mcp_tools_list(a, id, state, m);
     }
-    if (str_eq_cstr(method, "tools/call") == 1) {
-        return agnosai_route_json_a(a, HTTP_OK,
-          _agnosai_mcp_tools_call(a, id, bayan_json_v_obj_get_by_cstr(v, "params"), state, tp));
-    }
+    if (str_eq_cstr(method, "tools/call") == 1) { return _agnosai_mcp_tools_call(a, id, params, state, tp, m); }
     # Beyond the oracle's three — see ADR 015 and ADR 016.
     if (str_eq_cstr(method, "prompts/list") == 1) {
-        return agnosai_route_json_a(a, HTTP_OK, _agnosai_mcp_prompts_list(a, id, state));
+        if (m == 1 && _agnosai_mcp_cursor_bad(params) == 1) { return _agnosai_mcp_bad_cursor(a, id); }
+        return _agnosai_mcp_prompts_list(a, id, state, m);
     }
-    if (str_eq_cstr(method, "prompts/get") == 1) {
-        return agnosai_route_json_a(a, HTTP_OK,
-          _agnosai_mcp_prompts_get(a, id, bayan_json_v_obj_get_by_cstr(v, "params"), state));
-    }
+    if (str_eq_cstr(method, "prompts/get") == 1) { return _agnosai_mcp_prompts_get(a, id, params, state, m); }
     if (str_eq_cstr(method, "resources/list") == 1) {
-        return agnosai_route_json_a(a, HTTP_OK, _agnosai_mcp_resources_list(a, id, state));
+        if (m == 1 && _agnosai_mcp_cursor_bad(params) == 1) { return _agnosai_mcp_bad_cursor(a, id); }
+        return _agnosai_mcp_resources_list(a, id, state, m);
     }
     if (str_eq_cstr(method, "resources/read") == 1) {
-        return agnosai_route_json_a(a, HTTP_OK,
-          _agnosai_mcp_resources_read(a, id, bayan_json_v_obj_get_by_cstr(v, "params"), state));
+        return _agnosai_mcp_resources_read(a, id, params, state, m);
+    }
+    return 0;
+}
+
+# ---- 2026-07-28: the checks, and the answer ----------------------------------
+
+# A 2026-07-28 request admitted by its version, checked as that revision asks, then answered. The
+# order is bote's: what the body must carry, then each header against it. `hv_lines` is how many
+# lines named `MCP-Protocol-Version`, counted when its value was read.
+fn _agnosai_mcp_modern(a, state, v, bv: Str, tp: Str, hdrs, hv_lines): i64 {
+    var null_id = bayan_json_v_null_a(a);
+    if (v == 0) {
+        return _agnosai_mcp_refuse(a, HTTP_BAD_REQUEST, null_id, AGNOSAI_MCP_PARSE_ERROR, str_from_a(a, "Parse error"));
+    }
+    if (bayan_json_v_is_obj(v) == 0) {
+        return _agnosai_mcp_refuse(a, HTTP_BAD_REQUEST, null_id, AGNOSAI_MCP_INVALID_REQUEST,
+          str_from_a(a, "a POST carries one message"));
+    }
+    var ver_v = bayan_json_v_obj_get_by_cstr(v, "jsonrpc");
+    var method_v = bayan_json_v_obj_get_by_cstr(v, "method");
+    var id = bayan_json_v_obj_get_by_cstr(v, "id");
+    var rid = null_id;
+    if (id != 0 && (bayan_json_v_is_str(id) == 1 || bayan_json_v_is_int(id) == 1)) { rid = id; }
+    if (ver_v == 0 || bayan_json_v_is_str(ver_v) == 0 || str_eq_cstr(bayan_json_v_str(ver_v), "2.0") == 0
+      || method_v == 0 || bayan_json_v_is_str(method_v) == 0) {
+        return _agnosai_mcp_refuse(a, HTTP_BAD_REQUEST, rid, AGNOSAI_MCP_INVALID_REQUEST,
+          str_from_a(a, "Invalid Request"));
+    }
+    # No `id`: a notification. This revision defines no header requirements for one, and this
+    # endpoint acts on none, so it is accepted and nothing answers it.
+    if (id == 0) { return agnosai_route_json_a(a, AGNOSAI_HTTP_ACCEPTED, 0); }
+    # An `id` is a string or a number, never null, in this revision.
+    if (rid == null_id) {
+        return _agnosai_mcp_refuse(a, HTTP_BAD_REQUEST, null_id, AGNOSAI_MCP_INVALID_REQUEST,
+          str_from_a(a, "Invalid Request: id must be a string or a number"));
+    }
+    var method = bayan_json_v_str(method_v);
+
+    if (bv == 0) {
+        return _agnosai_mcp_refuse(a, HTTP_BAD_REQUEST, rid, AGNOSAI_MCP_INVALID_PARAMS,
+          str_from_a(a, "_meta needs a string io.modelcontextprotocol/protocolVersion"));
+    }
+    var caps = bayan_json_v_obj_get_by_cstr(_agnosai_mcp_meta(v), AGNOSAI_MCP_META_CAPS);
+    if (caps == 0 || bayan_json_v_is_obj(caps) == 0) {
+        return _agnosai_mcp_refuse(a, HTTP_BAD_REQUEST, rid, AGNOSAI_MCP_INVALID_PARAMS,
+          str_from_a(a, "_meta needs an object io.modelcontextprotocol/clientCapabilities"));
+    }
+    if (hv_lines > 1) {
+        return _agnosai_mcp_header_refuse(a, rid, "malformed header: MCP-Protocol-Version");
     }
 
-    _agnosai_mcp_unknown(method);
-    return agnosai_route_json_a(a, HTTP_OK,
-      _agnosai_mcp_error(a, id, AGNOSAI_MCP_METHOD_NOT_FOUND, str_from_a(a, "Method not found")));
+    var hm_lines: i64[1];
+    var hm = agnosai_http_header_once_a(a, hdrs, "Mcp-Method", &hm_lines);
+    if (hm == 0) { return _agnosai_mcp_header_refuse(a, rid, "missing required header: Mcp-Method"); }
+    if (load64(&hm_lines) > 1 || agnosai_http_header_value_ok(hm) == 0) {
+        return _agnosai_mcp_header_refuse(a, rid, "malformed header: Mcp-Method");
+    }
+    if (str_eq_cstr(method, hm) == 0) {
+        return _agnosai_mcp_refuse(a, HTTP_BAD_REQUEST, rid, AGNOSAI_MCP_HEADER_MISMATCH,
+          _agnosai_mcp_mismatch_a(a, "Mcp-Method", hm, _agnosai_mcp_cstr_a(a, method)));
+    }
+
+    var key = _agnosai_mcp_name_key(method);
+    if (key != 0) {
+        var hn_lines: i64[1];
+        var hn = agnosai_http_header_once_a(a, hdrs, "Mcp-Name", &hn_lines);
+        if (hn == 0) { return _agnosai_mcp_header_refuse(a, rid, "missing required header: Mcp-Name"); }
+        if (load64(&hn_lines) > 1 || agnosai_http_header_value_ok(hn) == 0) {
+            return _agnosai_mcp_header_refuse(a, rid, "malformed header: Mcp-Name");
+        }
+        var nv = _agnosai_mcp_field_value_a(a, hn);
+        if (nv == 0) { return _agnosai_mcp_header_refuse(a, rid, "Mcp-Name is not valid Base64"); }
+        # A body without the field is the method's own -32602, as it is in the earlier revision.
+        var params = bayan_json_v_obj_get_by_cstr(v, "params");
+        var bn_v = 0;
+        if (params != 0 && bayan_json_v_is_obj(params) == 1) { bn_v = bayan_json_v_obj_get_by_cstr(params, key); }
+        if (bn_v != 0 && bayan_json_v_is_str(bn_v) == 1 && str_eq_cstr(bayan_json_v_str(bn_v), nv) == 0) {
+            return _agnosai_mcp_refuse(a, HTTP_BAD_REQUEST, rid, AGNOSAI_MCP_HEADER_MISMATCH,
+              _agnosai_mcp_mismatch_a(a, "Mcp-Name", nv, _agnosai_mcp_cstr_a(a, bayan_json_v_str(bn_v))));
+        }
+    }
+
+    # This revision has no `initialize`: a request that named it named one without it.
+    if (str_eq_cstr(method, "initialize") == 1) {
+        return _agnosai_mcp_refuse(a, HTTP_NOT_FOUND, rid, AGNOSAI_MCP_METHOD_NOT_FOUND,
+          str_from_a(a, "method not found: initialize"));
+    }
+    var r = _agnosai_mcp_dispatch(a, state, v, method, rid, tp, 1);
+    if (r == 0) {
+        _agnosai_mcp_unknown(method);
+        return _agnosai_mcp_refuse(a, HTTP_NOT_FOUND, rid, AGNOSAI_MCP_METHOD_NOT_FOUND,
+          str_from_a(a, "Method not found"));
+    }
+    # A method's own error is -32602, which goes out in band, on a 200, as bote's `_he_status_for`
+    # has it: a client reads an error out of a 200, and a 5xx is what a proxy retries. The 404s and
+    # 400s this revision sets are the refusals above, sent before a method runs.
+    return agnosai_route_json_a(a, HTTP_OK, r);
+}
+
+# A refusal: `status` and a JSON-RPC error, which is how a client tells a 2026-07-28 server from an
+# earlier one, as a 400 without a recognized error sends it back to `initialize`.
+fn _agnosai_mcp_refuse(a, status, id, code, message: Str): i64 {
+    _agnosai_mcp_refused(code, message);
+    return agnosai_route_json_a(a, status, _agnosai_mcp_error(a, id, code, message));
+}
+
+fn _agnosai_mcp_header_refuse(a, id, message): i64 {
+    return _agnosai_mcp_refuse(a, HTTP_BAD_REQUEST, id, AGNOSAI_MCP_HEADER_MISMATCH, str_from_a(a, message));
+}
+
+# -32022, naming the revisions this endpoint speaks, which a client picks from to retry.
+fn _agnosai_mcp_unsupported(a, id, requested): i64 {
+    var supported = bayan_json_v_arr_new_a(a);
+    bayan_json_v_arr_push_a(a, supported, bayan_json_v_str_new_a(a, str_from_a(a, AGNOSAI_MCP_MODERN_VERSION)));
+    bayan_json_v_arr_push_a(a, supported, bayan_json_v_str_new_a(a, str_from_a(a, AGNOSAI_MCP_PROTOCOL_VERSION)));
+    var d = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, d, AGN_JK_SUPPORTED, supported);
+    bayan_json_v_obj_set_a(a, d, AGN_JK_REQUESTED, bayan_json_v_str_new_a(a, str_from_a(a, requested)));
+    var msg = str_from_a(a, "Unsupported protocol version");
+    _agnosai_mcp_refused(AGNOSAI_MCP_UNSUPPORTED_VERSION, msg);
+    return agnosai_route_json_a(a, HTTP_BAD_REQUEST,
+      _agnosai_mcp_error_data(a, id, AGNOSAI_MCP_UNSUPPORTED_VERSION, msg, d));
+}
+
+# "Header mismatch: Mcp-Name header value 'foo' does not match body value 'bar'", as the spec's
+# example has it. `hv` and `bv` are cstrs.
+fn _agnosai_mcp_mismatch_a(a, header, hv, bv): Str {
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "Header mismatch: ");
+    str_builder_add_cstr_a(a, sb, header);
+    str_builder_add_cstr_a(a, sb, " header value '");
+    str_builder_add_cstr_a(a, sb, hv);
+    str_builder_add_cstr_a(a, sb, "' does not match body value '");
+    str_builder_add_cstr_a(a, sb, bv);
+    str_builder_add_cstr_a(a, sb, "'");
+    return str_builder_build_a(a, sb);
+}
+
+# `s` as a NUL-terminated cstr in `a`, for the messages that quote a body value.
+fn _agnosai_mcp_cstr_a(a, s: Str): i64 {
+    return str_data(str_clone_a(a, s));
+}
+
+# The request's `params._meta`, or 0.
+fn _agnosai_mcp_meta(v): i64 {
+    if (v == 0 || bayan_json_v_is_obj(v) == 0) { return 0; }
+    var params = bayan_json_v_obj_get_by_cstr(v, "params");
+    if (params == 0 || bayan_json_v_is_obj(params) == 0) { return 0; }
+    var meta = bayan_json_v_obj_get_by_cstr(params, "_meta");
+    if (meta == 0 || bayan_json_v_is_obj(meta) == 0) { return 0; }
+    return meta;
+}
+
+# The revision a request names in its `_meta`, a Str, or 0.
+fn _agnosai_mcp_body_version(v): i64 {
+    var meta = _agnosai_mcp_meta(v);
+    if (meta == 0) { return 0; }
+    var bv = bayan_json_v_obj_get_by_cstr(meta, AGNOSAI_MCP_META_VERSION);
+    if (bv == 0 || bayan_json_v_is_str(bv) == 0) { return 0; }
+    return bayan_json_v_str(bv);
+}
+
+# 1 when a message of the batch `v` names 2026-07-28.
+fn _agnosai_mcp_batch_is_modern(v): i64 {
+    for (var i = 0; i < bayan_json_v_arr_len(v); i = i + 1) {
+        var bv = _agnosai_mcp_body_version(bayan_json_v_arr_get(v, i));
+        if (bv != 0 && str_eq_cstr(bv, AGNOSAI_MCP_MODERN_VERSION) == 1) { return 1; }
+    }
+    return 0;
+}
+
+# The request's `id` for a refusal: a string or a number as it is, anything else null.
+fn _agnosai_mcp_id_of(a, v): i64 {
+    if (v != 0 && bayan_json_v_is_obj(v) == 1) {
+        var id = bayan_json_v_obj_get_by_cstr(v, "id");
+        if (id != 0 && (bayan_json_v_is_str(id) == 1 || bayan_json_v_is_int(id) == 1)) { return id; }
+    }
+    return bayan_json_v_null_a(a);
+}
+
+# The params field `Mcp-Name` mirrors for `method`, a cstr, or 0 when it has none.
+fn _agnosai_mcp_name_key(method: Str): i64 {
+    if (str_eq_cstr(method, "tools/call") == 1) { return "name"; }
+    if (str_eq_cstr(method, "prompts/get") == 1) { return "name"; }
+    if (str_eq_cstr(method, "resources/read") == 1) { return "uri"; }
+    return 0;
+}
+
+# 1 when a list's `params.cursor` is one this endpoint never issued: it answers every list in one
+# page, so any cursor but the empty one is.
+fn _agnosai_mcp_cursor_bad(params): i64 {
+    if (params == 0 || bayan_json_v_is_obj(params) == 0) { return 0; }
+    var c = bayan_json_v_obj_get_by_cstr(params, "cursor");
+    if (c == 0 || bayan_json_v_is_null(c) == 1) { return 0; }
+    if (bayan_json_v_is_str(c) == 0) { return 1; }
+    if (str_len(bayan_json_v_str(c)) > 0) { return 1; }
+    return 0;
+}
+
+fn _agnosai_mcp_bad_cursor(a, id): i64 {
+    return _agnosai_mcp_error(a, id, AGNOSAI_MCP_INVALID_PARAMS, str_from_a(a, "invalid cursor"));
+}
+
+# What an `Mcp-Name` value says: the value as sent, or a `=?base64?…?=` sentinel decoded. The
+# markers are case-sensitive, so anything else is a plain value. 0 when a sentinel does not decode.
+fn _agnosai_mcp_field_value_a(a, v): i64 {
+    var n = strlen(v);
+    if (n < 11 || memeq(v, "=?base64?", 9) == 0 || memeq(v + n - 2, "?=", 2) == 0) { return v; }
+    return _agnosai_mcp_b64_decode_a(a, v + 9, n - 11);
+}
+
+# The value of `ch` in the standard Base64 alphabet, or -1.
+fn _agnosai_mcp_b64_val(ch): i64 {
+    if (ch >= 65 && ch <= 90) { return ch - 65; }
+    if (ch >= 97 && ch <= 122) { return ch - 71; }
+    if (ch >= 48 && ch <= 57) { return ch + 4; }
+    if (ch == 43) { return 62; }
+    if (ch == 47) { return 63; }
+    return 0 - 1;
+}
+
+# The standard Base64 at p[0, n) as a cstr in `a`, or 0 when it is not canonical or decodes to a
+# NUL, which a cstr cannot hold. Not `bayan_base64_decode`: that keeps its output on the global heap,
+# and this is a client's header on a path that may refuse it.
+fn _agnosai_mcp_b64_decode_a(a, p, n): i64 {
+    if (n % 4 != 0) { return 0; }
+    var pad = 0;
+    while (pad < 2 && n > 0 && load8(p + n - 1) == 61) {
+        n = n - 1;
+        pad = pad + 1;
+    }
+    var out = alloc_via(a, (n / 4) * 3 + 3);
+    var acc = 0;
+    var bits = 0;
+    var o = 0;
+    var i = 0;
+    while (i < n) {
+        var x = _agnosai_mcp_b64_val(load8(p + i));
+        if (x < 0) { return 0; }
+        acc = ((acc << 6) | x) & 0xFFFFFF;
+        bits = bits + 6;
+        if (bits >= 8) {
+            bits = bits - 8;
+            var b = (acc >> bits) & 255;
+            if (b == 0) { return 0; }
+            store8(out + o, b);
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+    # The bits a last group pads with are 0 in canonical Base64.
+    if ((acc & ((1 << bits) - 1)) != 0) { return 0; }
+    store8(out + o, 0);
+    return out;
+}
+
+fn _agnosai_mcp_refused(code, message: Str): i64 {
+    if (sakshi_get_level() < SK_DEBUG) { return 0; }
+    var f[AGNOSAI_LOG_FIELDS_BYTES];
+    var n = agnosai_log_fields_start(&f, message);
+    n = agnosai_log_field_int(&f, n, "code", code);
+    sakshi_log_kv(SK_DEBUG, "MCP request refused", 19, "reason", 6, &f, n);
+    return 0;
 }
 
 # Global-allocator form of `agnosai_route_mcp_a`.

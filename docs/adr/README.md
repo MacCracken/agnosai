@@ -65,6 +65,8 @@ Regenerate rather than hand-edit — this index read _"No ADRs yet"_ until
 | [036](036-a-crew-keeps-a-log-and-resumes-from-it.md) | A crew keeps a log, and resumes from it | Accepted — shipped in 2.5.0 |
 | [037](037-the-servers-crews-are-the-orchestrators-to-give-back.md) | The server's crews are the orchestrator's to give back | Accepted — shipped in 2.5.1 |
 | [038](038-an-audit-entry-lives-in-its-ring-slot.md) | An audit entry lives in its ring slot | Accepted — shipped in 2.5.2 |
+| [039](039-mcp-serves-both-eras-on-one-endpoint.md) | `/mcp` serves both MCP eras on one endpoint, by hand | Accepted — shipped in 2.6.0 |
+| [040](040-a2a-v1-tasks-are-crews.md) | A2A v1.0: an Agent Card, and a JSON-RPC endpoint whose tasks are crews | Accepted — shipped in 2.6.0 |
 
 ADRs 001-005 predate the current heading convention (`ADR-00N: Title` rather
 than `00N — Title`). The headings are left as written — renumbering accepted

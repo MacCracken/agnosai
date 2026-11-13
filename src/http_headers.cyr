@@ -1,0 +1,138 @@
+# =========================================================================
+# http_headers — a request's header lines, for a route that reads more than
+# the serve layer hands it (2.6.0).
+#
+# Port-local: no `rust-old/` counterpart. The serve layer reads the headers
+# every route needs, `Authorization`, `Content-Type` and `traceparent`, and
+# passes them as arguments. MCP 2026-07-28 and A2A 1.0 each read headers of
+# their own: `/mcp` its `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name`,
+# which it compares with the body, and A2A its `A2A-Version` and the `Host` its
+# card names. So the serve layer hands those routes the request itself, as a
+# 16-byte view of sandhi's buffer, and they look up what they read.
+#
+# A caller with no request, a test dispatching directly, passes 0, and every
+# lookup answers absent.
+# =========================================================================
+
+enum AgnosaiHttpHeadersOff {
+    AGN_HH_BUF = 0;
+    AGN_HH_LEN = 8;
+    AGN_HH_END = 16;   # where the header lines end, found once
+    AGN_HH_SIZE = 24;
+}
+
+# A view of the request in `buf`, `blen` bytes, request line first, in the `AGN_HH_SIZE` (24) bytes
+# at `h`. Where its header lines end is found here, once, for every lookup after.
+fn agnosai_http_headers_init(h, buf, blen): i64 {
+    store64(h + AGN_HH_BUF, buf);
+    store64(h + AGN_HH_LEN, blen);
+    store64(h + AGN_HH_END, _agnosai_hh_end(buf, blen));
+    return h;
+}
+
+# A view of the request in `buf`, `blen` bytes, in `a`.
+fn agnosai_http_headers_new_a(a, buf, blen): i64 {
+    return agnosai_http_headers_init(alloc_via(a, AGN_HH_SIZE), buf, blen);
+}
+
+# A view of a request's text, as it arrives: the request line, the header lines and the body.
+fn agnosai_http_headers_of_a(a, text: Str): i64 {
+    return agnosai_http_headers_new_a(a, str_data(text), str_len(text));
+}
+
+# Where the header lines end: the blank line's offset, or the buffer's end.
+fn _agnosai_hh_end(buf, blen): i64 {
+    var i = 0;
+    while (i + 3 < blen) {
+        if (load8(buf + i) == 13 && load8(buf + i + 1) == 10 && load8(buf + i + 2) == 13
+          && load8(buf + i + 3) == 10) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return blen;
+}
+
+fn _agnosai_hh_lower(c): i64 {
+    if (c >= 65 && c <= 90) { return c + 32; }
+    return c;
+}
+
+# 1 when the `n` bytes at `p` spell the cstr `name`, whatever their case.
+fn _agnosai_hh_iceq(p, name, n): i64 {
+    var i = 0;
+    while (i < n) {
+        if (_agnosai_hh_lower(load8(p + i)) != _agnosai_hh_lower(load8(name + i))) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# The header `name` (a cstr, any case), in one pass over the header lines: its first line's value, a
+# cstr in `a` without the spaces and tabs RFC 9110 does not count as part of it, or 0 when no line
+# names it, when `h` is 0, or when `a` is 0, which counts and copies nothing. Through `out_lines`,
+# when it is not 0, how many lines name it. Lines of one field combine into one comma-separated value
+# (RFC 9110 §5.3), which no single body value matches, so a route that compares a header with the
+# body refuses one on more than a line: a proxy reading the last line would act on one the route
+# never compared.
+fn agnosai_http_header_once_a(a, h, name, out_lines): i64 {
+    if (out_lines != 0) { store64(out_lines, 0); }
+    if (h == 0) { return 0; }
+    var buf = load64(h + AGN_HH_BUF);
+    var end = load64(h + AGN_HH_END);
+    var nlen = strlen(name);
+    var seen = 0;
+    var vs = 0 - 1;
+    var ve = 0;
+    var i = 0;
+    # Past the request line, which is never a header.
+    while (i < end && load8(buf + i) != 10) { i = i + 1; }
+    i = i + 1;
+    while (i < end) {
+        var e = i;
+        while (e < end && load8(buf + e) != 10) { e = e + 1; }
+        if (e - i > nlen && load8(buf + i + nlen) == 58 && _agnosai_hh_iceq(buf + i, name, nlen) == 1) {
+            seen = seen + 1;
+            if (vs < 0) {
+                vs = i + nlen + 1;
+                ve = e;
+            }
+        }
+        i = e + 1;
+    }
+    if (out_lines != 0) { store64(out_lines, seen); }
+    if (vs < 0 || a == 0) { return 0; }
+    while (vs < ve && (load8(buf + vs) == 32 || load8(buf + vs) == 9)) { vs = vs + 1; }
+    while (ve > vs && (load8(buf + ve - 1) == 13 || load8(buf + ve - 1) == 32 || load8(buf + ve - 1) == 9)) {
+        ve = ve - 1;
+    }
+    var out = alloc_via(a, ve - vs + 1);
+    memcpy(out, buf + vs, ve - vs);
+    store8(out + ve - vs, 0);
+    return out;
+}
+
+# How many header lines name the field `name` (a cstr, any case), with nothing allocated.
+fn agnosai_http_header_lines(h, name): i64 {
+    var n: i64[1];
+    agnosai_http_header_once_a(0, h, name, &n);
+    return load64(&n);
+}
+
+# The value of the header `name` (a cstr, any case) as a cstr in `a`, without the spaces and tabs
+# around it, or 0 when the request has none, or when `h` is 0. The first line wins.
+fn agnosai_http_header_a(a, h, name): i64 {
+    return agnosai_http_header_once_a(a, h, name, 0);
+}
+
+# 1 when the cstr `v` holds only what a field value may: visible ASCII, space and tab.
+fn agnosai_http_header_value_ok(v): i64 {
+    var i = 0;
+    var c = load8(v);
+    while (c != 0) {
+        if (c != 9 && (c < 32 || c > 126)) { return 0; }
+        i = i + 1;
+        c = load8(v + i);
+    }
+    return 1;
+}

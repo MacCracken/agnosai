@@ -563,8 +563,18 @@ fn agnosai_serve_handler(ctx, cfd, buf, blen): i64 {
         }
     }
 
-    var resp = agnosai_route_dispatch_tp_a(a, _agnosai_serve_state, method, path,
-      auth_str, has_auth, body, agnosai_content_type_is_json(ctype), traceparent);
+    # The request itself, for a route that reads headers of its own (2.6.0): a view of sandhi's
+    # buffer, on the stack, as it lives no longer than this call.
+    var hh[24];
+    agnosai_http_headers_init(&hh, buf, blen);
+    var resp = agnosai_route_dispatch_h_a(a, _agnosai_serve_state, method, path,
+      auth_str, has_auth, body, agnosai_content_type_is_json(ctype), traceparent, &hh);
+
+    # A stream writes its own response, for as long as it streams (2.6.0: A2A's streaming methods).
+    if (agnosai_route_is_stream(resp) == 1) {
+        agnosai_route_stream_run(resp, cfd);
+        return 0;
+    }
 
     # The a2a callback, on the success path only — the oracle spawns it inside
     # the `Ok(crew_state)` arm.
@@ -673,6 +683,7 @@ fn _agnosai_serve_strip_query(a, path: Str): Str {
 fn _agnosai_serve_reason(status): i64 {
     if (status == HTTP_OK) { return "OK"; }
     if (status == AGNOSAI_HTTP_CREATED) { return "Created"; }
+    if (status == AGNOSAI_HTTP_ACCEPTED) { return "Accepted"; }
     if (status == HTTP_NO_CONTENT) { return "No Content"; }
     if (status == HTTP_BAD_REQUEST) { return "Bad Request"; }
     if (status == HTTP_UNAUTHORIZED) { return "Unauthorized"; }

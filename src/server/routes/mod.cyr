@@ -57,7 +57,7 @@
 # **Do not take this from `rust-old/Cargo.toml`**, which is 1.1.0 and frozen. The
 # oracle's `env!("CARGO_PKG_VERSION")` means "this package's version", and for the
 # port that is the root VERSION file.
-var AGNOSAI_VERSION = "2.5.2";
+var AGNOSAI_VERSION = "2.6.0";
 
 # --- Status codes sandhi does not define -----------------------------------
 #
@@ -68,6 +68,8 @@ var AGNOSAI_VERSION = "2.5.2";
 
 # 201 Created — `POST /api/v1/agents/definitions` on success.
 var AGNOSAI_HTTP_CREATED = 201;
+# A notification MCP 2026-07-28 accepted and nothing answers (2.6.0): no body.
+var AGNOSAI_HTTP_ACCEPTED = 202;
 
 # 409 Conflict — `POST /api/v1/crews/{id}/cancel` on a crew that has already
 # finished (2.1.6). Cancelling it would relabel finished work; the request
@@ -145,7 +147,8 @@ enum AgnosaiRouteRespOff {
     AGN_RR_BODY = 8;
     AGN_RR_IS_TEXT = 16;
     AGN_RR_HEADERS = 24;   # extra header lines, CRLF-terminated, or 0 (2.1.7)
-    AGN_ROUTE_RESP_SIZE = 32;
+    AGN_RR_STREAM = 32;    # a stream the connection runs, `fn(job, cfd)`, the job its body, or 0 (2.6.0)
+    AGN_ROUTE_RESP_SIZE = 40;
 }
 
 # A handler's answer: an HTTP status plus a JSON body.
@@ -158,6 +161,7 @@ fn agnosai_route_json_a(a, status, body): i64 {
     store64(r + AGN_RR_BODY, body);
     store64(r + AGN_RR_IS_TEXT, 0);
     store64(r + AGN_RR_HEADERS, 0);
+    store64(r + AGN_RR_STREAM, 0);
     return r;
 }
 
@@ -179,7 +183,31 @@ fn agnosai_route_text(status, body: Str): i64 {
     store64(r + AGN_RR_BODY, body);
     store64(r + AGN_RR_IS_TEXT, 1);
     store64(r + AGN_RR_HEADERS, 0);
+    store64(r + AGN_RR_STREAM, 0);
     return r;
+}
+
+# A handler's answer that is a stream, not a body (2.6.0): `fp`, `fn(job, cfd)`, writes the whole
+# response to the connection, its status line included, and `job` is what it streams from. The serve
+# layer runs it in place of sending a body. ⚠ **A stream answer is run**: its job may hold what only
+# the stream lets go, a crew included (ADR 037), so a caller that dispatches directly runs it with
+# `agnosai_route_stream_run`, on a descriptor of its own.
+fn agnosai_route_stream_a(a, fp, job): i64 {
+    var r = agnosai_route_json_a(a, HTTP_OK, job);
+    store64(r + AGN_RR_STREAM, fp);
+    return r;
+}
+
+# 1 when `r` is a stream, which `agnosai_route_stream_run` runs.
+fn agnosai_route_is_stream(r): i64 {
+    if (r == 0) { return 0; }
+    if (load64(r + AGN_RR_STREAM) != 0) { return 1; }
+    return 0;
+}
+
+# Run the stream `r` is on `cfd`. Answers what the stream does.
+fn agnosai_route_stream_run(r, cfd): i64 {
+    return fncall2(load64(r + AGN_RR_STREAM), load64(r + AGN_RR_BODY), cfd);
 }
 
 # The HTTP status this response carries.

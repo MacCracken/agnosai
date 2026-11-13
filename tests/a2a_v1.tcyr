@@ -1,0 +1,1033 @@
+# =========================================================================
+# a2a_v1 — the A2A protocol v1.0 on its JSON-RPC binding (2.6.0, ADR 040).
+#
+# The Agent Card, and `POST /a2a`, whose tasks are crews: the version header,
+# every method's answer and refusal, the crew a message starts and the task it
+# reads back as, and what a task costs the global heap once its crew goes back.
+# `server_routes_a2a.tcyr` pins the Rust line's `/api/v1/a2a/receive`, which
+# stays as it was.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/arena_pool.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+# strcase — `prompt_guard`, `cost_planning` and `definitions/assembler` all
+# fold ASCII case; the shared helpers live here (extracted at the third use).
+include "src/strcase.cyr"
+# telemetry — `tools/native` and `orchestrator/crew_runner` record GenAI
+# spans (ADR 017), so every suite that reaches them needs the module that
+# defines the recorder. It depends on nothing in `src/` except `id`.
+include "src/telemetry/mod.cyr"
+include "src/core/mod.cyr"
+include "src/definitions/mod.cyr"
+include "src/learning/mod.cyr"
+include "src/llm/mod.cyr"
+include "src/server/ssrf.cyr"
+include "src/server/prompt_guard.cyr"
+include "src/server/output_filter.cyr"
+include "src/server/prometheus.cyr"
+include "src/server/auth.cyr"
+include "src/guarded_fetch.cyr"
+include "src/chan_lossy.cyr"
+include "src/server/sse.cyr"
+include "src/sandbox/mod.cyr"
+include "src/tools/mod.cyr"
+include "src/orchestrator/mod.cyr"
+include "src/server/state.cyr"
+include "src/server/routes/mod.cyr"
+include "src/server/routes/health.cyr"
+include "src/server/routes/tools.cyr"
+include "src/server/routes/definitions.cyr"
+include "src/server/routes/agents.cyr"
+include "src/server/routes/approval.cyr"
+include "src/server/routes/dashboard.cyr"
+include "src/server/routes/crews.cyr"
+include "src/server/routes/a2a.cyr"
+include "src/server/routes/mcp.cyr"
+include "src/a2a_v1.cyr"
+include "src/server/hot_config.cyr"
+include "src/server/rate_limit.cyr"
+include "src/server/router.cyr"
+include "tests/test_helpers.cyr"
+include "tests/test_log.cyr"
+include "tests/test_tmp.cyr"
+
+fn _t_state_auth(auth): i64 {
+    var o = agnosai_orchestrator_new(agnosai_resource_budget_default());
+    agnosai_orchestrator_with_audit(o, 0);
+    agnosai_orchestrator_with_events(o, agnosai_event_bus_new());
+    return agnosai_app_state_new(o, agnosai_tool_registry_new(), auth, load64(o + AGN_OR_EVENTS), 0,
+      agnosai_orchestrator_approval_gate(o));
+}
+
+fn _t_state(): i64 { return _t_state_auth(agnosai_auth_config_new()); }
+
+# A request's text as it arrives: the request line, `headers` (each line ending CRLF) and `body`.
+fn _t_hdrs(headers, body: Str): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "POST /a2a HTTP/1.1\r\nHost: agnosai.test\r\n");
+    str_builder_add_cstr(sb, headers);
+    str_builder_add_cstr(sb, "\r\n");
+    str_builder_add(sb, body);
+    return agnosai_http_headers_of_a(default_alloc(), str_builder_build(sb));
+}
+
+# A JSON-RPC request for `method`, `params` a JSON literal or 0.
+fn _t_rpc(method, params): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"");
+    str_builder_add_cstr(sb, method);
+    str_builder_add_cstr(sb, "\"");
+    if (params != 0) {
+        str_builder_add_cstr(sb, ",\"params\":");
+        str_builder_add_cstr(sb, params);
+    }
+    str_builder_add_cstr(sb, "}");
+    return str_builder_build(sb);
+}
+
+# `method` sent with `A2A-Version: 1.0`.
+fn _t_call(s, method, params): i64 {
+    var body = _t_rpc(method, params);
+    return agnosai_route_a2a_rpc_h_a(default_alloc(), s, body, 0, _t_hdrs("A2A-Version: 1.0\r\n", body));
+}
+
+# A SendMessage's params: a user message saying `text`, and `extra` fields of params (a JSON
+# fragment ending in a comma, or "").
+fn _t_send_params(text, extra): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{");
+    str_builder_add_cstr(sb, extra);
+    str_builder_add_cstr(sb, "\"message\":{\"messageId\":\"m-1\",\"role\":\"ROLE_USER\",\"parts\":[{\"text\":\"");
+    str_builder_add_cstr(sb, text);
+    str_builder_add_cstr(sb, "\"}]}}");
+    return str_cstr(str_builder_build(sb));
+}
+
+fn _t_obj(v, key): i64 { return bayan_json_v_obj_get_by_cstr(v, key); }
+
+fn _t_str_is(v, key, want): i64 {
+    var x = _t_obj(v, key);
+    if (x == 0 || bayan_json_v_is_str(x) == 0) { return 0; }
+    return str_eq_cstr(bayan_json_v_str(x), want);
+}
+
+fn _t_result(r): i64 { return _t_obj(agnosai_route_body(r), "result"); }
+
+fn _t_code(r): i64 {
+    var e = _t_obj(agnosai_route_body(r), "error");
+    if (e == 0) { return 0; }
+    return bayan_json_v_int(_t_obj(e, "code"));
+}
+
+# The `ErrorInfo` reason an error carries, 1 when it is `want`.
+fn _t_reason_is(r, want): i64 {
+    var d = _t_obj(_t_obj(agnosai_route_body(r), "error"), "data");
+    if (d == 0 || bayan_json_v_arr_len(d) != 1) { return 0; }
+    var info = bayan_json_v_arr_get(d, 0);
+    if (_t_str_is(info, "@type", "type.googleapis.com/google.rpc.ErrorInfo") == 0) { return 0; }
+    if (_t_str_is(info, "domain", "a2a-protocol.org") == 0) { return 0; }
+    return _t_str_is(info, "reason", want);
+}
+
+fn _t_state_of(task): i64 { return _t_obj(_t_obj(task, "status"), "state"); }
+
+fn _t_task_state_is(task, want): i64 {
+    var s = _t_state_of(task);
+    if (s == 0) { return 0; }
+    return str_eq_cstr(bayan_json_v_str(s), want);
+}
+
+# --- the Agent Card ---------------------------------------------------------
+
+fn _t_card_suite(): i64 {
+    var s = _t_state();
+    var r = agnosai_route_a2a_card_a(default_alloc(), s, _t_hdrs("", str_from("")));
+    assert_eq(agnosai_route_status(r), HTTP_OK, "the card is served");
+    var c = agnosai_route_body(r);
+    assert(_t_str_is(c, "name", "agnosai") == 1, "naming the agent");
+    assert(_t_obj(c, "description") != 0, "and saying what it does");
+    assert(_t_str_is(c, "version", AGNOSAI_VERSION) == 1, "at its version");
+    var ifs = _t_obj(c, "supportedInterfaces");
+    assert_eq(bayan_json_v_arr_len(ifs), 1, "with one interface");
+    var i0 = bayan_json_v_arr_get(ifs, 0);
+    assert(_t_str_is(i0, "url", "http://agnosai.test/a2a") == 1, "at the request's host, without a public URL");
+    assert(_t_str_is(i0, "protocolBinding", "JSONRPC") == 1, "on the JSON-RPC binding");
+    assert(_t_str_is(i0, "protocolVersion", "1.0") == 1, "at 1.0");
+    var caps = _t_obj(c, "capabilities");
+    assert_eq(bayan_json_v_bool(_t_obj(caps, "streaming")), 1, "it streams");
+    assert_eq(bayan_json_v_bool(_t_obj(caps, "pushNotifications")), 0, "and sends no push notifications");
+    assert_eq(bayan_json_v_bool(_t_obj(caps, "extendedAgentCard")), 0, "and has no extended card");
+    assert_eq(bayan_json_v_arr_len(_t_obj(c, "defaultInputModes")), 2, "it reads text and JSON");
+    assert_eq(bayan_json_v_arr_len(_t_obj(c, "defaultOutputModes")), 1, "and answers text");
+    var sk = bayan_json_v_arr_get(_t_obj(c, "skills"), 0);
+    assert(_t_str_is(sk, "id", "run-crew") == 1, "its skill is running a crew");
+    assert(_t_obj(sk, "name") != 0 && _t_obj(sk, "description") != 0, "named and described");
+    assert_eq(bayan_json_v_arr_len(_t_obj(sk, "tags")), 3, "and tagged");
+    assert_eq(_t_obj(c, "securitySchemes"), 0, "with auth off, no scheme");
+    assert_eq(_t_obj(c, "url"), 0, "and none of 0.3's fields: no top-level url");
+    assert_eq(_t_obj(c, "protocolVersion"), 0, "nor protocolVersion");
+    assert(streq(agnosai_route_headers(r), "Cache-Control: no-cache\r\n") == 1,
+      "naming a request's host, no shared cache may keep it");
+
+    var bad = agnosai_route_a2a_card_a(default_alloc(), s,
+      agnosai_http_headers_of_a(default_alloc(), str_from("GET / HTTP/1.1\r\nHost: evil.test/x?\r\n\r\n")));
+    var bi = bayan_json_v_arr_get(_t_obj(agnosai_route_body(bad), "supportedInterfaces"), 0);
+    assert(_t_str_is(bi, "url", "http://localhost/a2a") == 1, "a host a URL cannot carry is not written into it");
+    var none = agnosai_route_a2a_card_a(default_alloc(), s, 0);
+    var ni = bayan_json_v_arr_get(_t_obj(agnosai_route_body(none), "supportedInterfaces"), 0);
+    assert(_t_str_is(ni, "url", "http://localhost/a2a") == 1, "nor is a missing one");
+
+    var cfg = agnosai_a2a_config_with_public_url(agnosai_a2a_config_new(), str_from("https://agents.example.com/"));
+    assert(str_eq_cstr(agnosai_a2a_config_public_url(cfg), "https://agents.example.com") == 1,
+      "a public URL is kept without its trailing slash");
+    assert_eq(agnosai_a2a_config_public_url(agnosai_a2a_config_new()), 0, "and there is none unless set");
+    agnosai_app_state_with_a2a(s, cfg);
+    assert_eq(agnosai_app_state_a2a(s), cfg, "the app state holds the endpoint's settings");
+    var pr = agnosai_route_a2a_card_a(default_alloc(), s, _t_hdrs("", str_from("")));
+    var pi = bayan_json_v_arr_get(_t_obj(agnosai_route_body(pr), "supportedInterfaces"), 0);
+    assert(_t_str_is(pi, "url", "https://agents.example.com/a2a") == 1,
+      "the configured public URL wins, its trailing slash dropped");
+    assert(streq(agnosai_route_headers(pr), "Cache-Control: public, max-age=300\r\n") == 1,
+      "and then any cache may keep the card five minutes");
+
+    var auth = agnosai_auth_config_with_secret(str_from("s3cret"));
+    var sa = _t_state_auth(auth);
+    var ac = agnosai_route_body(agnosai_route_a2a_card_a(default_alloc(), sa, 0));
+    var http = _t_obj(_t_obj(_t_obj(ac, "securitySchemes"), "bearer"), "httpAuthSecurityScheme");
+    assert(_t_str_is(http, "scheme", "Bearer") == 1, "with auth on, the card declares the bearer scheme");
+    assert_eq(_t_obj(http, "bearerFormat"), 0, "a shared secret's, which is no JWT");
+    var req = bayan_json_v_arr_get(_t_obj(ac, "securityRequirements"), 0);
+    assert(_t_obj(_t_obj(_t_obj(req, "schemes"), "bearer"), "list") != 0, "and requires it");
+
+    # Through the router: public, whatever auth says; and the endpoint it names, not.
+    var g = agnosai_route_dispatch_h_a(default_alloc(), sa, AGNOSAI_METHOD_GET,
+      str_from("/.well-known/agent-card.json"), str_from(""), 0, str_from(""), 1, 0, 0);
+    assert_eq(agnosai_route_status(g), HTTP_OK, "the card needs no token, as discovery cannot have one");
+    var p = agnosai_route_dispatch_h_a(default_alloc(), sa, AGNOSAI_METHOD_POST,
+      str_from("/a2a"), str_from(""), 0, _t_rpc("GetTask", "{\"id\":\"x\"}"), 1, 0, 0);
+    assert_eq(agnosai_route_status(p), HTTP_UNAUTHORIZED, "and the endpoint needs one");
+    var pc = agnosai_route_dispatch_h_a(default_alloc(), sa, AGNOSAI_METHOD_POST,
+      str_from("/.well-known/agent-card.json"), str_from(""), 0, str_from(""), 1, 0, 0);
+    assert_eq(agnosai_route_status(pc), HTTP_METHOD_NOT_ALLOWED, "the card is GET only");
+    return 0;
+}
+
+# --- the version, and the envelope -----------------------------------------------
+
+# A stream that marks its job and answers its descriptor.
+fn _t_any_stream(job, cfd): i64 {
+    store64(job, 1);
+    return cfd;
+}
+
+fn _t_version_suite(): i64 {
+    var s = _t_state();
+    var body = _t_rpc("GetTask", "{\"id\":\"nope\"}");
+    var none = agnosai_route_a2a_rpc_h_a(default_alloc(), s, body, 0, _t_hdrs("", body));
+    assert_eq(agnosai_route_status(none), HTTP_OK, "a JSON-RPC error is in band, on a 200");
+    assert_eq(_t_code(none), AGNOSAI_A2A_VERSION_NOT_SUPPORTED, "a request naming no version is 0.3's, and refused");
+    assert(_t_reason_is(none, "VERSION_NOT_SUPPORTED") == 1, "with an ErrorInfo saying so");
+    assert_eq(bayan_json_v_int(_t_obj(agnosai_route_body(none), "id")), 7, "echoing the request's id");
+    var old = agnosai_route_a2a_rpc_h_a(default_alloc(), s, body, 0, _t_hdrs("A2A-Version: 0.3\r\n", body));
+    assert_eq(_t_code(old), AGNOSAI_A2A_VERSION_NOT_SUPPORTED, "so is one naming 0.3");
+    var newer = agnosai_route_a2a_rpc_h_a(default_alloc(), s, body, 0, _t_hdrs("A2A-Version: 1.1\r\n", body));
+    assert_eq(_t_code(newer), AGNOSAI_A2A_VERSION_NOT_SUPPORTED, "and one naming 1.1");
+    var patch = agnosai_route_a2a_rpc_h_a(default_alloc(), s, body, 0, _t_hdrs("A2A-Version: 1.0.3\r\n", body));
+    assert_eq(_t_code(patch), AGNOSAI_A2A_TASK_NOT_FOUND, "a patch number is ignored");
+    var junk = agnosai_route_a2a_rpc_h_a(default_alloc(), s, body, 0, _t_hdrs("A2A-Version: 1.0.x\r\n", body));
+    assert_eq(_t_code(junk), AGNOSAI_A2A_VERSION_NOT_SUPPORTED, "and a version that is not one is refused");
+
+    var parse = agnosai_route_a2a_rpc_h_a(default_alloc(), s, str_from("{\"jsonrpc\""), 0,
+      _t_hdrs("A2A-Version: 1.0\r\n", str_from("")));
+    assert_eq(_t_code(parse), AGNOSAI_A2A_PARSE_ERROR, "a body that is not JSON is -32700");
+    assert_eq(_t_reason_is(parse, "x"), 0, "and a JSON-RPC error carries no ErrorInfo");
+    var noid = str_from("{\"jsonrpc\":\"2.0\",\"method\":\"GetTask\",\"params\":{\"id\":\"x\"}}");
+    var ni = agnosai_route_a2a_rpc_h_a(default_alloc(), s, noid, 0, _t_hdrs("A2A-Version: 1.0\r\n", noid));
+    assert_eq(_t_code(ni), AGNOSAI_A2A_INVALID_REQUEST, "every A2A method is a request: one with no id is -32600");
+    var nover = str_from("{\"id\":1,\"method\":\"GetTask\"}");
+    var nv = agnosai_route_a2a_rpc_h_a(default_alloc(), s, nover, 0, _t_hdrs("A2A-Version: 1.0\r\n", nover));
+    assert_eq(_t_code(nv), AGNOSAI_A2A_INVALID_REQUEST, "and so is one with no jsonrpc");
+
+    assert_eq(_t_code(_t_call(s, "message/send", 0)), AGNOSAI_A2A_METHOD_NOT_FOUND, "0.3's names are gone: -32601");
+    assert_eq(_t_code(agnosai_route_a2a_rpc_a(default_alloc(), s, body)), AGNOSAI_A2A_VERSION_NOT_SUPPORTED,
+      "the form with no request has no version header, so is refused as 0.3");
+    var job = alloc(8);
+    var sr = agnosai_route_stream_a(default_alloc(), &_t_any_stream, job);
+    assert_eq(agnosai_route_is_stream(sr), 1, "a route can answer with a stream");
+    assert_eq(agnosai_route_stream_run(sr, 9), 9, "which runs with its job, on the descriptor it is given");
+    assert_eq(load64(job), 1, "its job the one it was made with");
+    assert_eq(agnosai_route_is_stream(agnosai_route_json_a(default_alloc(), HTTP_OK, 0)), 0, "a body is no stream");
+    assert_eq(_t_code(_t_call(s, "CreateTaskPushNotificationConfig", "{}")), AGNOSAI_A2A_PUSH_NOT_SUPPORTED,
+      "push notifications are not supported");
+    assert(_t_reason_is(_t_call(s, "ListTaskPushNotificationConfigs", "{}"), "PUSH_NOTIFICATION_NOT_SUPPORTED") == 1,
+      "by any of the four methods");
+    assert_eq(_t_code(_t_call(s, "GetExtendedAgentCard", 0)), AGNOSAI_A2A_UNSUPPORTED_OPERATION,
+      "nor an extended card");
+    return 0;
+}
+
+# --- SendMessage, GetTask ------------------------------------------------------
+
+fn _t_send_suite(): i64 {
+    var s = _t_state();
+    var r = _t_call(s, "SendMessage", _t_send_params("check the release notes", ""));
+    assert_eq(_t_code(r), 0, "a message is taken");
+    var t = _t_obj(_t_result(r), "task");
+    assert(t != 0, "and answered with its task");
+    var id = bayan_json_v_str(_t_obj(t, "id"));
+    assert_eq(str_len(id), 36, "whose id is its crew's");
+    assert(agnosai_orchestrator_crew(agnosai_app_state_orchestrator(s), id) != 0, "a crew in the registry");
+    assert(_t_task_state_is(t, "TASK_STATE_COMPLETED") == 1, "run to its end, as SendMessage blocks by default");
+    var ctx = bayan_json_v_str(_t_obj(t, "contextId"));
+    assert_eq(str_len(ctx), 36, "in a context the agent made, the client naming none");
+    var arts = _t_obj(t, "artifacts");
+    assert_eq(bayan_json_v_arr_len(arts), 1, "its one result an artifact");
+    var art = bayan_json_v_arr_get(arts, 0);
+    assert(_t_obj(art, "artifactId") != 0, "named by its crew task's id");
+    var part = bayan_json_v_arr_get(_t_obj(art, "parts"), 0);
+    assert(_t_obj(part, "text") != 0 && _t_str_is(part, "mediaType", "text/plain") == 1, "as plain text");
+    var h = _t_obj(t, "history");
+    assert_eq(bayan_json_v_arr_len(h), 1, "its history the message that started it");
+    var hm = bayan_json_v_arr_get(h, 0);
+    assert(_t_str_is(hm, "messageId", "m-1") == 1 && _t_str_is(hm, "role", "ROLE_USER") == 1, "as the client sent it");
+    assert(str_eq(bayan_json_v_str(_t_obj(hm, "taskId")), id) == 1, "in its task");
+    assert(str_eq(bayan_json_v_str(_t_obj(hm, "contextId")), ctx) == 1, "and its context");
+
+    var g = _t_call(s, "GetTask", str_cstr(str_cat(str_cat(str_from("{\"id\":\""), id), str_from("\"}"))));
+    var gt = _t_result(g);
+    assert(str_eq(bayan_json_v_str(_t_obj(gt, "id")), id) == 1, "GetTask reads it back");
+    assert(_t_task_state_is(gt, "TASK_STATE_COMPLETED") == 1, "as it ended");
+    assert(str_eq(bayan_json_v_str(_t_obj(gt, "contextId")), ctx) == 1, "in its context");
+    var g0 = _t_call(s, "GetTask", str_cstr(str_cat(str_cat(str_from("{\"historyLength\":0,\"id\":\""), id),
+          str_from("\"}"))));
+    assert_eq(_t_obj(_t_result(g0), "history"), 0, "with no history when historyLength is 0");
+    var gu = _t_call(s, "GetTask", str_cstr(str_cat(str_cat(str_from("{\"id\":\""),
+            str_from(str_upper_cstr(str_cstr(id)))), str_from("\"}"))));
+    assert_eq(_t_code(gu), 0, "and by its id in capitals, as every crew route reads one");
+
+    var wcm = str_cat(str_from("{\"message\":{\"messageId\":\"m-2\",\"role\":\"ROLE_USER\",\"contextId\":\"ctx-9\","),
+      str_from("\"parts\":[{\"data\":{\"k\":1}},{\"text\":\"and this\"}]}}"));
+    var wc = _t_result(_t_call(s, "SendMessage", str_cstr(wcm)));
+    assert(_t_str_is(_t_obj(wc, "task"), "contextId", "ctx-9") == 1, "a context the client names is the task's");
+
+    var nh = _t_result(_t_call(s, "SendMessage", _t_send_params("x", "\"configuration\":{\"historyLength\":0},")));
+    assert_eq(_t_obj(_t_obj(nh, "task"), "history"), 0, "historyLength 0 on a message leaves the task's history out");
+    var ok = _t_call(s, "SendMessage", _t_send_params("x",
+        "\"configuration\":{\"acceptedOutputModes\":[\"text/plain\"]},"));
+    assert_eq(_t_code(ok), 0, "a client that reads text is answered");
+    return 0;
+}
+
+# A task that fails says why: with a gateway nothing answers on, its crew's task fails, and the
+# status message carries the crew's reason and the task's own error.
+fn _t_failure_suite(): i64 {
+    var s = _t_state();
+    agnosai_orchestrator_with_llm_url(agnosai_app_state_orchestrator(s), str_from("http://127.0.0.1:1"), str_from(""));
+    var t = _t_obj(_t_result(_t_call(s, "SendMessage", _t_send_params("fail it", ""))), "task");
+    assert(_t_task_state_is(t, "TASK_STATE_FAILED") == 1, "a crew that fails is a failed task");
+    var m = _t_obj(_t_obj(t, "status"), "message");
+    assert(_t_str_is(m, "role", "ROLE_AGENT") == 1, "its status carries the agent's message");
+    var text = bayan_json_v_str(_t_obj(bayan_json_v_arr_get(_t_obj(m, "parts"), 0), "text"));
+    assert(str_starts_with(text, str_from("task_failed: ")) == 1, "saying the crew's reason");
+    assert(str_len(text) > 13, "and what went wrong, the task's own error");
+    assert_eq(_t_obj(t, "artifacts"), 0, "and a failed result is no artifact");
+
+    # The failed result's text, not the first result's: a crew state with a completed one first.
+    var a = default_alloc();
+    var cst = agnosai_crew_state_new_a(a, str_from("00000000-0000-4000-8000-000000000001"), AGNOSAI_CREW_FAILED);
+    agnosai_crew_state_with_reason(cst, str_from("task_failed"));
+    agnosai_crew_state_with_result(cst, agnosai_task_result_new(str_from("t1"), str_from("fine"),
+        AGNOSAI_STATUS_COMPLETED));
+    agnosai_crew_state_with_result(cst, agnosai_task_result_new(str_from("t2"), str_from("boom"),
+        AGNOSAI_STATUS_FAILED));
+    var cm = _t_obj(_agnosai_a2a_status_a(a, cst, str_from("x"), str_from("c")), "message");
+    assert(str_eq_cstr(bayan_json_v_str(_t_obj(bayan_json_v_arr_get(_t_obj(cm, "parts"), 0), "text")),
+        "task_failed: boom") == 1,
+      "the error is the failed result's, not the first result's");
+    return 0;
+}
+
+fn _t_refusal_suite(): i64 {
+    var s = _t_state();
+    assert_eq(_t_code(_t_call(s, "SendMessage", "{}")), AGNOSAI_A2A_INVALID_PARAMS, "a SendMessage needs its message");
+    assert_eq(_t_code(_t_call(s, "SendMessage", 0)), AGNOSAI_A2A_INVALID_PARAMS, "and its params");
+    assert_eq(_t_code(_t_call(s, "SendMessage", "{\"message\":{\"role\":\"ROLE_USER\",\"parts\":[{\"text\":\"x\"}]}}")),
+      AGNOSAI_A2A_INVALID_PARAMS, "a message needs its messageId");
+    assert_eq(_t_code(_t_call(s, "SendMessage",
+          "{\"message\":{\"messageId\":\"m\",\"role\":\"ROLE_AGENT\",\"parts\":[{\"text\":\"x\"}]}}")),
+      AGNOSAI_A2A_INVALID_PARAMS, "and is the user's");
+    assert_eq(_t_code(_t_call(s, "SendMessage",
+          "{\"message\":{\"messageId\":\"m\",\"role\":\"ROLE_USER\",\"parts\":[]}}")),
+      AGNOSAI_A2A_INVALID_PARAMS, "with a part at least");
+    assert_eq(_t_code(_t_call(s, "SendMessage",
+          "{\"message\":{\"messageId\":\"m\",\"role\":\"ROLE_USER\",\"parts\":[{\"text\":\"x\",\"data\":1}]}}")),
+      AGNOSAI_A2A_INVALID_PARAMS, "each carrying one of text, raw, url or data");
+    var raw = _t_call(s, "SendMessage",
+      "{\"message\":{\"messageId\":\"m\",\"role\":\"ROLE_USER\",\"parts\":[{\"raw\":\"aGk=\"}]}}");
+    assert_eq(_t_code(raw), AGNOSAI_A2A_CONTENT_TYPE_NOT_SUPPORTED, "a raw part is content this agent does not read");
+    assert(_t_reason_is(raw, "CONTENT_TYPE_NOT_SUPPORTED") == 1, "saying so");
+    assert_eq(_t_code(_t_call(s, "SendMessage",
+          "{\"message\":{\"messageId\":\"m\",\"role\":\"ROLE_USER\",\"parts\":[{\"url\":\"https://x.test/f\"}]}}")),
+      AGNOSAI_A2A_CONTENT_TYPE_NOT_SUPPORTED, "nor is a URL part");
+    assert_eq(_t_code(_t_call(s, "SendMessage", _t_send_params("x",
+            "\"configuration\":{\"acceptedOutputModes\":[\"image/png\"]},"))),
+      AGNOSAI_A2A_CONTENT_TYPE_NOT_SUPPORTED, "a client that reads no text cannot be answered");
+    assert_eq(_t_code(_t_call(s, "SendMessage",
+          _t_send_params("x", "\"configuration\":{\"taskPushNotificationConfig\":{\"url\":\"https://x.test\"}},"))),
+      AGNOSAI_A2A_PUSH_NOT_SUPPORTED, "nor told by push");
+    assert_eq(_t_code(_t_call(s, "SendMessage", _t_send_params("x", "\"configuration\":{\"historyLength\":-1},"))),
+      AGNOSAI_A2A_INVALID_PARAMS, "a historyLength is not negative");
+    assert_eq(_t_code(_t_call(s, "SendMessage", _t_send_params("x", "\"metadata\":7,"))), AGNOSAI_A2A_INVALID_PARAMS,
+      "and metadata is an object");
+
+    var long = str_builder_new();
+    for (var i = 0; i < 1001; i = i + 1) { str_builder_add_cstr(long, "0123456789"); }
+    assert_eq(_t_code(_t_call(s, "SendMessage", _t_send_params(str_cstr(str_builder_build(long)), ""))),
+      AGNOSAI_A2A_INVALID_PARAMS, "and its text is 10000 bytes at most, as /api/v1/a2a/receive's is");
+
+    var unknown = str_cstr(str_cat(str_from("{\"message\":{\"messageId\":\"m\",\"role\":\"ROLE_USER\","),
+        str_from("\"taskId\":\"00000000-0000-4000-8000-000000000000\",\"parts\":[{\"text\":\"x\"}]}}")));
+    assert_eq(_t_code(_t_call(s, "SendMessage", unknown)), AGNOSAI_A2A_TASK_NOT_FOUND,
+      "a message to no task is -32001");
+    var first = _t_obj(_t_result(_t_call(s, "SendMessage", _t_send_params("first", ""))), "task");
+    var fid = bayan_json_v_str(_t_obj(first, "id"));
+    var again = str_cat(str_cat(str_from("{\"message\":{\"messageId\":\"m\",\"role\":\"ROLE_USER\",\"taskId\":\""),
+        fid),
+      str_from("\",\"parts\":[{\"text\":\"more\"}]}}"));
+    var ag = _t_call(s, "SendMessage", str_cstr(again));
+    assert_eq(_t_code(ag), AGNOSAI_A2A_UNSUPPORTED_OPERATION, "and one to a task that has ended is unsupported");
+    assert(_t_reason_is(ag, "UNSUPPORTED_OPERATION") == 1, "as the spec has it");
+
+    assert_eq(_t_code(_t_call(s, "GetTask", "{\"id\":\"not-a-task\"}")), AGNOSAI_A2A_TASK_NOT_FOUND,
+      "an id no task has");
+    assert(_t_reason_is(_t_call(s, "GetTask", "{\"id\":\"00000000-0000-4000-8000-000000000000\"}"),
+        "TASK_NOT_FOUND") == 1,
+      "is TaskNotFoundError");
+    assert_eq(_t_code(_t_call(s, "GetTask", "{}")), AGNOSAI_A2A_INVALID_PARAMS, "and no id is -32602");
+
+    # A crew the REST API started is no task: it has no context.
+    var ra = arena_allocator_growable(65536);
+    var rbody = str_cat(str_from("{\"name\":\"rest\",\"agents\":[{\"agent_key\":\"t\",\"name\":\"T\","),
+      str_from("\"role\":\"tester\","));
+    rbody = str_cat(rbody,
+      str_from("\"goal\":\"test\"}],\"tasks\":[{\"description\":\"one\"}],\"process\":\"sequential\"}"));
+    var rest = agnosai_route_create_crew_tp_a(ra, s, rbody, 0);
+    assert_eq(agnosai_route_status(rest), HTTP_OK, "a crew posted to the REST API runs");
+    var rid = bayan_json_v_str(bayan_json_v_obj_get_by_cstr(agnosai_route_body(rest), "crew_id"));
+    var rq = str_cstr(str_cat(str_cat(str_from("{\"id\":\""), str_clone(rid)), str_from("\"}")));
+    assert_eq(_t_code(_t_call(s, "GetTask", rq)), AGNOSAI_A2A_TASK_NOT_FOUND, "a REST crew is not an A2A task");
+    assert_eq(_t_code(_t_call(s, "CancelTask", rq)), AGNOSAI_A2A_TASK_NOT_FOUND, "nor can it be cancelled as one");
+    return 0;
+}
+
+# An A2A task whose one task is high-risk, submitted: its answer waits on the gate for a reviewer, so
+# it stays WORKING, holding a slot, until it is decided or cancelled. Its id.
+fn _t_risky_task(s, mid): Str {
+    var o = agnosai_app_state_orchestrator(s);
+    var mb = str_builder_new();
+    str_builder_add_cstr(mb, "{\"messageId\":\"");
+    str_builder_add_cstr(mb, mid);
+    str_builder_add_cstr(mb, "\",\"role\":\"ROLE_USER\",\"parts\":[{\"text\":\"risky\"}]}");
+    var msg = bayan_json_v_parse(str_builder_build(mb));
+    var hold: i64[1];
+    var spec = _agnosai_a2a_crew_a(default_alloc(), s, msg, str_from("risky"), str_from("ctx-r"), 0, &hold);
+    agnosai_task_with_risk(vec_get(agnosai_crew_tasks(spec), 0), AGNOSAI_RISK_HIGH);
+    var id = str_clone(agnosai_crew_id(spec));
+    agnosai_orchestrator_submit_crew(o, spec);
+    agnosai_orchestrator_let_go(o, load64(&hold));
+    var g = agnosai_orchestrator_approval_gate(o);
+    for (var w = 0; w < 2000 && agnosai_approval_gate_pending_count(g) < 1; w = w + 1) { sleep_ms(2); }
+    return id;
+}
+
+fn _t_id_params(id: Str): i64 { return str_cstr(str_cat(str_cat(str_from("{\"id\":\""), id), str_from("\"}"))); }
+
+# `returnImmediately` answers before the crew runs. One crew at a time, and that one waiting on its
+# reviewer: a message's crew can only wait its turn, so the task comes back SUBMITTED, where a
+# blocking SendMessage would wait for the slot.
+fn _t_return_now_suite(): i64 {
+    var o = agnosai_orchestrator_new(agnosai_resource_budget_new(AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT, AGNOSAI_NO_LIMIT,
+        1));
+    agnosai_orchestrator_with_audit(o, 0);
+    agnosai_orchestrator_with_events(o, agnosai_event_bus_new());
+    var s = agnosai_app_state_new(o, agnosai_tool_registry_new(), agnosai_auth_config_new(), load64(o + AGN_OR_EVENTS),
+      0,
+      agnosai_orchestrator_approval_gate(o));
+    var held = _t_risky_task(s, "m-hold");
+    var later = _t_result(_t_call(s, "SendMessage", _t_send_params("x",
+          "\"configuration\":{\"returnImmediately\":true},")));
+    var lt = _t_obj(later, "task");
+    assert(_t_task_state_is(lt, "TASK_STATE_SUBMITTED") == 1,
+      "returnImmediately answers with the task before its crew runs, waiting its turn");
+    _t_call(s, "CancelTask", _t_id_params(held));
+    var lq = _t_id_params(bayan_json_v_str(_t_obj(lt, "id")));
+    var done = 0;
+    for (var w = 0; w < 2000 && done == 0; w = w + 1) {
+        if (_t_task_state_is(_t_result(_t_call(s, "GetTask", lq)), "TASK_STATE_COMPLETED") == 1) { done = 1; }
+        else { sleep_ms(2); }
+    }
+    assert_eq(done, 1, "and the crew runs once the slot is free, to its end, where GetTask reads it");
+    return 0;
+}
+
+# --- CancelTask, on a task that waits ---------------------------------------------
+
+fn _t_cancel_suite(): i64 {
+    var s = _t_state();
+    var o = agnosai_app_state_orchestrator(s);
+    # An A2A task whose one task is high-risk, so its answer waits on the gate for a reviewer.
+    var msg = bayan_json_v_parse(str_cat(str_from("{\"messageId\":\"m-c\",\"role\":\"ROLE_USER\","),
+        str_from("\"parts\":[{\"text\":\"risky\"}]}")));
+    var hold: i64[1];
+    var spec = _agnosai_a2a_crew_a(default_alloc(), s, msg, str_from("risky"), str_from("ctx-c"), 0, &hold);
+    agnosai_task_with_risk(vec_get(agnosai_crew_tasks(spec), 0), AGNOSAI_RISK_HIGH);
+    var id = str_clone(agnosai_crew_id(spec));
+    assert(agnosai_orchestrator_submit_crew(o, spec) != 0, "the crew starts");
+    agnosai_orchestrator_let_go(o, load64(&hold));
+    var g = agnosai_orchestrator_approval_gate(o);
+    for (var w = 0; w < 2000 && agnosai_approval_gate_pending_count(g) < 1; w = w + 1) { sleep_ms(2); }
+    var q = str_cstr(str_cat(str_cat(str_from("{\"id\":\""), id), str_from("\"}")));
+    var waiting = _t_result(_t_call(s, "GetTask", q));
+    assert(_t_task_state_is(waiting, "TASK_STATE_WORKING") == 1,
+      "a task waiting on a reviewer is WORKING: the input it waits for is not the client's");
+    var lw = _t_result(_t_call(s, "ListTasks", "{\"status\":\"TASK_STATE_WORKING\"}"));
+    assert_eq(bayan_json_v_int(_t_obj(lw, "totalSize")), 1, "and ListTasks finds it among the working");
+
+    var c = _t_call(s, "CancelTask", q);
+    assert_eq(_t_code(c), 0, "CancelTask cancels it");
+    assert(_t_task_state_is(_t_result(c), "TASK_STATE_CANCELED") == 1, "and answers the task, canceled");
+    var again = _t_call(s, "CancelTask", q);
+    assert_eq(_t_code(again), AGNOSAI_A2A_TASK_NOT_CANCELABLE, "a task that has ended is not cancelable");
+    assert(_t_reason_is(again, "TASK_NOT_CANCELABLE") == 1, "saying so");
+    for (var w2 = 0; w2 < 2000 && agnosai_approval_gate_pending_count(g) > 0; w2 = w2 + 1) { sleep_ms(2); }
+    assert_eq(agnosai_approval_gate_pending_count(g), 0, "and the cancel released what it waited for");
+    var nres = 0;
+    for (var w3 = 0; w3 < 2000 && nres == 0; w3 = w3 + 1) {
+        var cs = agnosai_orchestrator_crew(o, id);
+        if (cs != 0) { nres = vec_len(agnosai_crew_state_results(cs)); }
+        if (nres == 0) { sleep_ms(2); }
+    }
+    assert(nres > 0, "the cancelled crew's task has its result, not completed");
+    assert_eq(_t_obj(_t_result(_t_call(s, "GetTask", q)), "artifacts"), 0,
+      "and a result its reviewer never approved is no artifact");
+    return 0;
+}
+
+# --- ListTasks ------------------------------------------------------------------
+
+fn _t_list_suite(): i64 {
+    var s = _t_state();
+    for (var i = 0; i < 5; i = i + 1) {
+        var ctx = "\"configuration\":{},";
+        _t_call(s, "SendMessage", _t_send_params("x", ctx));
+    }
+    _t_call(s, "SendMessage",
+      str_cstr(str_cat(str_from("{\"message\":{\"messageId\":\"m-z\",\"role\":\"ROLE_USER\",\"contextId\":\"ctx-z\","),
+          str_from("\"parts\":[{\"text\":\"z\"}]}}"))));
+    var all = _t_result(_t_call(s, "ListTasks", "{}"));
+    assert_eq(bayan_json_v_int(_t_obj(all, "totalSize")), 6, "ListTasks lists every task");
+    assert_eq(bayan_json_v_arr_len(_t_obj(all, "tasks")), 6, "in one page of 50");
+    assert_eq(bayan_json_v_int(_t_obj(all, "pageSize")), 50, "saying its page size");
+    assert(_t_str_is(all, "nextPageToken", "") == 1, "and that it was the last page");
+    assert_eq(_t_obj(bayan_json_v_arr_get(_t_obj(all, "tasks"), 0), "artifacts"), 0, "without artifacts unless asked");
+    var with = _t_result(_t_call(s, "ListTasks", "{\"includeArtifacts\":true}"));
+    assert(_t_obj(bayan_json_v_arr_get(_t_obj(with, "tasks"), 0), "artifacts") != 0, "and with them when asked");
+
+    var p1 = _t_result(_t_call(s, "ListTasks", "{\"pageSize\":4}"));
+    assert_eq(bayan_json_v_arr_len(_t_obj(p1, "tasks")), 4, "a page is its size");
+    assert(_t_str_is(p1, "nextPageToken", "4") == 1, "and names the next");
+    var p2 = _t_result(_t_call(s, "ListTasks", "{\"pageSize\":4,\"pageToken\":\"4\"}"));
+    assert_eq(bayan_json_v_arr_len(_t_obj(p2, "tasks")), 2, "which holds the rest");
+    assert(_t_str_is(p2, "nextPageToken", "") == 1, "and is the last");
+    var a1 = bayan_json_v_str(_t_obj(bayan_json_v_arr_get(_t_obj(p1, "tasks"), 3), "id"));
+    var b1 = bayan_json_v_str(_t_obj(bayan_json_v_arr_get(_t_obj(p2, "tasks"), 0), "id"));
+    assert(agnosai_order_str_cmp(a1, b1) < 0, "in one order, by id, across pages");
+
+    var q1 = _t_result(_t_call(s, "ListTasks", "{\"pageSize\":3}"));
+    assert(_t_str_is(q1, "nextPageToken", "3") == 1, "pages of 3 over 6 tasks");
+    var q2 = _t_result(_t_call(s, "ListTasks", "{\"pageSize\":3,\"pageToken\":\"3\"}"));
+    assert_eq(bayan_json_v_arr_len(_t_obj(q2, "tasks")), 3, "the second holding the last 3");
+    assert(_t_str_is(q2, "nextPageToken", "") == 1, "and naming no next, though it ends where a page would");
+
+    var cz = _t_result(_t_call(s, "ListTasks", "{\"contextId\":\"ctx-z\"}"));
+    assert_eq(bayan_json_v_int(_t_obj(cz, "totalSize")), 1, "a context filters");
+    var done = _t_result(_t_call(s, "ListTasks", "{\"status\":\"TASK_STATE_COMPLETED\"}"));
+    assert_eq(bayan_json_v_int(_t_obj(done, "totalSize")), 6, "and so does a state");
+    var rej = _t_result(_t_call(s, "ListTasks", "{\"status\":\"TASK_STATE_REJECTED\"}"));
+    assert_eq(bayan_json_v_int(_t_obj(rej, "totalSize")), 0, "a rejected task is never registered, so none lists");
+
+    assert_eq(_t_code(_t_call(s, "ListTasks", "{\"pageSize\":0}")), AGNOSAI_A2A_INVALID_PARAMS, "a page is 1 at least");
+    assert_eq(_t_code(_t_call(s, "ListTasks", "{\"pageSize\":101}")), AGNOSAI_A2A_INVALID_PARAMS, "and 100 at most");
+    assert_eq(_t_code(_t_call(s, "ListTasks", "{\"pageToken\":\"abc\"}")), AGNOSAI_A2A_INVALID_PARAMS,
+      "a token this endpoint never issued is refused");
+    assert_eq(_t_code(_t_call(s, "ListTasks", "{\"status\":\"DONE\"}")), AGNOSAI_A2A_INVALID_PARAMS,
+      "as is a state that is none");
+    assert_eq(_t_code(_t_call(s, "ListTasks", "{\"statusTimestampAfter\":\"2026-01-01T00:00:00Z\"}")),
+      AGNOSAI_A2A_UNSUPPORTED_OPERATION, "and a timestamp filter it could not apply");
+    return 0;
+}
+
+# --- the streams ------------------------------------------------------------------
+
+var _T_CAP = _tt_tmp_path("a2a-stream-capture", "");
+
+fn _t_open_capture(): i64 {
+    return file_open(str_cstr(str_from(_T_CAP)), O_WRONLY | O_CREAT | O_TRUNC, 420);
+}
+
+fn _t_captured(): Str {
+    var buf = alloc(65536);
+    var n = file_read_all(str_cstr(str_from(_T_CAP)), buf, 65536);
+    if (n < 0) { n = 0; }
+    return str_from_buf(buf, n);
+}
+
+# The `data:` payloads in a captured stream, each a parsed JSON-RPC response, in order.
+fn _t_frames(cap: Str): i64 {
+    var out = vec_new();
+    var d = str_data(cap);
+    var n = str_len(cap);
+    var i = 0;
+    while (i + 6 <= n) {
+        if (memeq(d + i, "data: ", 6) == 1) {
+            var e = i + 6;
+            while (e < n && load8(d + e) != 10) { e = e + 1; }
+            vec_push(out, bayan_json_v_parse(str_new(d + i + 6, e - i - 6)));
+            i = e;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+# The StreamResponse in frame `f`, and its one member `kind`, or 0.
+fn _t_member(f, kind): i64 { return _t_obj(_t_obj(f, "result"), kind); }
+
+fn _t_stream_to_capture(r): Str {
+    var fd = _t_open_capture();
+    agnosai_route_stream_run(r, fd);
+    file_close(fd);
+    return _t_captured();
+}
+
+var _t_sub_resp = 0;
+var _t_sub_fd = 0;
+var _t_sub_done = 0;
+
+fn _t_sub_thread(arg): i64 {
+    agnosai_route_stream_run(_t_sub_resp, _t_sub_fd);
+    file_close(_t_sub_fd);
+    atomic_store(&_t_sub_done, 1);
+    return 0;
+}
+
+fn _t_stream_suite(): i64 {
+    var s = _t_state();
+    var r = _t_call(s, "SendStreamingMessage", _t_send_params("stream it", ""));
+    assert_eq(agnosai_route_is_stream(r), 1, "SendStreamingMessage answers with a stream");
+    var cap = _t_stream_to_capture(r);
+    assert(str_contains_cstr(cap, "HTTP/1.1 200") == 1, "on a 200");
+    assert(str_contains_cstr(cap, "Content-Type: text/event-stream") == 1, "of text/event-stream");
+    assert(str_contains_cstr(cap, "X-Accel-Buffering: no") == 1, "that no proxy buffers");
+    var fr = _t_frames(cap);
+    assert(vec_len(fr) >= 3, "the task, its artifact and its end");
+    var f0 = vec_get(fr, 0);
+    assert_eq(bayan_json_v_int(_t_obj(f0, "id")), 7, "each event a JSON-RPC response to the request");
+    var t0 = _t_member(f0, "task");
+    assert(t0 != 0, "the first, the task");
+    assert(_t_task_state_is(t0, "TASK_STATE_SUBMITTED") == 1, "as it was before it ran");
+    var id = bayan_json_v_str(_t_obj(t0, "id"));
+    var last = vec_get(fr, vec_len(fr) - 1);
+    var lu = _t_member(last, "statusUpdate");
+    assert(lu != 0, "the last a status update");
+    assert(str_eq_cstr(bayan_json_v_str(_t_obj(_t_obj(lu, "status"), "state")), "TASK_STATE_COMPLETED") == 1,
+      "saying the task completed");
+    assert(str_eq(bayan_json_v_str(_t_obj(lu, "taskId")), id) == 1, "for the task the stream began with");
+    var au = _t_member(vec_get(fr, vec_len(fr) - 2), "artifactUpdate");
+    assert(au != 0, "after its artifact");
+    assert_eq(bayan_json_v_bool(_t_obj(au, "lastChunk")), 1, "in one chunk");
+    assert(_t_obj(_t_obj(au, "artifact"), "parts") != 0, "carrying the result");
+    assert(_t_task_state_is(_t_result(_t_call(s, "GetTask",
+            str_cstr(str_cat(str_cat(str_from("{\"id\":\""), id), str_from("\"}"))))), "TASK_STATE_COMPLETED") == 1,
+      "and GetTask reads the same task back");
+
+    var bad = _t_call(s, "SendStreamingMessage", "{}");
+    assert_eq(agnosai_route_is_stream(bad), 0, "a message it refuses is no stream");
+    assert_eq(_t_code(bad), AGNOSAI_A2A_INVALID_PARAMS, "but the error SendMessage would answer");
+    var ended = _t_call(s, "SubscribeToTask", str_cstr(str_cat(str_cat(str_from("{\"id\":\""), id), str_from("\"}"))));
+    assert_eq(_t_code(ended), AGNOSAI_A2A_UNSUPPORTED_OPERATION, "a task that has ended has no stream to subscribe to");
+    assert_eq(_t_code(_t_call(s, "SubscribeToTask", "{\"id\":\"00000000-0000-4000-8000-000000000000\"}")),
+      AGNOSAI_A2A_TASK_NOT_FOUND, "nor has a task there is not");
+
+    # A task that waits on its reviewer, subscribed to on a thread, then cancelled.
+    var o = agnosai_app_state_orchestrator(s);
+    var msg = bayan_json_v_parse(str_cat(str_from("{\"messageId\":\"m-s\",\"role\":\"ROLE_USER\","),
+        str_from("\"parts\":[{\"text\":\"risky\"}]}")));
+    var hold: i64[1];
+    var spec = _agnosai_a2a_crew_a(default_alloc(), s, msg, str_from("risky"), str_from("ctx-s"), 0, &hold);
+    agnosai_task_with_risk(vec_get(agnosai_crew_tasks(spec), 0), AGNOSAI_RISK_HIGH);
+    var wid = str_clone(agnosai_crew_id(spec));
+    agnosai_orchestrator_submit_crew(o, spec);
+    agnosai_orchestrator_let_go(o, load64(&hold));
+    var g = agnosai_orchestrator_approval_gate(o);
+    for (var w = 0; w < 2000 && agnosai_approval_gate_pending_count(g) < 1; w = w + 1) { sleep_ms(2); }
+    var q = str_cstr(str_cat(str_cat(str_from("{\"id\":\""), wid), str_from("\"}")));
+    _t_sub_resp = _t_call(s, "SubscribeToTask", q);
+    assert_eq(agnosai_route_is_stream(_t_sub_resp), 1, "SubscribeToTask answers a working task with a stream");
+    _t_sub_fd = _t_open_capture();
+    _t_sub_done = 0;
+    assert(thread_create_detached(&_t_sub_thread, 0) != 0, "run on a thread of its own");
+    sleep_ms(150);
+    assert_eq(atomic_load(&_t_sub_done), 0, "which stays open while the task works");
+    _t_call(s, "CancelTask", q);
+    for (var w2 = 0; w2 < 2000 && atomic_load(&_t_sub_done) == 0; w2 = w2 + 1) { sleep_ms(2); }
+    assert_eq(atomic_load(&_t_sub_done), 1, "and ends once the task does");
+    var sf = _t_frames(_t_captured());
+    assert(_t_task_state_is(_t_member(vec_get(sf, 0), "task"), "TASK_STATE_WORKING") == 1,
+      "its first event the task, working");
+    var sl = _t_member(vec_get(sf, vec_len(sf) - 1), "statusUpdate");
+    assert(str_eq_cstr(bayan_json_v_str(_t_obj(_t_obj(sl, "status"), "state")), "TASK_STATE_CANCELED") == 1,
+      "and its last, canceled");
+
+    # Through the router, as the binary dispatches it.
+    var body = _t_rpc("SendStreamingMessage", _t_send_params("via the router", ""));
+    var h = _t_hdrs("A2A-Version: 1.0\r\n", body);
+    var rr = agnosai_route_dispatch_h_a(default_alloc(), s, AGNOSAI_METHOD_POST, str_from("/a2a"),
+      str_from(""), 0, body, 1, 0, h);
+    assert_eq(agnosai_route_is_stream(rr), 1, "the router hands the stream back for the serve layer to run");
+    _t_stream_to_capture(rr);
+    return 0;
+}
+
+# --- JCS, RFC 8785 ---------------------------------------------------------------
+
+fn _t_jcs(json): i64 {
+    var v = bayan_json_v_parse(str_from(json));
+    var c = agnosai_jcs_a(default_alloc(), v);
+    if (c == 0) { return 0; }
+    return str_cstr(c);
+}
+
+fn _t_jcs_suite(): i64 {
+    assert(streq(_t_jcs("{ \"b\" : 1, \"a\" : [true, false, null, \"x\"] }"),
+        "{\"a\":[true,false,null,\"x\"],\"b\":1}") == 1,
+      "members sorted, no whitespace");
+    assert(streq(_t_jcs("{\"z\":{\"y\":2,\"x\":1},\"aa\":0,\"a\":0}"),
+        "{\"a\":0,\"aa\":0,\"z\":{\"x\":1,\"y\":2}}") == 1,
+      "at every depth, a prefix first");
+    assert(streq(_t_jcs("[\"q\\\"b\\\\s\\n\\t\\r\\b\\f\\u0001\\u001f\"]"),
+        "[\"q\\\"b\\\\s\\n\\t\\r\\b\\f\\u0001\\u001f\"]") == 1,
+      "a string as JSON.stringify writes it: two-letter escapes, and \\u00xx for the other controls");
+    assert(streq(_t_jcs("[\"\\u007f\\u00e9\\u20ac\"]"), "[\"\x7f\xc3\xa9\xe2\x82\xac\"]") == 1,
+      "and everything else as it is, in UTF-8");
+    assert(streq(_t_jcs("[-7,0,12345678901]"), "[-7,0,12345678901]") == 1, "an integer in decimal");
+    assert_eq(_t_jcs("[1.5]"), 0, "a float is refused, as its shortest form is not written here");
+    # bayan's parser refuses a name twice, so the value is built: `obj_set` appends.
+    var dup = bayan_json_v_obj_new();
+    bayan_json_v_obj_set(dup, str_from("a"), bayan_json_v_int_new(1));
+    bayan_json_v_obj_set(dup, str_from("a"), bayan_json_v_int_new(2));
+    assert_eq(agnosai_jcs_a(default_alloc(), dup), 0, "and so is a name twice");
+    assert(agnosai_jcs_cmp(str_from("a"), str_from("b")) < 0 && agnosai_jcs_cmp(str_from("b"), str_from("a")) > 0,
+      "names compare by their units");
+    assert(agnosai_jcs_cmp(str_from("ab"), str_from("a")) > 0 && agnosai_jcs_cmp(str_from("ab"), str_from("ab")) == 0,
+      "a prefix first, and a name equal to itself");
+    assert(agnosai_jcs_cmp(str_from("\xef\xbd\xa1"), str_from("\xf0\x9f\x98\x80")) > 0,
+      "and U+FF61 after U+1F600, whose high surrogate 0xD83D is the smaller unit");
+    # RFC 8785 §3.2.3: names sort by UTF-16 code units, so U+1F600, a surrogate pair from 0xD83D,
+    # sorts before U+FF61, though its code point is the larger.
+    assert(streq(_t_jcs("{\"\\uff61\":1,\"\\ud83d\\ude00\":2,\"a\":3}"),
+        "{\"a\":3,\"\xf0\x9f\x98\x80\":2,\"\xef\xbd\xa1\":1}") == 1,
+      "by UTF-16 code units, not code points");
+    return 0;
+}
+
+# --- the signed card ----------------------------------------------------------------
+
+fn _t_ec_pem(): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "-----BEGIN PRIVATE KEY-----\n");
+    str_builder_add_cstr(sb, "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgMuwBo/ntg8yaLVNb\n");
+    str_builder_add_cstr(sb, "SRZGRaXRHQkUtmnEnwJLvHpS/62hRANCAATJaE1VtpDhETYbFR9JzPNZtsrvkxdv\n");
+    str_builder_add_cstr(sb, "2ZK1HWKX2EyUGPxCtGdxbysBARlHsrZRKH0AwJt+q2wSyA+4WH8YBg7r\n");
+    str_builder_add_cstr(sb, "-----END PRIVATE KEY-----\n");
+    return str_builder_build(sb);
+}
+
+fn _t_rsa_pem(): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "-----BEGIN PRIVATE KEY-----\n");
+    str_builder_add_cstr(sb, "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQClPQeMy96YnvC5\n");
+    str_builder_add_cstr(sb, "GxoNGG9i+OeQpkvGxJV+9tfZUQlVARs+LGjiwLGOtjW0sA8rdVvRsD9eS/YB4KIG\n");
+    str_builder_add_cstr(sb, "rNGG1A6r1KRNdxHQrGbOHmsmUFvq8YxS4OTP/jY/BzUsD6OhcZNdo5LtaGcx3mlC\n");
+    str_builder_add_cstr(sb, "ExwLKuo3HB23pZnfJt1OrXoU8hXqPhIdNa2oD17vK3J9kNW/mzIlIDpqk0ONX0ly\n");
+    str_builder_add_cstr(sb, "gUdstZsL6XEcTvmizTw1KJ2SvJ0FkG5M8cx5nkdbcoG3GdF7k28tyo8VndbGaUJT\n");
+    str_builder_add_cstr(sb, "uQqlwcbrF9zsib+fVrgLIhrSVMzFyXNTnPKq6vM+cQ3vX6zZ4EKL2iKjn2qaaE2a\n");
+    str_builder_add_cstr(sb, "efQmLLS/AgMBAAECggEAUYmdlaUuaQqZSAZvIwIpSOIBRrhA0UtFZ/r/xV1/KOKc\n");
+    str_builder_add_cstr(sb, "YmBAu5ARrhYMx2ZPfgbx8bWyd2IteXyzB281D37J5JHQJ+e3M003h8Or5SKnUPaz\n");
+    str_builder_add_cstr(sb, "41vVnStY8l4op17qRGrKqNzkTmGD9rBFKZVLc9lP7TTjFzHRDbRcZYwmH3rcRJNj\n");
+    str_builder_add_cstr(sb, "beUzn1Hsd4dcTWnj1Q8bjNYkHUTligFk4bS0k7C78LJeQIR69A/lrDlNzIfacjlu\n");
+    str_builder_add_cstr(sb, "zD8U/+oAAFi8JvK9V/Ab2/XrSjtwakAeRezsD/FsWS6rnNrE+YpshipyljMa+/dv\n");
+    str_builder_add_cstr(sb, "OBSCQAVb9a0ak3kIyxCLYGMxJ1//h5cEKCOoOSTbsQKBgQDlAqvgh73DGE1NQAa/\n");
+    str_builder_add_cstr(sb, "l/fKRYh87LfgVVuqAeOKuZEncIokPGw78Cglka7bfHT6ysQN2Rz7WghKjwiZMy+0\n");
+    str_builder_add_cstr(sb, "kdQO50w44+d717ywr5YOyEqR2UKUqG8za91HjSTt5w2auRfPtZ9+RtyBYbPgp1U5\n");
+    str_builder_add_cstr(sb, "8f7A5n2hpEa8JAGrZU0b078psQKBgQC4tlUVnO+xembyi0bw4fdJdeSCltoKFtWu\n");
+    str_builder_add_cstr(sb, "4Ba8Mahb7Ty9R2fTRsxanczODauBnXXn7wRxEAPcypJEoOlm8z5CcXy1PZeq6AU6\n");
+    str_builder_add_cstr(sb, "ZPooNzSnsVc4qtWxCSoAbqv0hCqhDSVQfKt0OG0rAHOaenDzhDo5w917sXSgM3uF\n");
+    str_builder_add_cstr(sb, "pDwBWSrxbwKBgQCcjuX3mnS1IjD+ha3XX0nL4xs65A2UdGY05BOta8z63Gnj+da4\n");
+    str_builder_add_cstr(sb, "ZybbACw86mmCZgn/uZShlNwkNIJZUW/kjukcwy0Nm2hN9p+NXoxEUNMBwDhPLpLO\n");
+    str_builder_add_cstr(sb, "4Yel+azsYs+fHbhUjEKb7k+it6tkAqE1+uUA9NGgJpEg37CwfpFnW6vNEQKBgHgi\n");
+    str_builder_add_cstr(sb, "HjRwXXSQp2QYMYt5a9vbUUOd2TG2qEOUezTrFxSyt05joqNG6KIG/60ENweV4Zl3\n");
+    str_builder_add_cstr(sb, "Wuwt/lUbawY3oZXTniqYpQM7i+kb/kp8YjbFsPlf3dp9QX5i925QjIX7b75PTnWK\n");
+    str_builder_add_cstr(sb, "n/h2uom9QXK3L78xwKzRNru8Lp4C3dONfXljBQsBAoGAf/agTTpgdHncliBTVQ7h\n");
+    str_builder_add_cstr(sb, "92K10pyDIS0VaTtR5GkkyB0oNlX1+6ju0bxIUk7V6SAm6pAkS2Ido82MWcRUH+o/\n");
+    str_builder_add_cstr(sb, "S3HU4TCb0ig1L77/Y517c/8eLYc2QIyxlYfy/6L6mpJTNVCVQKwHY92ZK8wJWTrv\n");
+    str_builder_add_cstr(sb, "qY19Ul+rP8KMFtlGW47LO9Q=\n");
+    str_builder_add_cstr(sb, "-----END PRIVATE KEY-----\n");
+    return str_builder_build(sb);
+}
+
+fn _t_unhex(h: Str): i64 {
+    var n = str_len(h) / 2;
+    var out = alloc(n);
+    for (var i = 0; i < n; i = i + 1) {
+        var hi = load8(str_data(h) + i * 2);
+        var lo = load8(str_data(h) + i * 2 + 1);
+        if (hi >= 97) { hi = hi - 87; } else { hi = hi - 48; }
+        if (lo >= 97) { lo = lo - 87; } else { lo = lo - 48; }
+        store8(out + i, hi * 16 + lo);
+    }
+    return out;
+}
+
+# The P-256 test key's public half, Qx || Qy, and the RSA test key's modulus. Test keys only: they
+# sign nothing outside this suite.
+fn _t_ec_pub(): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb,
+      "c9684d55b690e111361b151f49ccf359b6caef93176fd992b51d6297d84c9418fc42b467716f2b01011947b2b651287d");
+    str_builder_add_cstr(sb, "00c09b7eab6c12c80fb8587f18060eeb");
+    return _t_unhex(str_builder_build(sb));
+}
+
+fn _t_rsa_n(): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb,
+      "a53d078ccbde989ef0b91b1a0d186f62f8e790a64bc6c4957ef6d7d9510955011b3e2c68e2c0b18eb635b4b00f2b755b");
+    str_builder_add_cstr(sb,
+      "d1b03f5e4bf601e0a206acd186d40eabd4a44d7711d0ac66ce1e6b26505beaf18c52e0e4cffe363f07352c0fa3a17193");
+    str_builder_add_cstr(sb,
+      "5da392ed686731de6942131c0b2aea371c1db7a599df26dd4ead7a14f215ea3e121d35ada80f5eef2b727d90d5bf9b32");
+    str_builder_add_cstr(sb,
+      "25203a6a93438d5f497281476cb59b0be9711c4ef9a2cd3c35289d92bc9d05906e4cf1cc799e475b7281b719d17b936f");
+    str_builder_add_cstr(sb,
+      "2dca8f159dd6c6694253b90aa5c1c6eb17dcec89bf9f56b80b221ad254ccc5c973539cf2aaeaf33e710def5facd9e042");
+    str_builder_add_cstr(sb, "8bda22a39f6a9a684d9a79f4262cb4bf");
+    return _t_unhex(str_builder_build(sb));
+}
+
+fn _t_card_canon(): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb,
+      "{\"capabilities\":{\"extendedAgentCard\":false,\"pushNotifications\":false,\"streaming\":true},\"de");
+    str_builder_add_cstr(sb,
+      "faultInputModes\":[\"text/plain\",\"application/json\"],\"defaultOutputModes\":[\"text/plain\"],\"de");
+    str_builder_add_cstr(sb,
+      "scription\":\"Runs a crew of AI agents for a task: provider-agnostic orchestration, with san");
+    str_builder_add_cstr(sb,
+      "dboxed tools.\",\"name\":\"agnosai\",\"securityRequirements\":[{\"schemes\":{\"bearer\":{\"list\":[]}}}");
+    str_builder_add_cstr(sb,
+      "],\"securitySchemes\":{\"bearer\":{\"httpAuthSecurityScheme\":{\"scheme\":\"Bearer\"}}},\"skills\":[{\"");
+    str_builder_add_cstr(sb,
+      "description\":\"Takes a task in plain text, runs a crew of agents for it, and answers with e");
+    str_builder_add_cstr(sb,
+      "ach result as an artifact.\",\"id\":\"run-crew\",\"name\":\"Run a crew\",\"tags\":[\"orchestration\",\"c");
+    str_builder_add_cstr(sb,
+      "rew\",\"agents\"]}],\"supportedInterfaces\":[{\"protocolBinding\":\"JSONRPC\",\"protocolVersion\":\"1.");
+    str_builder_add_cstr(sb, "0\",\"url\":\"https://agents.example.com/a2a\"}],\"version\":\"");
+    str_builder_add_cstr(sb, AGNOSAI_VERSION);
+    str_builder_add_cstr(sb, "\"}");
+    return str_builder_build(sb);
+}
+
+# base64url, RFC 4648 §10's vectors, unpadded.
+fn _t_b64u_is(text, want): i64 {
+    return streq(str_cstr(_agnosai_a2a_b64url_a(default_alloc(), text, strlen(text))), want);
+}
+
+fn _t_sign_suite(): i64 {
+    var a = default_alloc();
+    assert(_t_b64u_is("f", "Zg") == 1 && _t_b64u_is("fo", "Zm8") == 1 && _t_b64u_is("foo", "Zm9v") == 1,
+      "base64url is RFC 4648's");
+    assert(_t_b64u_is("foob", "Zm9vYg") == 1 && _t_b64u_is("fooba", "Zm9vYmE") == 1 && _t_b64u_is("foobar",
+        "Zm9vYmFy") == 1,
+      "unpadded, every last group");
+    assert(_t_b64u_is("\xfb\xff", "-_8") == 1, "in the URL alphabet");
+    var dl: i64[1];
+    var db = _agnosai_a2a_b64url_decode_a(a, str_from("Zm9vYmE"), &dl);
+    assert(load64(&dl) == 5 && memeq(db, "fooba", 5) == 1, "and decodes back");
+    # The canonical form of a card, checked against Python's `json.dumps(sort_keys=True,
+    # separators=(",", ":"))`, which is RFC 8785's for an ASCII card with no floats.
+    var kc = agnosai_a2a_card_a(a, agnosai_auth_config_with_secret(str_from("k")),
+      str_from("https://agents.example.com"));
+    assert(str_eq(agnosai_jcs_a(a, kc), _t_card_canon()) == 1, "a card's canonical form is RFC 8785's");
+    var es = agnosai_a2a_signer_from_pem(_t_ec_pem(), str_from("test-key"), 0);
+    assert(es != 0, "a P-256 key in PKCS #8 is read");
+    assert(streq(agnosai_a2a_signer_alg(es), "ES256") == 1, "and signs ES256");
+    var card = agnosai_a2a_card_a(a, 0, str_from("https://agents.example.com"));
+    var sig = agnosai_a2a_card_sign_a(a, card, es);
+    assert(sig != 0, "a card is signed");
+    var hl: i64[1];
+    var hb = _agnosai_a2a_b64url_decode_a(a, bayan_json_v_str(_t_obj(sig, "protected")), &hl);
+    assert(streq(str_cstr(str_new(hb, load64(&hl))), "{\"alg\":\"ES256\",\"kid\":\"test-key\",\"typ\":\"JOSE\"}") == 1,
+      "its protected header naming the algorithm, the key and the type, canonically");
+    var sl: i64[1];
+    _agnosai_a2a_b64url_decode_a(a, bayan_json_v_str(_t_obj(sig, "signature")), &sl);
+    assert_eq(load64(&sl), 64, "an ES256 signature is r || s, 64 bytes");
+    var sigs = bayan_json_v_arr_new_a(a);
+    bayan_json_v_arr_push_a(a, sigs, sig);
+    bayan_json_v_obj_set_a(a, card, str_from("signatures"), sigs);
+    assert_eq(agnosai_a2a_card_verify_es256_a(a, card, _t_ec_pub()), 1, "and the key's public half verifies it");
+    # Over what the spec says it signs, built here: the protected header, `.`, and the card's canonical
+    # form in base64url, `signatures` left out.
+    var unsigned_card = agnosai_a2a_card_a(a, 0, str_from("https://agents.example.com"));
+    var canon = agnosai_jcs_a(a, unsigned_card);
+    var input = str_cat(str_cat(bayan_json_v_str(_t_obj(sig, "protected")), str_from(".")),
+      _agnosai_a2a_b64url_a(a, str_data(canon), str_len(canon)));
+    var raw_len: i64[1];
+    var raw_sig = _agnosai_a2a_b64url_decode_a(a, bayan_json_v_str(_t_obj(sig, "signature")), &raw_len);
+    assert_eq(ecdsa_p256_verify(_t_ec_pub(), str_data(input), str_len(input), raw_sig), 1,
+      "the signature is sigil's ES256 over the spec's signing input");
+    bayan_json_v_obj_set_a(a, card, str_from("description"), bayan_json_v_str_new_a(a, str_from("someone else")));
+    assert_eq(agnosai_a2a_card_verify_es256_a(a, card, _t_ec_pub()), 0,
+      "a card changed after it was signed does not verify");
+    var other = alloc(64);
+    memcpy(other, _t_ec_pub(), 64);
+    store8(other + 63, load8(other + 63) ^ 1);
+    var card2 = agnosai_a2a_card_a(a, 0, str_from("https://agents.example.com"));
+    var sigs2 = bayan_json_v_arr_new_a(a);
+    bayan_json_v_arr_push_a(a, sigs2, agnosai_a2a_card_sign_a(a, card2, es));
+    bayan_json_v_obj_set_a(a, card2, str_from("signatures"), sigs2);
+    assert_eq(agnosai_a2a_card_verify_es256_a(a, card2, other), 0, "nor does one under another key");
+    assert_eq(agnosai_a2a_card_verify_rs256_a(a, card2, _t_rsa_n(), 256, "\x01\x00\x01", 3), 0,
+      "nor as an RS256 signature, which it is not");
+
+    var rs = agnosai_a2a_signer_from_pem(_t_rsa_pem(), str_from("rsa-key"),
+      str_from("https://agents.example.com/jwks.json"));
+    assert(rs != 0 && streq(agnosai_a2a_signer_alg(rs), "RS256") == 1, "an RSA key signs RS256");
+    var card3 = agnosai_a2a_card_a(a, 0, str_from("https://agents.example.com"));
+    var rsig = agnosai_a2a_card_sign_a(a, card3, rs);
+    var rh: i64[1];
+    var rhb = _agnosai_a2a_b64url_decode_a(a, bayan_json_v_str(_t_obj(rsig, "protected")), &rh);
+    assert(str_contains_cstr(str_new(rhb, load64(&rh)), "\"jku\":\"https://agents.example.com/jwks.json\"") == 1,
+      "naming where its keys are published, when it is told");
+    var sigs3 = bayan_json_v_arr_new_a(a);
+    bayan_json_v_arr_push_a(a, sigs3, rsig);
+    bayan_json_v_obj_set_a(a, card3, str_from("signatures"), sigs3);
+    assert_eq(agnosai_a2a_card_verify_rs256_a(a, card3, _t_rsa_n(), 256, "\x01\x00\x01", 3), 1,
+      "and the RSA key's public half verifies it");
+    assert_eq(agnosai_a2a_signer_from_pem(str_from("-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n"),
+        str_from("k"), 0), 0, "a PEM with no private key is no signer");
+
+    # Sealed: built once, for the public URL, signed, and served as it is.
+    var cfg = agnosai_a2a_config_with_public_url(agnosai_a2a_config_new(), str_from("https://agents.example.com"));
+    assert_eq(agnosai_a2a_config_seal(agnosai_a2a_config_new(), 0), 0 - 1, "a card is sealed only for a public URL");
+    agnosai_a2a_config_with_signer(cfg, es);
+    assert_eq(agnosai_a2a_config_seal(cfg, 0), 0, "and then is");
+    var s = _t_state();
+    agnosai_app_state_with_a2a(s, cfg);
+    var served = agnosai_route_body(agnosai_route_a2a_card_a(a, s, _t_hdrs("", str_from(""))));
+    assert_eq(bayan_json_v_arr_len(_t_obj(served, "signatures")), 1, "the card served carries its signature");
+    assert_eq(agnosai_a2a_card_verify_es256_a(a, served, _t_ec_pub()), 1, "which verifies");
+    var text = bayan_json_v_build_a(a, served);
+    var reparsed = bayan_json_v_parse(text);
+    assert_eq(agnosai_a2a_card_verify_es256_a(a, reparsed, _t_ec_pub()), 1,
+      "and still does once the card has been through the wire, as a client reads it");
+    var ra = arena_allocator_growable(4096);
+    agnosai_route_a2a_card_a(ra, s, 0);
+    reset_via(ra);
+    var before = alloc_used();
+    for (var i = 0; i < 16; i = i + 1) {
+        agnosai_route_a2a_card_a(ra, s, 0);
+        reset_via(ra);
+    }
+    assert_eq(alloc_used() - before, 0, "a sealed card is answered as it is, built for no request");
+    return 0;
+}
+
+# --- what a task costs the global heap ------------------------------------------------
+
+# A message sent and its task read, in a request arena reset after, with the registry at a cap of 8
+# so every message past it evicts a crew, which goes back (ADR 037).
+fn _t_heap_suite(): i64 {
+    var cap = AGNOSAI_MAX_RETAINED_CREWS;
+    var low = AGNOSAI_CREWS_LOW_WATER;
+    AGNOSAI_MAX_RETAINED_CREWS = 8;
+    AGNOSAI_CREWS_LOW_WATER = 4;
+    var s = _t_state();
+    var ra = arena_allocator_growable(65536);
+    var body = _t_rpc("SendMessage", _t_send_params("run it", ""));
+    var lbody = _t_rpc("ListTasks", "{\"includeArtifacts\":true}");
+    var text = str_cat(str_from("POST /a2a HTTP/1.1\r\nA2A-Version: 1.0\r\n\r\n"), body);
+    var ltext = str_cat(str_from("POST /a2a HTTP/1.1\r\nA2A-Version: 1.0\r\n\r\n"), lbody);
+    for (var w = 0; w < 1100; w = w + 1) {
+        agnosai_route_a2a_rpc_h_a(ra, s, body, 0, agnosai_http_headers_of_a(ra, text));
+        reset_via(ra);
+    }
+    var before = alloc_used();
+    var bad = 0;
+    for (var i = 0; i < 200; i = i + 1) {
+        var r = agnosai_route_a2a_rpc_h_a(ra, s, body, 0, agnosai_http_headers_of_a(ra, text));
+        if (_t_code(r) != 0) { bad = bad + 1; }
+        agnosai_route_a2a_rpc_h_a(ra, s, lbody, 0, agnosai_http_headers_of_a(ra, ltext));
+        reset_via(ra);
+    }
+    assert_eq(bad, 0, "every message is taken");
+    assert_eq(alloc_used() - before, 0, "and a task, sent and listed, leaves nothing once its crew is evicted");
+
+    # And a stream: its frames in a scratch of the pool's, reset after each, its crew given back.
+    var sbody = _t_rpc("SendStreamingMessage", _t_send_params("stream it", ""));
+    var stext = str_cat(str_from("POST /a2a HTTP/1.1\r\nA2A-Version: 1.0\r\n\r\n"), sbody);
+    var null_fd = file_open("/dev/null", O_WRONLY, 0);
+    for (var ws = 0; ws < 24; ws = ws + 1) {
+        agnosai_route_stream_run(agnosai_route_a2a_rpc_h_a(ra, s, sbody, 0, agnosai_http_headers_of_a(ra, stext)),
+          null_fd);
+        reset_via(ra);
+    }
+    var sbefore = alloc_used();
+    for (var j = 0; j < 40; j = j + 1) {
+        agnosai_route_stream_run(agnosai_route_a2a_rpc_h_a(ra, s, sbody, 0, agnosai_http_headers_of_a(ra, stext)),
+          null_fd);
+        reset_via(ra);
+    }
+    assert_eq(alloc_used() - sbefore, 0, "a streamed task leaves nothing either");
+    file_close(null_fd);
+    AGNOSAI_MAX_RETAINED_CREWS = cap;
+    AGNOSAI_CREWS_LOW_WATER = low;
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+    _t_card_suite();
+    _t_version_suite();
+    _t_send_suite();
+    _t_return_now_suite();
+    _t_refusal_suite();
+    _t_failure_suite();
+    _t_cancel_suite();
+    _t_list_suite();
+    _t_stream_suite();
+    _t_jcs_suite();
+    _t_sign_suite();
+    _t_heap_suite();
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+sys_exit_group(f);

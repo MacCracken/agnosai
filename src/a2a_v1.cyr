@@ -1,0 +1,1450 @@
+# =========================================================================
+# a2a_v1 — the A2A protocol v1.0, over its JSON-RPC binding (2.6.0, ADR 040).
+#
+# Port-local: no `rust-old/` counterpart. The Rust line's A2A is
+# `POST /api/v1/a2a/receive`, a delegation shape of its own that predates the
+# protocol (`server/routes/a2a.cyr`), and it stays as it is. This is the
+# protocol: an Agent Card at `/.well-known/agent-card.json` that says what this
+# agent is and where it answers, and a JSON-RPC endpoint, `POST /a2a`, whose
+# tasks are crews.
+#
+# ## A task is a crew
+#
+# `SendMessage` reads the message's text and data parts into a one-task crew,
+# as `/api/v1/a2a/receive` does, in an arena of the orchestrator's (ADR 037),
+# and the A2A task's id is the crew's. The crew keeps what the protocol asks
+# of a task and a crew does not have: its `contextId`, and the message that
+# started it, for its history, in its metadata. So `GetTask`, `ListTasks` and
+# `CancelTask` read the registry, a task lives as long as its crew does, and a
+# crew a consumer or the REST API started is not a task: it has no
+# `contextId`. Each route that reads a crew holds it and copies what it
+# renders, as ADR 037 says.
+#
+# | crew | task |
+# |---|---|
+# | pending | `TASK_STATE_SUBMITTED` |
+# | running, or awaiting a reviewer | `TASK_STATE_WORKING` |
+# | completed | `TASK_STATE_COMPLETED` |
+# | failed | `TASK_STATE_FAILED` |
+# | cancelled | `TASK_STATE_CANCELED` |
+# | refused at admission (ADR 033) | `TASK_STATE_REJECTED`, and never registered |
+#
+# A crew awaiting a reviewer is `WORKING`, not `INPUT_REQUIRED`: the input it
+# waits for is a reviewer's, on `POST /api/v1/approvals`, not the client's.
+#
+# ## What this agent does not do
+#
+# Push notifications and the extended card: the card says `false`, and their
+# methods answer `PushNotificationNotSupportedError` and
+# `UnsupportedOperationError`. A message to a task already started is
+# `UnsupportedOperationError`, as a crew takes no further input. Tasks carry
+# no status timestamp, as crews record none, so `ListTasks` refuses a
+# `statusTimestampAfter` it could not apply rather than ignore it.
+# =========================================================================
+
+include "src/http_headers.cyr"
+include "src/arena_pool.cyr"
+include "src/jcs.cyr"
+
+# The protocol version this endpoint speaks, as `A2A-Version` and the card spell it: Major.Minor.
+var AGNOSAI_A2A_PROTOCOL_VERSION = "1.0";
+
+# Where the JSON-RPC binding answers, after the base URL, and where the card is.
+var AGNOSAI_A2A_RPC_PATH = "/a2a";
+var AGNOSAI_A2A_CARD_PATH = "/.well-known/agent-card.json";
+
+# A2A's error codes, the ones this endpoint sends (spec §5.4).
+var AGNOSAI_A2A_TASK_NOT_FOUND = 0 - 32001;
+var AGNOSAI_A2A_TASK_NOT_CANCELABLE = 0 - 32002;
+var AGNOSAI_A2A_PUSH_NOT_SUPPORTED = 0 - 32003;
+var AGNOSAI_A2A_UNSUPPORTED_OPERATION = 0 - 32004;
+var AGNOSAI_A2A_CONTENT_TYPE_NOT_SUPPORTED = 0 - 32005;
+var AGNOSAI_A2A_VERSION_NOT_SUPPORTED = 0 - 32009;
+# And JSON-RPC's own.
+var AGNOSAI_A2A_PARSE_ERROR = 0 - 32700;
+var AGNOSAI_A2A_INVALID_REQUEST = 0 - 32600;
+var AGNOSAI_A2A_METHOD_NOT_FOUND = 0 - 32601;
+var AGNOSAI_A2A_INVALID_PARAMS = 0 - 32602;
+
+# `ListTasks`' page: 50 unless asked, 100 at most.
+var AGNOSAI_A2A_PAGE_DEFAULT = 50;
+var AGNOSAI_A2A_PAGE_MAX = 100;
+
+# The crew metadata a task keeps: its context, and the message that started it.
+var AGNOSAI_A2A_MD_CONTEXT = "a2a.contextId";
+var AGNOSAI_A2A_MD_MESSAGE = "a2a.message";
+
+# The wire's vocabulary, minted once (the rule in `core/json.cyr`).
+var AGN_JK_A2A_TASK = str_from("task");
+var AGN_JK_A2A_CONTEXT_ID = str_from("contextId");
+var AGN_JK_A2A_TASK_ID = str_from("taskId");
+var AGN_JK_A2A_MESSAGE_ID = str_from("messageId");
+var AGN_JK_A2A_ROLE = str_from("role");
+var AGN_JK_A2A_PARTS = str_from("parts");
+var AGN_JK_A2A_STATE = str_from("state");
+var AGN_JK_A2A_ARTIFACTS = str_from("artifacts");
+var AGN_JK_A2A_ARTIFACT_ID = str_from("artifactId");
+var AGN_JK_A2A_HISTORY = str_from("history");
+var AGN_JK_A2A_MEDIA_TYPE = str_from("mediaType");
+var AGN_JV_A2A_TEXT_PLAIN = str_from("text/plain");
+var AGN_JV_A2A_ROLE_AGENT = str_from("ROLE_AGENT");
+var AGN_JV_A2A_RESULT = str_from("result");
+
+# --- configuration --------------------------------------------------------
+
+enum AgnosaiA2AConfigOff {
+    AGN_A2C_PUBLIC_URL = 0;
+    AGN_A2C_SIGNER = 8;
+    AGN_A2C_CARD = 16;   # the card, built once for the public URL and signed when there is a signer
+    AGN_A2C_SIZE = 24;
+}
+
+# The endpoint's settings: none, so the card names the host a request came to, and is not signed.
+fn agnosai_a2a_config_new(): i64 {
+    var c = alloc(AGN_A2C_SIZE);
+    store64(c + AGN_A2C_PUBLIC_URL, 0);
+    store64(c + AGN_A2C_SIGNER, 0);
+    store64(c + AGN_A2C_CARD, 0);
+    return c;
+}
+
+# The URL clients reach this server at, `https://host[:port]` with no trailing `/`, which the card
+# names its endpoint under (`AGNOSAI_PUBLIC_URL`). Without one the card names the request's `Host`,
+# over `http`, which is right only where nothing stands in between.
+fn agnosai_a2a_config_with_public_url(c, url: Str): i64 {
+    var n = str_len(url);
+    while (n > 0 && load8(str_data(url) + n - 1) == 47) { n = n - 1; }
+    store64(c + AGN_A2C_PUBLIC_URL, str_new(str_data(url), n));
+    return c;
+}
+
+# The configured public URL, or 0.
+fn agnosai_a2a_config_public_url(c): i64 {
+    if (c == 0) { return 0; }
+    return load64(c + AGN_A2C_PUBLIC_URL);
+}
+
+# --- the signed card (A2A §8.4) ---------------------------------------------
+#
+# A card MAY carry signatures, each a JWS in its JSON serialization (RFC 7515) over the card's
+# canonical form, RFC 8785, with `signatures` itself left out: `protected` the base64url of the
+# protected header, `signature` the base64url of the signature over `protected` `.` and the
+# base64url of the canonical card. The header names its algorithm, `kid`, `typ` `JOSE`, and `jku`
+# when the operator publishes its keys there. ES256 is P-256 with SHA-256, its signature `r || s`;
+# RS256 is RSASSA-PKCS1-v1.5 with SHA-256; both are sigil's.
+#
+# **The card is signed once**, at start-up, over the public URL it names
+# (`agnosai_a2a_config_seal`): a card that named each request's host would need a signature a
+# request, and one per host a client could send. So a signer needs a public URL.
+
+enum AgnosaiA2ASignerOff {
+    AGN_A2G_ALG = 0;
+    AGN_A2G_KEY = 8;
+    AGN_A2G_KID = 16;
+    AGN_A2G_JKU = 24;
+    AGN_A2G_SIZE = 32;
+}
+
+var AGNOSAI_A2A_ALG_ES256 = 1;
+var AGNOSAI_A2A_ALG_RS256 = 2;
+
+# The DER body of the PEM block labelled `label` in `pem`, into `der`, `max` bytes at most: its
+# length, or -1 when `pem` has no such block.
+fn _agnosai_a2a_pem_der(pem: Str, label, der, max): i64 {
+    _pem_init();
+    var b = str_builder_new();
+    str_builder_add_cstr(b, "-----BEGIN ");
+    str_builder_add_cstr(b, label);
+    str_builder_add_cstr(b, "-----");
+    var begin = str_builder_build(b);
+    var e = str_builder_new();
+    str_builder_add_cstr(e, "-----END ");
+    str_builder_add_cstr(e, label);
+    str_builder_add_cstr(e, "-----");
+    var end = str_builder_build(e);
+    var p = str_data(pem);
+    var n = str_len(pem);
+    var bpos = _pem_find(p, n, 0, str_data(begin), str_len(begin));
+    if (bpos < 0) { return 0 - 1; }
+    var body = bpos + str_len(begin);
+    var epos = _pem_find(p, n, body, str_data(end), str_len(end));
+    if (epos < 0) { return 0 - 1; }
+    return _pem_b64_decode(p, body, epos, der, max);
+}
+
+# A signer from the PEM private key `pem`: a P-256 key, SEC 1 or PKCS #8, signs ES256, and an RSA
+# key, PKCS #1 or PKCS #8, RS256. `kid` names the key in each signature's header, and `jku`, a Str
+# or 0, where its public half is published. 0 when `pem` holds neither. Read once, at start-up: the
+# key is on the global heap for the process's life.
+fn agnosai_a2a_signer_from_pem(pem: Str, kid: Str, jku): i64 {
+    var der = alloc(8192);
+    var g = alloc(AGN_A2G_SIZE);
+    store64(g + AGN_A2G_KID, kid);
+    store64(g + AGN_A2G_JKU, jku);
+    var d = alloc(32);
+    var n = _agnosai_a2a_pem_der(pem, "EC PRIVATE KEY", der, 8192);
+    if (n <= 0) { n = _agnosai_a2a_pem_der(pem, "PRIVATE KEY", der, 8192); }
+    if (n > 0 && ecdsa_p256_privkey_from_der(der, n, d) == 0) {
+        memset(der, 0, 8192);
+        store64(g + AGN_A2G_ALG, AGNOSAI_A2A_ALG_ES256);
+        store64(g + AGN_A2G_KEY, d);
+        return g;
+    }
+    var rk = alloc(RSAK_SIZE);
+    var rn = _agnosai_a2a_pem_der(pem, "RSA PRIVATE KEY", der, 8192);
+    if (rn <= 0) { rn = _agnosai_a2a_pem_der(pem, "PRIVATE KEY", der, 8192); }
+    var ok = 0;
+    if (rn > 0 && rsa_privkey_from_der(der, rn, rk) == 0) { ok = 1; }
+    memset(der, 0, 8192);
+    if (ok == 0) { return 0; }
+    store64(g + AGN_A2G_ALG, AGNOSAI_A2A_ALG_RS256);
+    store64(g + AGN_A2G_KEY, rk);
+    return g;
+}
+
+# The JWS `alg` a signer signs with.
+fn agnosai_a2a_signer_alg(g): i64 {
+    if (load64(g + AGN_A2G_ALG) == AGNOSAI_A2A_ALG_ES256) { return "ES256"; }
+    return "RS256";
+}
+
+# Give the endpoint a signer for its card (`agnosai_a2a_signer_from_pem`).
+fn agnosai_a2a_config_with_signer(c, g): i64 {
+    store64(c + AGN_A2C_SIGNER, g);
+    return c;
+}
+
+# Build the card once, for the configured public URL, signed when the endpoint has a signer, so
+# `GET /.well-known/agent-card.json` answers it as it is. Called at start-up, before a worker
+# exists: the card is the global heap's, and read-only after. Answers 0, or -1 when there is no
+# public URL to build it for, or a signer that would not sign, and the card is then built per
+# request, unsigned.
+fn agnosai_a2a_config_seal(c, auth): i64 {
+    var url = agnosai_a2a_config_public_url(c);
+    if (url == 0) { return 0 - 1; }
+    var a = default_alloc();
+    var card = agnosai_a2a_card_a(a, auth, url);
+    var g = load64(c + AGN_A2C_SIGNER);
+    if (g != 0) {
+        var sig = agnosai_a2a_card_sign_a(a, card, g);
+        if (sig == 0) { return 0 - 1; }
+        var sigs = bayan_json_v_arr_new_a(a);
+        bayan_json_v_arr_push_a(a, sigs, sig);
+        bayan_json_v_obj_set_a(a, card, str_from_a(a, "signatures"), sigs);
+    }
+    store64(c + AGN_A2C_CARD, card);
+    return 0;
+}
+
+var _AGNOSAI_A2A_B64U = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+# `n` bytes at `p` as base64url, no padding, a Str in `a`.
+fn _agnosai_a2a_b64url_a(a, p, n): Str {
+    var sb = str_builder_new_a(a);
+    var i = 0;
+    var q[8];
+    while (i < n) {
+        var b0 = load8(p + i);
+        var b1 = 0;
+        var b2 = 0;
+        if (i + 1 < n) { b1 = load8(p + i + 1); }
+        if (i + 2 < n) { b2 = load8(p + i + 2); }
+        store8(&q, load8(_AGNOSAI_A2A_B64U + (b0 >> 2)));
+        store8(&q + 1, load8(_AGNOSAI_A2A_B64U + (((b0 & 3) << 4) | (b1 >> 4))));
+        store8(&q + 2, load8(_AGNOSAI_A2A_B64U + (((b1 & 15) << 2) | (b2 >> 6))));
+        store8(&q + 3, load8(_AGNOSAI_A2A_B64U + (b2 & 63)));
+        var take = 4;
+        if (i + 1 >= n) { take = 2; }
+        elif (i + 2 >= n) { take = 3; }
+        store8(&q + take, 0);
+        str_builder_add_cstr_a(a, sb, &q);
+        i = i + 3;
+    }
+    return str_builder_build_a(a, sb);
+}
+
+fn _agnosai_a2a_b64u_val(c): i64 {
+    if (c >= 65 && c <= 90) { return c - 65; }
+    if (c >= 97 && c <= 122) { return c - 71; }
+    if (c >= 48 && c <= 57) { return c + 4; }
+    if (c == 45) { return 62; }
+    if (c == 95) { return 63; }
+    return 0 - 1;
+}
+
+# The base64url `s`, unpadded, decoded into `a`: its bytes, their count through `out_len`, or 0 when
+# it is not base64url.
+fn _agnosai_a2a_b64url_decode_a(a, s: Str, out_len): i64 {
+    var p = str_data(s);
+    var n = str_len(s);
+    if (n % 4 == 1) { return 0; }
+    var out = alloc_via(a, (n / 4) * 3 + 3);
+    var acc = 0;
+    var bits = 0;
+    var o = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var x = _agnosai_a2a_b64u_val(load8(p + i));
+        if (x < 0) { return 0; }
+        acc = ((acc << 6) | x) & 0xFFFFFF;
+        bits = bits + 6;
+        if (bits >= 8) {
+            bits = bits - 8;
+            store8(out + o, (acc >> bits) & 255);
+            o = o + 1;
+        }
+    }
+    store64(out_len, o);
+    return out;
+}
+
+# `card` without its `signatures`, which a signature does not cover: a shallow copy in `a`.
+fn _agnosai_a2a_unsigned_a(a, card): i64 {
+    var o = bayan_json_v_obj_new_a(a);
+    for (var i = 0; i < bayan_json_v_obj_len(card); i = i + 1) {
+        var k = bayan_json_v_obj_key(card, i);
+        if (str_eq_cstr(k, "signatures") == 0) { bayan_json_v_obj_set_a(a, o, k, bayan_json_v_obj_val(card, i)); }
+    }
+    return o;
+}
+
+# What a signature over `card` signs, with the protected header `protected` (base64url): that, `.`,
+# and the base64url of the card's canonical form, or 0 when the card has no canonical form.
+fn _agnosai_a2a_signing_input_a(a, protected: Str, card): i64 {
+    var payload = agnosai_jcs_a(a, _agnosai_a2a_unsigned_a(a, card));
+    if (payload == 0) { return 0; }
+    var sb = str_builder_new_a(a);
+    str_builder_add_a(a, sb, protected);
+    str_builder_add_cstr_a(a, sb, ".");
+    str_builder_add_a(a, sb, _agnosai_a2a_b64url_a(a, str_data(payload), str_len(payload)));
+    return str_builder_build_a(a, sb);
+}
+
+# An `AgentCardSignature` over `card` by signer `g`, in `a`, or 0 when it would not sign.
+fn agnosai_a2a_card_sign_a(a, card, g): i64 {
+    var h = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, h, str_from_a(a, "alg"), bayan_json_v_str_new_a(a, str_from_a(a,
+          agnosai_a2a_signer_alg(g))));
+    bayan_json_v_obj_set_a(a, h, str_from_a(a, "kid"), bayan_json_v_str_new_a(a, load64(g + AGN_A2G_KID)));
+    bayan_json_v_obj_set_a(a, h, str_from_a(a, "typ"), bayan_json_v_str_new_a(a, str_from_a(a, "JOSE")));
+    if (load64(g + AGN_A2G_JKU) != 0) {
+        bayan_json_v_obj_set_a(a, h, str_from_a(a, "jku"), bayan_json_v_str_new_a(a, load64(g + AGN_A2G_JKU)));
+    }
+    var hj = agnosai_jcs_a(a, h);
+    var protected = _agnosai_a2a_b64url_a(a, str_data(hj), str_len(hj));
+    var input = _agnosai_a2a_signing_input_a(a, protected, card);
+    if (input == 0) { return 0; }
+    var raw = alloc_via(a, 512);
+    var len = 0 - 1;
+    if (load64(g + AGN_A2G_ALG) == AGNOSAI_A2A_ALG_ES256) {
+        if (ecdsa_p256_sign(load64(g + AGN_A2G_KEY), str_data(input), str_len(input), raw) == 0) { len = 64; }
+    } else {
+        len = rsa_pkcs1v15_sign_sha256(load64(g + AGN_A2G_KEY), str_data(input), str_len(input), raw);
+    }
+    if (len <= 0) { return 0; }
+    var sig = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, sig, str_from_a(a, "protected"), bayan_json_v_str_new_a(a, protected));
+    bayan_json_v_obj_set_a(a, sig, str_from_a(a, "signature"), bayan_json_v_str_new_a(a, _agnosai_a2a_b64url_a(a, raw,
+          len)));
+    return sig;
+}
+
+# A signature of `card`'s that names `alg` in its protected header, with the signing input it
+# covers through `out_input` and the signature's bytes through `out_sig` and `out_len`, or 0.
+fn _agnosai_a2a_find_sig_a(a, card, alg, out_input, out_sig, out_len): i64 {
+    var sigs = bayan_json_v_obj_get_by_cstr(card, "signatures");
+    if (sigs == 0 || bayan_json_v_is_arr(sigs) == 0) { return 0; }
+    for (var i = 0; i < bayan_json_v_arr_len(sigs); i = i + 1) {
+        var sig = bayan_json_v_arr_get(sigs, i);
+        var pv = bayan_json_v_obj_get_by_cstr(sig, "protected");
+        var sv = bayan_json_v_obj_get_by_cstr(sig, "signature");
+        if (pv != 0 && sv != 0 && bayan_json_v_is_str(pv) == 1 && bayan_json_v_is_str(sv) == 1) {
+            var hl: i64[1];
+            var hb = _agnosai_a2a_b64url_decode_a(a, bayan_json_v_str(pv), &hl);
+            if (hb != 0) {
+                var h = bayan_json_v_parse_buf_a(a, hb, load64(&hl));
+                var av = 0;
+                if (h != 0 && bayan_json_v_is_obj(h) == 1) { av = bayan_json_v_obj_get_by_cstr(h, "alg"); }
+                if (av != 0 && bayan_json_v_is_str(av) == 1 && str_eq_cstr(bayan_json_v_str(av), alg) == 1) {
+                    var raw = _agnosai_a2a_b64url_decode_a(a, bayan_json_v_str(sv), out_len);
+                    var input = _agnosai_a2a_signing_input_a(a, bayan_json_v_str(pv), card);
+                    if (raw != 0 && input != 0) {
+                        store64(out_input, input);
+                        store64(out_sig, raw);
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+# 1 when `card` carries an ES256 signature the P-256 public key `pk`, `Qx || Qy` in 64 bytes, made
+# over it, as a client checks a card before it trusts it (A2A §8.4.3).
+fn agnosai_a2a_card_verify_es256_a(a, card, pk): i64 {
+    var input: i64[1];
+    var sig: i64[1];
+    var len: i64[1];
+    if (_agnosai_a2a_find_sig_a(a, card, "ES256", &input, &sig, &len) == 0) { return 0; }
+    if (load64(&len) != 64) { return 0; }
+    return ecdsa_p256_verify(pk, str_data(load64(&input)), str_len(load64(&input)), load64(&sig));
+}
+
+# 1 when `card` carries an RS256 signature the RSA public key `n`, `e` (big-endian, `n_len` and
+# `e_len` bytes) made over it.
+fn agnosai_a2a_card_verify_rs256_a(a, card, n, n_len, e, e_len): i64 {
+    var input: i64[1];
+    var sig: i64[1];
+    var len: i64[1];
+    if (_agnosai_a2a_find_sig_a(a, card, "RS256", &input, &sig, &len) == 0) { return 0; }
+    return rsa_pkcs1v15_verify_sha256(n, n_len, e, e_len, str_data(load64(&input)), str_len(load64(&input)),
+      load64(&sig), load64(&len));
+}
+
+# --- the JSON-RPC envelope ------------------------------------------------
+
+fn _agnosai_a2a_success(a, id, result): i64 {
+    var o = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, o, AGN_JK_JSONRPC, bayan_json_v_str_new_a(a, AGN_JV_JSONRPC_20));
+    bayan_json_v_obj_set_a(a, o, AGN_JK_ID, id);
+    bayan_json_v_obj_set_a(a, o, AGN_JK_RESULT, result);
+    return o;
+}
+
+# The `ErrorInfo` reason an A2A code carries: its error's name, less `Error`, in upper snake case
+# (spec §5.4), or 0 for a JSON-RPC code, which carries no data.
+fn _agnosai_a2a_reason(code): i64 {
+    if (code == AGNOSAI_A2A_TASK_NOT_FOUND) { return "TASK_NOT_FOUND"; }
+    if (code == AGNOSAI_A2A_TASK_NOT_CANCELABLE) { return "TASK_NOT_CANCELABLE"; }
+    if (code == AGNOSAI_A2A_PUSH_NOT_SUPPORTED) { return "PUSH_NOTIFICATION_NOT_SUPPORTED"; }
+    if (code == AGNOSAI_A2A_UNSUPPORTED_OPERATION) { return "UNSUPPORTED_OPERATION"; }
+    if (code == AGNOSAI_A2A_CONTENT_TYPE_NOT_SUPPORTED) { return "CONTENT_TYPE_NOT_SUPPORTED"; }
+    if (code == AGNOSAI_A2A_VERSION_NOT_SUPPORTED) { return "VERSION_NOT_SUPPORTED"; }
+    return 0;
+}
+
+# A JSON-RPC error. An A2A code carries `data`, an array of one `google.rpc.ErrorInfo` in the
+# `a2a-protocol.org` domain, as the spec's errors do.
+fn _agnosai_a2a_error(a, id, code, message: Str): i64 {
+    var e = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, e, AGN_JK_CODE, bayan_json_v_int_new_a(a, code));
+    bayan_json_v_obj_set_a(a, e, AGN_JK_MESSAGE, bayan_json_v_str_new_a(a, message));
+    var reason = _agnosai_a2a_reason(code);
+    if (reason != 0) {
+        var info = bayan_json_v_obj_new_a(a);
+        bayan_json_v_obj_set_a(a, info, str_from_a(a, "@type"),
+          bayan_json_v_str_new_a(a, str_from_a(a, "type.googleapis.com/google.rpc.ErrorInfo")));
+        bayan_json_v_obj_set_a(a, info, str_from_a(a, "reason"), bayan_json_v_str_new_a(a, str_from_a(a, reason)));
+        bayan_json_v_obj_set_a(a, info, str_from_a(a, "domain"),
+          bayan_json_v_str_new_a(a, str_from_a(a, "a2a-protocol.org")));
+        var data = bayan_json_v_arr_new_a(a);
+        bayan_json_v_arr_push_a(a, data, info);
+        bayan_json_v_obj_set_a(a, e, AGN_JK_DATA, data);
+    }
+    var o = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, o, AGN_JK_JSONRPC, bayan_json_v_str_new_a(a, AGN_JV_JSONRPC_20));
+    bayan_json_v_obj_set_a(a, o, AGN_JK_ID, id);
+    bayan_json_v_obj_set_a(a, o, AGN_JK_ERROR, e);
+    return o;
+}
+
+# An error, as the route's answer. **Every JSON-RPC answer is HTTP 200**, errors in band: the
+# binding names no status for them, and a client reads an error out of a 200 where a proxy retries
+# a 5xx.
+fn _agnosai_a2a_fail(a, id, code, message): i64 {
+    _agnosai_a2a_refused(a, code, message);
+    return agnosai_route_json_a(a, HTTP_OK, _agnosai_a2a_error(a, id, code, str_from_a(a, message)));
+}
+
+fn _agnosai_a2a_refused(a, code, message): i64 {
+    if (sakshi_get_level() < SK_DEBUG) { return 0; }
+    var f[AGNOSAI_LOG_FIELDS_BYTES];
+    var n = agnosai_log_fields_start(&f, str_from_a(a, message));
+    n = agnosai_log_field_int(&f, n, "code", code);
+    sakshi_log_kv(SK_DEBUG, "A2A request refused", 19, "reason", 6, &f, n);
+    return 0;
+}
+
+# --- the Agent Card -------------------------------------------------------
+
+# The base URL the card names its endpoint under: the configured public URL, or `http://` and the
+# request's `Host` when it is one a URL can carry, or `http://localhost`.
+fn _agnosai_a2a_base_a(a, cfg, hdrs): Str {
+    var pu = agnosai_a2a_config_public_url(cfg);
+    if (pu != 0) { return pu; }
+    var host = agnosai_http_header_a(a, hdrs, "Host");
+    if (host == 0 || _agnosai_a2a_host_ok(host) == 0) { host = "localhost"; }
+    var sb = str_builder_new_a(a);
+    str_builder_add_cstr_a(a, sb, "http://");
+    str_builder_add_cstr_a(a, sb, host);
+    return str_builder_build_a(a, sb);
+}
+
+# 1 when `host` is a host and port a URL can carry as it is: letters, digits, `.`, `-`, `:` and the
+# brackets of an IPv6 literal, 255 bytes at most. Anything else, a `/` or a space included, would
+# let a request write the card's URL.
+fn _agnosai_a2a_host_ok(host): i64 {
+    var n = strlen(host);
+    if (n == 0 || n > 255) { return 0; }
+    for (var i = 0; i < n; i = i + 1) {
+        var c = load8(host + i);
+        var ok = 0;
+        if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)) { ok = 1; }
+        if (c == 46 || c == 45 || c == 58 || c == 91 || c == 93) { ok = 1; }
+        if (ok == 0) { return 0; }
+    }
+    return 1;
+}
+
+fn _agnosai_a2a_strs_a(a, x, y): i64 {
+    var arr = bayan_json_v_arr_new_a(a);
+    bayan_json_v_arr_push_a(a, arr, bayan_json_v_str_new_a(a, str_from_a(a, x)));
+    if (y != 0) { bayan_json_v_arr_push_a(a, arr, bayan_json_v_str_new_a(a, str_from_a(a, y))); }
+    return arr;
+}
+
+# The Agent Card, unsigned, with its endpoint under `base`. `auth` says how a caller authenticates:
+# with auth on, the card declares the bearer scheme the endpoint checks, a JWT's when one is
+# configured, and requires it.
+fn agnosai_a2a_card_a(a, auth, base: Str): i64 {
+    var card = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, card, AGN_JK_NAME, bayan_json_v_str_new_a(a, AGN_JV_AGNOSAI));
+    bayan_json_v_obj_set_a(a, card, AGN_JK_DESCRIPTION, bayan_json_v_str_new_a(a, str_from_a(a,
+          "Runs a crew of AI agents for a task: provider-agnostic orchestration, with sandboxed tools.")));
+
+    var iface = bayan_json_v_obj_new_a(a);
+    var url = str_builder_new_a(a);
+    str_builder_add_a(a, url, base);
+    str_builder_add_cstr_a(a, url, AGNOSAI_A2A_RPC_PATH);
+    bayan_json_v_obj_set_a(a, iface, str_from_a(a, "url"), bayan_json_v_str_new_a(a, str_builder_build_a(a, url)));
+    bayan_json_v_obj_set_a(a, iface, str_from_a(a, "protocolBinding"), bayan_json_v_str_new_a(a, str_from_a(a,
+          "JSONRPC")));
+    bayan_json_v_obj_set_a(a, iface, str_from_a(a, "protocolVersion"),
+      bayan_json_v_str_new_a(a, str_from_a(a, AGNOSAI_A2A_PROTOCOL_VERSION)));
+    var ifaces = bayan_json_v_arr_new_a(a);
+    bayan_json_v_arr_push_a(a, ifaces, iface);
+    bayan_json_v_obj_set_a(a, card, str_from_a(a, "supportedInterfaces"), ifaces);
+
+    bayan_json_v_obj_set_a(a, card, AGN_JK_VERSION, bayan_json_v_str_new_a(a, str_from_a(a, AGNOSAI_VERSION)));
+
+    var caps = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, caps, str_from_a(a, "streaming"), bayan_json_v_bool_new_a(a, 1));
+    bayan_json_v_obj_set_a(a, caps, str_from_a(a, "pushNotifications"), bayan_json_v_bool_new_a(a, 0));
+    bayan_json_v_obj_set_a(a, caps, str_from_a(a, "extendedAgentCard"), bayan_json_v_bool_new_a(a, 0));
+    bayan_json_v_obj_set_a(a, card, AGN_JK_CAPABILITIES, caps);
+
+    if (auth != 0 && agnosai_auth_config_enabled(auth) == 1) {
+        var http = bayan_json_v_obj_new_a(a);
+        bayan_json_v_obj_set_a(a, http, str_from_a(a, "scheme"), bayan_json_v_str_new_a(a, str_from_a(a, "Bearer")));
+        if (agnosai_auth_config_jwt(auth) != 0) {
+            bayan_json_v_obj_set_a(a, http, str_from_a(a, "bearerFormat"), bayan_json_v_str_new_a(a, str_from_a(a,
+                  "JWT")));
+        }
+        var scheme = bayan_json_v_obj_new_a(a);
+        bayan_json_v_obj_set_a(a, scheme, str_from_a(a, "httpAuthSecurityScheme"), http);
+        var schemes = bayan_json_v_obj_new_a(a);
+        bayan_json_v_obj_set_a(a, schemes, str_from_a(a, "bearer"), scheme);
+        bayan_json_v_obj_set_a(a, card, str_from_a(a, "securitySchemes"), schemes);
+
+        var scopes = bayan_json_v_obj_new_a(a);
+        bayan_json_v_obj_set_a(a, scopes, str_from_a(a, "list"), bayan_json_v_arr_new_a(a));
+        var req_schemes = bayan_json_v_obj_new_a(a);
+        bayan_json_v_obj_set_a(a, req_schemes, str_from_a(a, "bearer"), scopes);
+        var req = bayan_json_v_obj_new_a(a);
+        bayan_json_v_obj_set_a(a, req, str_from_a(a, "schemes"), req_schemes);
+        var reqs = bayan_json_v_arr_new_a(a);
+        bayan_json_v_arr_push_a(a, reqs, req);
+        bayan_json_v_obj_set_a(a, card, str_from_a(a, "securityRequirements"), reqs);
+    }
+
+    bayan_json_v_obj_set_a(a, card, str_from_a(a, "defaultInputModes"),
+      _agnosai_a2a_strs_a(a, "text/plain", "application/json"));
+    bayan_json_v_obj_set_a(a, card, str_from_a(a, "defaultOutputModes"), _agnosai_a2a_strs_a(a, "text/plain", 0));
+
+    var skill = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, skill, AGN_JK_ID, bayan_json_v_str_new_a(a, str_from_a(a, "run-crew")));
+    bayan_json_v_obj_set_a(a, skill, AGN_JK_NAME, bayan_json_v_str_new_a(a, str_from_a(a, "Run a crew")));
+    bayan_json_v_obj_set_a(a, skill, AGN_JK_DESCRIPTION, bayan_json_v_str_new_a(a, str_from_a(a,
+          "Takes a task in plain text, runs a crew of agents for it, and answers with each result as an artifact.")));
+    var tags = _agnosai_a2a_strs_a(a, "orchestration", "crew");
+    bayan_json_v_arr_push_a(a, tags, bayan_json_v_str_new_a(a, str_from_a(a, "agents")));
+    bayan_json_v_obj_set_a(a, skill, str_from_a(a, "tags"), tags);
+    var skills = bayan_json_v_arr_new_a(a);
+    bayan_json_v_arr_push_a(a, skills, skill);
+    bayan_json_v_obj_set_a(a, card, str_from_a(a, "skills"), skills);
+    return card;
+}
+
+# `GET /.well-known/agent-card.json` — public, as discovery is: the card says how to authenticate
+# to the endpoint it names. Kept five minutes by any cache when the public URL is configured, as it
+# is then the same for every caller; otherwise it names the request's host, so no shared cache may
+# keep it.
+fn agnosai_route_a2a_card_a(a, state, hdrs): i64 {
+    var cfg = agnosai_app_state_a2a(state);
+    var card = 0;
+    if (cfg != 0) { card = load64(cfg + AGN_A2C_CARD); }
+    if (card == 0) { card = agnosai_a2a_card_a(a, agnosai_app_state_auth(state), _agnosai_a2a_base_a(a, cfg, hdrs)); }
+    var cache = "Cache-Control: no-cache\r\n";
+    if (agnosai_a2a_config_public_url(cfg) != 0) { cache = "Cache-Control: public, max-age=300\r\n"; }
+    return agnosai_route_with_headers(agnosai_route_json_a(a, HTTP_OK, card), cache);
+}
+
+# --- a crew as a task -----------------------------------------------------
+
+# The A2A state of crew status `status`.
+fn _agnosai_a2a_state_of(status): i64 {
+    if (status == AGNOSAI_CREW_PENDING) { return "TASK_STATE_SUBMITTED"; }
+    if (status == AGNOSAI_CREW_COMPLETED) { return "TASK_STATE_COMPLETED"; }
+    if (status == AGNOSAI_CREW_FAILED) { return "TASK_STATE_FAILED"; }
+    if (status == AGNOSAI_CREW_CANCELLED) { return "TASK_STATE_CANCELED"; }
+    return "TASK_STATE_WORKING";
+}
+
+# 1 when a task in crew status `status` has ended: nothing more comes of it.
+fn _agnosai_a2a_terminal(status): i64 {
+    if (status == AGNOSAI_CREW_COMPLETED || status == AGNOSAI_CREW_FAILED || status == AGNOSAI_CREW_CANCELLED) {
+        return 1;
+    }
+    return 0;
+}
+
+# The crew's `contextId`, or 0 for a crew that is not an A2A task. `spec` may be 0: a crew read
+# with no hold is not the orchestrator's, so not one this endpoint started.
+fn _agnosai_a2a_context(a, spec): i64 {
+    if (spec == 0) { return 0; }
+    var v = map_get(agnosai_crew_metadata(spec), str_from_a(a, AGNOSAI_A2A_MD_CONTEXT));
+    if (v == 0 || bayan_json_v_is_str(v) == 0) { return 0; }
+    return bayan_json_v_str(v);
+}
+
+# The agent's message on a task's status: `text`, from the agent, in the task's context.
+fn _agnosai_a2a_agent_message_a(a, task_id: Str, context: Str, text: Str): i64 {
+    var m = bayan_json_v_obj_new_a(a);
+    var mid = str_builder_new_a(a);
+    str_builder_add_a(a, mid, task_id);
+    str_builder_add_cstr_a(a, mid, "-status");
+    bayan_json_v_obj_set_a(a, m, AGN_JK_A2A_MESSAGE_ID, bayan_json_v_str_new_a(a, str_builder_build_a(a, mid)));
+    bayan_json_v_obj_set_a(a, m, AGN_JK_A2A_ROLE, bayan_json_v_str_new_a(a, AGN_JV_A2A_ROLE_AGENT));
+    var part = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, part, AGN_JK_TEXT, bayan_json_v_str_new_a(a, text));
+    var parts = bayan_json_v_arr_new_a(a);
+    bayan_json_v_arr_push_a(a, parts, part);
+    bayan_json_v_obj_set_a(a, m, AGN_JK_A2A_PARTS, parts);
+    bayan_json_v_obj_set_a(a, m, AGN_JK_A2A_CONTEXT_ID, bayan_json_v_str_new_a(a, context));
+    bayan_json_v_obj_set_a(a, m, AGN_JK_A2A_TASK_ID, bayan_json_v_str_new_a(a, task_id));
+    return m;
+}
+
+# A task's `status`: its state, and for one that failed or was cancelled, a message saying why: the
+# crew's reason, and for a failed task the first failed result's own text, `task_failed: <error>`, as
+# the reason alone says that a task failed and not what went wrong.
+fn _agnosai_a2a_status_a(a, st, task_id: Str, context: Str): i64 {
+    var status = agnosai_crew_state_status(st);
+    var o = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, o, AGN_JK_A2A_STATE, bayan_json_v_str_new_a(a, str_from_a(a,
+          _agnosai_a2a_state_of(status))));
+    var reason = agnosai_crew_state_reason(st);
+    if (reason != 0 && (status == AGNOSAI_CREW_FAILED || status == AGNOSAI_CREW_CANCELLED)) {
+        var sb = str_builder_new_a(a);
+        str_builder_add_a(a, sb, reason);
+        var why = _agnosai_a2a_first_failure(st);
+        if (status == AGNOSAI_CREW_FAILED && why != 0) {
+            str_builder_add_cstr_a(a, sb, ": ");
+            str_builder_add_a(a, sb, why);
+        }
+        bayan_json_v_obj_set_a(a, o, AGN_JK_MESSAGE,
+          _agnosai_a2a_agent_message_a(a, task_id, context, str_builder_build_a(a, sb)));
+    }
+    return o;
+}
+
+# The output of the first result in crew state `st` that failed, when it says something, or 0.
+fn _agnosai_a2a_first_failure(st): i64 {
+    var results = agnosai_crew_state_results(st);
+    for (var i = 0; i < vec_len(results); i = i + 1) {
+        var res = vec_get(results, i);
+        var out = agnosai_task_result_output(res);
+        if (agnosai_task_result_status(res) == AGNOSAI_STATUS_FAILED && out != 0 && str_len(out) > 0) { return out; }
+    }
+    return 0;
+}
+
+# One artifact a task result makes: its output as text, under the crew task's id.
+fn _agnosai_a2a_artifact_a(a, res): i64 {
+    var art = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, art, AGN_JK_A2A_ARTIFACT_ID,
+      bayan_json_v_str_new_a(a, str_clone_a(a, agnosai_task_result_task_id(res))));
+    bayan_json_v_obj_set_a(a, art, AGN_JK_NAME, bayan_json_v_str_new_a(a, AGN_JV_A2A_RESULT));
+    var part = bayan_json_v_obj_new_a(a);
+    var out = agnosai_task_result_output(res);
+    if (out == 0) { out = AGN_JV_EMPTY; }
+    bayan_json_v_obj_set_a(a, part, AGN_JK_TEXT, bayan_json_v_str_new_a(a, str_clone_a(a, out)));
+    bayan_json_v_obj_set_a(a, part, AGN_JK_A2A_MEDIA_TYPE, bayan_json_v_str_new_a(a, AGN_JV_A2A_TEXT_PLAIN));
+    var parts = bayan_json_v_arr_new_a(a);
+    bayan_json_v_arr_push_a(a, parts, part);
+    bayan_json_v_obj_set_a(a, art, AGN_JK_A2A_PARTS, parts);
+    return art;
+}
+
+# A crew as an A2A `Task`, in `a`, every string a copy, so it outlives the crew's hold. `history` is
+# how many messages of its history to carry: -1 for all, 0 for none. `artifacts` is 1 to carry each
+# completed result as an artifact.
+fn _agnosai_a2a_task_a(a, st, spec, history, artifacts): i64 {
+    var id = str_clone_a(a, agnosai_crew_state_crew_id(st));
+    var context = str_clone_a(a, _agnosai_a2a_context(a, spec));
+    var t = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, t, AGN_JK_ID, bayan_json_v_str_new_a(a, id));
+    bayan_json_v_obj_set_a(a, t, AGN_JK_A2A_CONTEXT_ID, bayan_json_v_str_new_a(a, context));
+    bayan_json_v_obj_set_a(a, t, AGN_JK_STATUS, _agnosai_a2a_status_a(a, st, id, context));
+    if (artifacts == 1) {
+        var arts = bayan_json_v_arr_new_a(a);
+        var results = agnosai_crew_state_results(st);
+        for (var i = 0; i < vec_len(results); i = i + 1) {
+            var res = vec_get(results, i);
+            if (agnosai_task_result_status(res) == AGNOSAI_STATUS_COMPLETED) {
+                bayan_json_v_arr_push_a(a, arts, _agnosai_a2a_artifact_a(a, res));
+            }
+        }
+        if (bayan_json_v_arr_len(arts) > 0) { bayan_json_v_obj_set_a(a, t, AGN_JK_A2A_ARTIFACTS, arts); }
+    }
+    if (history != 0 && spec != 0) {
+        var msg = map_get(agnosai_crew_metadata(spec), str_from_a(a, AGNOSAI_A2A_MD_MESSAGE));
+        if (msg != 0) {
+            var h = bayan_json_v_arr_new_a(a);
+            bayan_json_v_arr_push_a(a, h, agnosai_json_copy_a(a, msg));
+            bayan_json_v_obj_set_a(a, t, AGN_JK_A2A_HISTORY, h);
+        }
+    }
+    return t;
+}
+
+# A task the orchestrator refused at admission (ADR 033): `TASK_STATE_REJECTED`, saying why. It was
+# never registered, so nothing reads it again.
+fn _agnosai_a2a_rejected_a(a, task_id: Str, context: Str, why: Str): i64 {
+    var t = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, t, AGN_JK_ID, bayan_json_v_str_new_a(a, task_id));
+    bayan_json_v_obj_set_a(a, t, AGN_JK_A2A_CONTEXT_ID, bayan_json_v_str_new_a(a, context));
+    var s = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, s, AGN_JK_A2A_STATE, bayan_json_v_str_new_a(a, str_from_a(a, "TASK_STATE_REJECTED")));
+    bayan_json_v_obj_set_a(a, s, AGN_JK_MESSAGE, _agnosai_a2a_agent_message_a(a, task_id, context, why));
+    bayan_json_v_obj_set_a(a, t, AGN_JK_STATUS, s);
+    return t;
+}
+
+# Read the A2A task `id` with a hold (ADR 037): its crew state, and the hold through `out_hold`, or
+# 0 for no such task. A crew that is not one this endpoint started is no task, and is let go.
+fn _agnosai_a2a_hold_task(a, state, id: Str, out_hold): i64 {
+    store64(out_hold, 0);
+    var key = _agnosai_uuid_key_a(a, id);
+    if (key == 0) { return 0; }
+    var o = agnosai_app_state_orchestrator(state);
+    var st = agnosai_orchestrator_hold_crew(o, key, out_hold);
+    if (st == 0) { return 0; }
+    if (_agnosai_a2a_context(a, load64(out_hold)) == 0) {
+        agnosai_orchestrator_let_go(o, load64(out_hold));
+        store64(out_hold, 0);
+        return 0;
+    }
+    return st;
+}
+
+# `historyLength` from `params`: -1 when absent, the count when a non-negative integer, or -2.
+fn _agnosai_a2a_history_len(params): i64 {
+    if (params == 0) { return 0 - 1; }
+    var h = bayan_json_v_obj_get_by_cstr(params, "historyLength");
+    if (h == 0 || bayan_json_v_is_null(h) == 1) { return 0 - 1; }
+    if (bayan_json_v_is_int(h) == 0 || bayan_json_v_int(h) < 0) { return 0 - 2; }
+    return bayan_json_v_int(h);
+}
+
+# --- SendMessage ----------------------------------------------------------
+
+# The text a message's parts say, in order, a data part as its JSON, or 0 with `*out_code` and
+# `*out_msg` saying why not. A raw or a URL part is content this agent does not read.
+fn _agnosai_a2a_message_text_a(a, parts, out_code, out_msg): i64 {
+    var sb = str_builder_new_a(a);
+    for (var i = 0; i < bayan_json_v_arr_len(parts); i = i + 1) {
+        var p = bayan_json_v_arr_get(parts, i);
+        if (bayan_json_v_is_obj(p) == 0) {
+            store64(out_code, AGNOSAI_A2A_INVALID_PARAMS);
+            store64(out_msg, "a part is an object");
+            return 0;
+        }
+        var text = bayan_json_v_obj_get_by_cstr(p, "text");
+        var data = bayan_json_v_obj_get_by_cstr(p, "data");
+        var raw = bayan_json_v_obj_get_by_cstr(p, "raw");
+        var url = bayan_json_v_obj_get_by_cstr(p, "url");
+        var n = 0;
+        if (text != 0) { n = n + 1; }
+        if (data != 0) { n = n + 1; }
+        if (raw != 0) { n = n + 1; }
+        if (url != 0) { n = n + 1; }
+        if (n != 1) {
+            store64(out_code, AGNOSAI_A2A_INVALID_PARAMS);
+            store64(out_msg, "a part carries exactly one of text, raw, url or data");
+            return 0;
+        }
+        if (raw != 0 || url != 0) {
+            store64(out_code, AGNOSAI_A2A_CONTENT_TYPE_NOT_SUPPORTED);
+            store64(out_msg, "this agent reads text and data parts");
+            return 0;
+        }
+        if (i > 0) { str_builder_add_cstr_a(a, sb, "\n\n"); }
+        if (text != 0) {
+            if (bayan_json_v_is_str(text) == 0) {
+                store64(out_code, AGNOSAI_A2A_INVALID_PARAMS);
+                store64(out_msg, "a text part's text is a string");
+                return 0;
+            }
+            str_builder_add_a(a, sb, bayan_json_v_str(text));
+        } else {
+            str_builder_add_a(a, sb, bayan_json_v_build_a(a, data));
+        }
+    }
+    return str_builder_build_a(a, sb);
+}
+
+# 1 when a client that accepts `modes` can read text: it named none, or named `text/plain`,
+# `text/*` or `*/*`.
+fn _agnosai_a2a_accepts_text(modes): i64 {
+    if (modes == 0 || bayan_json_v_is_arr(modes) == 0 || bayan_json_v_arr_len(modes) == 0) { return 1; }
+    for (var i = 0; i < bayan_json_v_arr_len(modes); i = i + 1) {
+        var m = bayan_json_v_arr_get(modes, i);
+        if (bayan_json_v_is_str(m) == 1) {
+            var s = bayan_json_v_str(m);
+            if (str_eq_cstr(s, "text/plain") == 1 || str_eq_cstr(s, "text/*") == 1 || str_eq_cstr(s, "*/*") == 1) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+# A string field of `o` no longer than AGNOSAI_A2A_MAX_STRING_LEN and not empty, its Str, or 0 when
+# absent, and -1 when present and not one.
+fn _agnosai_a2a_opt_id(o, key): i64 {
+    var v = bayan_json_v_obj_get_by_cstr(o, key);
+    if (v == 0 || bayan_json_v_is_null(v) == 1) { return 0; }
+    if (bayan_json_v_is_str(v) == 0) { return 0 - 1; }
+    var s = bayan_json_v_str(v);
+    if (str_len(s) == 0 || str_len(s) > AGNOSAI_A2A_MAX_STRING_LEN) { return 0 - 1; }
+    return s;
+}
+
+# The crew a message starts, in an arena of the orchestrator's, owned, its hold through `out_hold`.
+fn _agnosai_a2a_crew_a(a, state, message, text: Str, context: Str, tp: Str, out_hold): i64 {
+    var o = agnosai_app_state_orchestrator(state);
+    var ca = agnosai_orchestrator_crew_arena(o);
+    var spec = agnosai_crew_new_in(ca, str_from_a(ca, "a2a-task"));
+    var tasks = vec_new_a(ca);
+    vec_push_a(ca, tasks, agnosai_task_new_a(ca, str_clone_a(ca, text)));
+    agnosai_crew_with_tasks(spec, tasks);
+    if (tp != 0) { agnosai_crew_with_trace_parent(spec, str_clone_a(ca, tp)); }
+    agnosai_crew_with_metadata(spec, str_from_a(ca, AGNOSAI_A2A_MD_CONTEXT),
+      bayan_json_v_str_new_a(ca, str_clone_a(ca, context)));
+    # The history keeps the message as it is in its task: the client's, with its task and context.
+    agnosai_crew_with_metadata(spec, str_from_a(ca, AGNOSAI_A2A_MD_MESSAGE),
+      _agnosai_a2a_kept_message_a(ca, message, agnosai_crew_id(spec), context));
+    store64(out_hold, agnosai_orchestrator_own_crew(o, spec));
+    return spec;
+}
+
+# The message as the task's history keeps it: the client's, with the task and context it is in.
+fn _agnosai_a2a_kept_message_a(a, message, task_id: Str, context: Str): i64 {
+    var m = agnosai_json_copy_a(a, message);
+    if (bayan_json_v_obj_get_by_cstr(m, "contextId") == 0) {
+        bayan_json_v_obj_set_a(a, m, str_from_a(a, "contextId"), bayan_json_v_str_new_a(a, str_clone_a(a, context)));
+    }
+    if (bayan_json_v_obj_get_by_cstr(m, "taskId") == 0) {
+        bayan_json_v_obj_set_a(a, m, str_from_a(a, "taskId"), bayan_json_v_str_new_a(a, str_clone_a(a, task_id)));
+    }
+    return m;
+}
+
+# What `SendMessage` and `SendStreamingMessage` both check: the message, and what its configuration
+# asks. A route answer refusing it, or 0 with the message's text through `out_text` and its
+# context through `out_context`.
+fn _agnosai_a2a_admit_message(a, state, id, params, out_text, out_context): i64 {
+    if (params == 0 || bayan_json_v_is_obj(params) == 0) {
+        return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_PARAMS, "params is an object");
+    }
+    var msg = bayan_json_v_obj_get_by_cstr(params, "message");
+    if (msg == 0 || bayan_json_v_is_obj(msg) == 0) {
+        return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_PARAMS, "message is required");
+    }
+    var mid = _agnosai_a2a_opt_id(msg, "messageId");
+    if (mid == 0 || mid == 0 - 1) {
+        return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_PARAMS, "message.messageId is a non-empty string");
+    }
+    var role = bayan_json_v_obj_get_by_cstr(msg, "role");
+    if (role == 0 || bayan_json_v_is_str(role) == 0 || str_eq_cstr(bayan_json_v_str(role), "ROLE_USER") == 0) {
+        return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_PARAMS, "message.role is ROLE_USER");
+    }
+    var parts = bayan_json_v_obj_get_by_cstr(msg, "parts");
+    if (parts == 0 || bayan_json_v_is_arr(parts) == 0 || bayan_json_v_arr_len(parts) == 0) {
+        return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_PARAMS, "message.parts holds at least one part");
+    }
+    var code: i64[1];
+    var why: i64[1];
+    var text = _agnosai_a2a_message_text_a(a, parts, &code, &why);
+    if (text == 0) { return _agnosai_a2a_fail(a, id, load64(&code), load64(&why)); }
+    if (str_len(text) == 0 || str_len(text) > AGNOSAI_A2A_MAX_STRING_LEN) {
+        return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_PARAMS, "the message's text is 1 to 10000 bytes");
+    }
+
+    # A message to a task already started: a crew takes no further input.
+    var tid = _agnosai_a2a_opt_id(msg, "taskId");
+    if (tid == 0 - 1) { return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_PARAMS, "message.taskId is a string"); }
+    if (tid != 0) {
+        var hold: i64[1];
+        var st = _agnosai_a2a_hold_task(a, state, tid, &hold);
+        if (st == 0) { return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_TASK_NOT_FOUND, "task not found"); }
+        var ended = _agnosai_a2a_terminal(agnosai_crew_state_status(st));
+        agnosai_orchestrator_let_go(agnosai_app_state_orchestrator(state), load64(&hold));
+        if (ended == 1) {
+            return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_UNSUPPORTED_OPERATION, "the task has ended");
+        }
+        return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_UNSUPPORTED_OPERATION,
+          "a task takes no further input once it has started");
+    }
+    var context = _agnosai_a2a_opt_id(msg, "contextId");
+    if (context == 0 - 1) {
+        return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_PARAMS, "message.contextId is a non-empty string");
+    }
+    if (context == 0) { context = agnosai_uuid_v4_str_a(a); }
+
+    var conf = bayan_json_v_obj_get_by_cstr(params, "configuration");
+    if (conf != 0 && bayan_json_v_is_null(conf) == 0) {
+        if (bayan_json_v_is_obj(conf) == 0) {
+            return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_PARAMS, "configuration is an object");
+        }
+        if (_agnosai_a2a_accepts_text(bayan_json_v_obj_get_by_cstr(conf, "acceptedOutputModes")) == 0) {
+            return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_CONTENT_TYPE_NOT_SUPPORTED, "this agent answers in text/plain");
+        }
+        var push = bayan_json_v_obj_get_by_cstr(conf, "taskPushNotificationConfig");
+        if (push != 0 && bayan_json_v_is_null(push) == 0) {
+            return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_PUSH_NOT_SUPPORTED, "this agent sends no push notifications");
+        }
+        if (_agnosai_a2a_history_len(conf) == 0 - 2) {
+            return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_PARAMS,
+              "configuration.historyLength is a non-negative integer");
+        }
+    }
+    var md = bayan_json_v_obj_get_by_cstr(params, "metadata");
+    if (md != 0 && bayan_json_v_is_null(md) == 0) {
+        if (bayan_json_v_is_obj(md) == 0 || str_len(bayan_json_v_build_a(a, md)) > AGNOSAI_A2A_MAX_METADATA_BYTES) {
+            return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_PARAMS, "metadata is an object of 64 KiB at most");
+        }
+    }
+    store64(out_text, text);
+    store64(out_context, context);
+    return 0;
+}
+
+# `SendMessage`: the message starts a crew, which runs to its end unless the configuration says
+# `returnImmediately`, and the answer is the task, `{"task": Task}`.
+fn _agnosai_a2a_send(a, state, id, params, tp: Str): i64 {
+    var text: i64[1];
+    var context: i64[1];
+    var refused = _agnosai_a2a_admit_message(a, state, id, params, &text, &context);
+    if (refused != 0) { return refused; }
+    var msg = bayan_json_v_obj_get_by_cstr(params, "message");
+    var conf = bayan_json_v_obj_get_by_cstr(params, "configuration");
+    var history = 0 - 1;
+    var now = 0;
+    if (conf != 0 && bayan_json_v_is_obj(conf) == 1) {
+        history = _agnosai_a2a_history_len(conf);
+        var ri = bayan_json_v_obj_get_by_cstr(conf, "returnImmediately");
+        if (ri != 0 && bayan_json_v_is_bool(ri) == 1 && bayan_json_v_bool(ri) == 1) { now = 1; }
+    }
+
+    var o = agnosai_app_state_orchestrator(state);
+    var hold: i64[1];
+    var spec = _agnosai_a2a_crew_a(a, state, msg, load64(&text), load64(&context), tp, &hold);
+    var crew_id = str_clone_a(a, agnosai_crew_id(spec));
+
+    var err: i64[1];
+    store64(&err, 0);
+    var st = 0;
+    if (now == 1) {
+        if (agnosai_orchestrator_submit_crew_err(o, spec, &err) != 0) {
+            st = agnosai_orchestrator_crew(o, agnosai_crew_id(spec));
+        }
+    } else {
+        st = agnosai_orchestrator_run_crew_err(o, spec, &err);
+    }
+    var task = 0;
+    if (st == 0) {
+        var why = str_from_a(a, "the crew was not admitted");
+        if (load64(&err) != 0) { why = str_clone_a(a, agnosai_error_message(load64(&err))); }
+        task = _agnosai_a2a_rejected_a(a, crew_id, str_clone_a(a, load64(&context)), why);
+    } else {
+        task = _agnosai_a2a_task_a(a, st, spec, history, 1);
+    }
+    agnosai_orchestrator_let_go(o, load64(&hold));
+    var r = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, r, AGN_JK_A2A_TASK, task);
+    return agnosai_route_json_a(a, HTTP_OK, _agnosai_a2a_success(a, id, r));
+}
+
+# --- GetTask, CancelTask, ListTasks ---------------------------------------
+
+# The task `params.id` names, held: its state through the return, its hold through `out_hold`, or a
+# route answer refusing it through `out_refused`.
+fn _agnosai_a2a_task_param(a, state, id, params, out_hold, out_refused): i64 {
+    store64(out_refused, 0);
+    store64(out_hold, 0);
+    if (params == 0 || bayan_json_v_is_obj(params) == 0) {
+        store64(out_refused, _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_PARAMS, "params is an object"));
+        return 0;
+    }
+    var tid = _agnosai_a2a_opt_id(params, "id");
+    if (tid == 0 || tid == 0 - 1) {
+        store64(out_refused, _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_PARAMS, "id is a non-empty string"));
+        return 0;
+    }
+    var st = _agnosai_a2a_hold_task(a, state, tid, out_hold);
+    if (st == 0) { store64(out_refused, _agnosai_a2a_fail(a, id, AGNOSAI_A2A_TASK_NOT_FOUND, "task not found")); }
+    return st;
+}
+
+# `GetTask`: the task, with as much of its history as `historyLength` asks.
+fn _agnosai_a2a_get(a, state, id, params): i64 {
+    var hold: i64[1];
+    var refused: i64[1];
+    var st = _agnosai_a2a_task_param(a, state, id, params, &hold, &refused);
+    if (st == 0) { return load64(&refused); }
+    var history = _agnosai_a2a_history_len(params);
+    if (history == 0 - 2) {
+        agnosai_orchestrator_let_go(agnosai_app_state_orchestrator(state), load64(&hold));
+        return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_PARAMS, "historyLength is a non-negative integer");
+    }
+    var t = _agnosai_a2a_task_a(a, st, load64(&hold), history, 1);
+    agnosai_orchestrator_let_go(agnosai_app_state_orchestrator(state), load64(&hold));
+    return agnosai_route_json_a(a, HTTP_OK, _agnosai_a2a_success(a, id, t));
+}
+
+# `CancelTask`: the crew is cancelled, and the answer is the task as that leaves it. A task that has
+# ended is not cancelable, as a finished crew is left as it finished (ADR 022).
+fn _agnosai_a2a_cancel(a, state, id, params): i64 {
+    var hold: i64[1];
+    var refused: i64[1];
+    var st = _agnosai_a2a_task_param(a, state, id, params, &hold, &refused);
+    if (st == 0) { return load64(&refused); }
+    var o = agnosai_app_state_orchestrator(state);
+    var key = str_clone_a(a, agnosai_crew_state_crew_id(st));
+    if (_agnosai_a2a_terminal(agnosai_crew_state_status(st)) == 1 || agnosai_orchestrator_cancel_crew(o, key) != 0) {
+        agnosai_orchestrator_let_go(o, load64(&hold));
+        return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_TASK_NOT_CANCELABLE, "the task has ended");
+    }
+    var t = _agnosai_a2a_task_a(a, st, load64(&hold), 0 - 1, 1);
+    agnosai_orchestrator_let_go(o, load64(&hold));
+    return agnosai_route_json_a(a, HTTP_OK, _agnosai_a2a_success(a, id, t));
+}
+
+# The crew status a `TaskState` filter names, or -1 for one no crew is in, and -2 for one that is not
+# a state.
+fn _agnosai_a2a_status_filter(s: Str): i64 {
+    if (str_eq_cstr(s, "TASK_STATE_SUBMITTED") == 1) { return AGNOSAI_CREW_PENDING; }
+    if (str_eq_cstr(s, "TASK_STATE_WORKING") == 1) { return AGNOSAI_CREW_RUNNING; }
+    if (str_eq_cstr(s, "TASK_STATE_COMPLETED") == 1) { return AGNOSAI_CREW_COMPLETED; }
+    if (str_eq_cstr(s, "TASK_STATE_FAILED") == 1) { return AGNOSAI_CREW_FAILED; }
+    if (str_eq_cstr(s, "TASK_STATE_CANCELED") == 1) { return AGNOSAI_CREW_CANCELLED; }
+    if (str_eq_cstr(s, "TASK_STATE_REJECTED") == 1 || str_eq_cstr(s, "TASK_STATE_INPUT_REQUIRED") == 1
+      || str_eq_cstr(s, "TASK_STATE_AUTH_REQUIRED") == 1) {
+        return 0 - 1;
+    }
+    return 0 - 2;
+}
+
+# 1 when crew status `cs` is in the state filter `want`: WORKING takes a crew awaiting a reviewer too.
+fn _agnosai_a2a_status_in(cs, want): i64 {
+    if (want == AGNOSAI_CREW_RUNNING) { return cs == AGNOSAI_CREW_RUNNING || cs == AGNOSAI_CREW_AWAITING_APPROVAL; }
+    return cs == want;
+}
+
+# A decimal page token, its offset, or -1 when it is not one.
+fn _agnosai_a2a_token_offset(s: Str): i64 {
+    var n = str_len(s);
+    if (n == 0) { return 0; }
+    if (n > 9) { return 0 - 1; }
+    var v = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var c = load8(str_data(s) + i);
+        if (c < 48 || c > 57) { return 0 - 1; }
+        v = v * 10 + (c - 48);
+    }
+    return v;
+}
+
+# `ListTasks`: the tasks this endpoint started that the registry holds, by id, filtered by context
+# and state, a page at a time. A page token is the offset of the page's first task.
+fn _agnosai_a2a_list(a, state, id, params): i64 {
+    if (params != 0 && bayan_json_v_is_null(params) == 0 && bayan_json_v_is_obj(params) == 0) {
+        return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_PARAMS, "params is an object");
+    }
+    var want_ctx = 0;
+    var want_status = 0 - 3;
+    var size = AGNOSAI_A2A_PAGE_DEFAULT;
+    var offset = 0;
+    var history = 0 - 1;
+    var artifacts = 0;
+    if (params != 0 && bayan_json_v_is_obj(params) == 1) {
+        want_ctx = _agnosai_a2a_opt_id(params, "contextId");
+        if (want_ctx == 0 - 1) { return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_PARAMS, "contextId is a string"); }
+        var sv = bayan_json_v_obj_get_by_cstr(params, "status");
+        if (sv != 0 && bayan_json_v_is_null(sv) == 0) {
+            if (bayan_json_v_is_str(sv) == 0 || _agnosai_a2a_status_filter(bayan_json_v_str(sv)) == 0 - 2) {
+                return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_PARAMS, "status is a TaskState");
+            }
+            want_status = _agnosai_a2a_status_filter(bayan_json_v_str(sv));
+        }
+        var pv = bayan_json_v_obj_get_by_cstr(params, "pageSize");
+        if (pv != 0 && bayan_json_v_is_null(pv) == 0) {
+            if (bayan_json_v_is_int(pv) == 0 || bayan_json_v_int(pv) < 1
+              || bayan_json_v_int(pv) > AGNOSAI_A2A_PAGE_MAX) {
+                return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_PARAMS, "pageSize is 1 to 100");
+            }
+            size = bayan_json_v_int(pv);
+        }
+        var tv = bayan_json_v_obj_get_by_cstr(params, "pageToken");
+        if (tv != 0 && bayan_json_v_is_null(tv) == 0) {
+            if (bayan_json_v_is_str(tv) == 0) { return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_PARAMS,
+                  "invalid pageToken"); }
+            offset = _agnosai_a2a_token_offset(bayan_json_v_str(tv));
+            if (offset < 0) { return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_PARAMS, "invalid pageToken"); }
+        }
+        history = _agnosai_a2a_history_len(params);
+        if (history == 0 - 2) {
+            return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_PARAMS, "historyLength is a non-negative integer");
+        }
+        var av = bayan_json_v_obj_get_by_cstr(params, "includeArtifacts");
+        if (av != 0 && bayan_json_v_is_bool(av) == 1 && bayan_json_v_bool(av) == 1) { artifacts = 1; }
+        var ts = bayan_json_v_obj_get_by_cstr(params, "statusTimestampAfter");
+        if (ts != 0 && bayan_json_v_is_null(ts) == 0) {
+            return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_UNSUPPORTED_OPERATION,
+              "statusTimestampAfter: tasks here carry no status timestamp");
+        }
+    }
+
+    var o = agnosai_app_state_orchestrator(state);
+    var ids = agnosai_orchestrator_crew_ids_a(a, o);
+    # By id: the registry's ids come in its map's order, which moves as it grows, and a page token
+    # is an offset into one order.
+    agnosai_sort(ids, &agnosai_order_str_cmp);
+    var tasks = bayan_json_v_arr_new_a(a);
+    var total = 0;
+    for (var i = 0; i < vec_len(ids); i = i + 1) {
+        var hold: i64[1];
+        var st = _agnosai_a2a_hold_task(a, state, vec_get(ids, i), &hold);
+        if (st != 0) {
+            var hit = 1;
+            if (want_ctx != 0 && str_eq(_agnosai_a2a_context(a, load64(&hold)), want_ctx) == 0) { hit = 0; }
+            if (want_status == 0 - 1) { hit = 0; }
+            if (want_status >= 0 && _agnosai_a2a_status_in(agnosai_crew_state_status(st),
+                want_status) == 0) { hit = 0; }
+            if (hit == 1) {
+                if (total >= offset && total < offset + size) {
+                    bayan_json_v_arr_push_a(a, tasks, _agnosai_a2a_task_a(a, st, load64(&hold), history, artifacts));
+                }
+                total = total + 1;
+            }
+            agnosai_orchestrator_let_go(o, load64(&hold));
+        }
+    }
+    var next = str_from_a(a, "");
+    if (offset + size < total) {
+        var nb = str_builder_new_a(a);
+        str_builder_add_int_a(a, nb, offset + size);
+        next = str_builder_build_a(a, nb);
+    }
+    var r = bayan_json_v_obj_new_a(a);
+    bayan_json_v_obj_set_a(a, r, str_from_a(a, "tasks"), tasks);
+    bayan_json_v_obj_set_a(a, r, str_from_a(a, "nextPageToken"), bayan_json_v_str_new_a(a, next));
+    bayan_json_v_obj_set_a(a, r, str_from_a(a, "pageSize"), bayan_json_v_int_new_a(a, size));
+    bayan_json_v_obj_set_a(a, r, str_from_a(a, "totalSize"), bayan_json_v_int_new_a(a, total));
+    return agnosai_route_json_a(a, HTTP_OK, _agnosai_a2a_success(a, id, r));
+}
+
+# --- the endpoint ---------------------------------------------------------
+
+# 1 when `hv`, an `A2A-Version` value, is a version this endpoint speaks: `1.0`, its patch ignored.
+fn _agnosai_a2a_version_ok(hv): i64 {
+    if (hv == 0) { return 0; }
+    if (streq(hv, AGNOSAI_A2A_PROTOCOL_VERSION) == 1) { return 1; }
+    var n = strlen(hv);
+    if (n < 5 || memeq(hv, "1.0.", 4) == 0) { return 0; }
+    for (var i = 4; i < n; i = i + 1) {
+        if (load8(hv + i) < 48 || load8(hv + i) > 57) { return 0; }
+    }
+    return 1;
+}
+
+# `POST /a2a` — an A2A JSON-RPC request, with the request itself, `hdrs`, for its `A2A-Version`.
+#
+# **The version comes first.** A request that names no version is 0.3's, as the spec has it, and one
+# naming another than 1.0 is refused with `VersionNotSupportedError`, which says the one this speaks.
+fn agnosai_route_a2a_rpc_h_a(a, state, body: Str, tp: Str, hdrs): i64 {
+    var v = bayan_json_v_parse_buf_a(a, str_data(body), str_len(body));
+    var id = bayan_json_v_null_a(a);
+    if (v != 0 && bayan_json_v_is_obj(v) == 1) {
+        var iv = bayan_json_v_obj_get_by_cstr(v, "id");
+        if (iv != 0 && (bayan_json_v_is_str(iv) == 1 || bayan_json_v_is_int(iv) == 1)) { id = iv; }
+    }
+    var hv = agnosai_http_header_a(a, hdrs, "A2A-Version");
+    if (_agnosai_a2a_version_ok(hv) == 0) {
+        var sb = str_builder_new_a(a);
+        str_builder_add_cstr_a(a, sb, "A2A version ");
+        if (hv == 0 || strlen(hv) == 0) { str_builder_add_cstr_a(a, sb, "0.3 (no A2A-Version header)"); }
+        else { str_builder_add_cstr_a(a, sb, hv); }
+        str_builder_add_cstr_a(a, sb, " is not supported; this agent speaks ");
+        str_builder_add_cstr_a(a, sb, AGNOSAI_A2A_PROTOCOL_VERSION);
+        return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_VERSION_NOT_SUPPORTED, str_data(str_builder_build_a(a, sb)));
+    }
+    if (v == 0) { return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_PARSE_ERROR, "Parse error"); }
+    if (bayan_json_v_is_obj(v) == 0) { return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_REQUEST,
+          "Invalid Request"); }
+    var ver_v = bayan_json_v_obj_get_by_cstr(v, "jsonrpc");
+    var method_v = bayan_json_v_obj_get_by_cstr(v, "method");
+    if (ver_v == 0 || bayan_json_v_is_str(ver_v) == 0 || str_eq_cstr(bayan_json_v_str(ver_v), "2.0") == 0
+      || method_v == 0 || bayan_json_v_is_str(method_v) == 0) {
+        return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_REQUEST, "Invalid Request");
+    }
+    # Every A2A method is a request, so one without an id is not one this endpoint can answer.
+    if (bayan_json_v_obj_get_by_cstr(v, "id") == 0 || bayan_json_v_is_null(id) == 1) {
+        return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_INVALID_REQUEST, "Invalid Request: id is a string or a number");
+    }
+    var method = bayan_json_v_str(method_v);
+    var params = bayan_json_v_obj_get_by_cstr(v, "params");
+
+    if (str_eq_cstr(method, "SendMessage") == 1) { return _agnosai_a2a_send(a, state, id, params, tp); }
+    if (str_eq_cstr(method, "GetTask") == 1) { return _agnosai_a2a_get(a, state, id, params); }
+    if (str_eq_cstr(method, "ListTasks") == 1) { return _agnosai_a2a_list(a, state, id, params); }
+    if (str_eq_cstr(method, "CancelTask") == 1) { return _agnosai_a2a_cancel(a, state, id, params); }
+    if (str_eq_cstr(method, "SendStreamingMessage") == 1 || str_eq_cstr(method, "SubscribeToTask") == 1) {
+        return _agnosai_a2a_stream_route(a, state, id, method, params, tp);
+    }
+    if (str_eq_cstr(method, "CreateTaskPushNotificationConfig") == 1
+      || str_eq_cstr(method, "GetTaskPushNotificationConfig") == 1
+      || str_eq_cstr(method, "ListTaskPushNotificationConfigs") == 1
+      || str_eq_cstr(method, "DeleteTaskPushNotificationConfig") == 1) {
+        return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_PUSH_NOT_SUPPORTED, "this agent sends no push notifications");
+    }
+    if (str_eq_cstr(method, "GetExtendedAgentCard") == 1) {
+        return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_UNSUPPORTED_OPERATION, "this agent has no extended card");
+    }
+    return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_METHOD_NOT_FOUND, "Method not found");
+}
+
+# --- SendStreamingMessage, SubscribeToTask --------------------------------
+#
+# A stream is the route's answer, run on the connection (`agnosai_route_stream_a`): `text/event-stream`,
+# each event `data: ` and a JSON-RPC response whose `result` is a `StreamResponse`, as spec §9.4.2 has
+# it. The first is the task; then a `statusUpdate` each time its state moves; then, once it has
+# ended, an `artifactUpdate` for each result and a last `statusUpdate`, and the stream closes. A
+# client that leaves ends the stream, not the task: a task a stream started runs on, as
+# `SendMessage`'s does with `returnImmediately`.
+#
+# **The stream reads the registry, not the bus.** A task's state is its crew's registered state, so
+# the stream polls it, every `AGNOSAI_A2A_POLL_MS` at most, as the crew stream polls its channel, and sends
+# what moved: an event's payload does not carry what a task's artifacts and status need, and a
+# subscription that lags would lose what the registry still holds. Each frame is built in a scratch
+# of its own, reset after it, so a stream as long as its crew costs the heap nothing.
+
+enum AgnosaiA2AStreamOff {
+    AGN_A2S_STATE = 0;     # the app state
+    AGN_A2S_ID = 8;        # the JSON-RPC request's id, a JSON value
+    AGN_A2S_CREW_ID = 16;  # the task's id, a Str
+    AGN_A2S_HOLD = 24;     # the hold on its crew, which the stream lets go
+    AGN_A2S_SPEC = 32;     # for SendStreamingMessage, the crew to start; else 0
+    AGN_A2S_HISTORY = 40;  # how much history the first event carries
+    AGN_A2S_SIZE = 48;
+}
+
+# Scratch for a stream's frames. ⚠ **Built eagerly, at module scope**, as `src/arena_pool.cyr`
+# requires: a lazy one races its first two threads.
+var _AGNOSAI_A2A_STREAM_POOL = agnosai_arena_pool_new(4, 8192);
+
+# How often a stream reads its task's state, in milliseconds, and how long it stays silent before it
+# sends a keep-alive comment, in seconds: the crew stream's 50 ms and 15 s (`server/routes/sse.cyr`).
+# A stream starts at 1 ms and doubles while nothing moves, up to the 50: a task that ends in
+# microseconds is streamed at once, where a fixed 50 ms made every stream last 50 at least, and one
+# that runs for minutes is read 20 times a second, as the crew stream reads its channel.
+var AGNOSAI_A2A_POLL_MS = 50;
+var AGNOSAI_A2A_KEEPALIVE_SECS = 15;
+
+# The headers a stream goes out with: no cache keeps it, and no proxy buffers it.
+var AGNOSAI_A2A_SSE_HEADERS = "Cache-Control: no-cache\r\nX-Accel-Buffering: no\r\n";
+
+fn _agnosai_a2a_stream_job_a(a, state, id, crew_id: Str, hold, spec, history): i64 {
+    var j = alloc_via(a, AGN_A2S_SIZE);
+    store64(j + AGN_A2S_STATE, state);
+    store64(j + AGN_A2S_ID, id);
+    store64(j + AGN_A2S_CREW_ID, crew_id);
+    store64(j + AGN_A2S_HOLD, hold);
+    store64(j + AGN_A2S_SPEC, spec);
+    store64(j + AGN_A2S_HISTORY, history);
+    return j;
+}
+
+# The streaming methods' route: what they refuse, refused, as `SendMessage` and `GetTask` refuse it;
+# else the stream. `SendStreamingMessage` builds the crew here and the stream starts it, once the
+# client has the task. `SubscribeToTask` holds the task, and refuses one that has ended, as the spec
+# says, since its stream would have nothing to say.
+fn _agnosai_a2a_stream_route(a, state, id, method: Str, params, tp: Str): i64 {
+    if (str_eq_cstr(method, "SendStreamingMessage") == 1) {
+        var text: i64[1];
+        var context: i64[1];
+        var refused = _agnosai_a2a_admit_message(a, state, id, params, &text, &context);
+        if (refused != 0) { return refused; }
+        var history = 0 - 1;
+        var conf = bayan_json_v_obj_get_by_cstr(params, "configuration");
+        if (conf != 0 && bayan_json_v_is_obj(conf) == 1) { history = _agnosai_a2a_history_len(conf); }
+        var hold: i64[1];
+        var spec = _agnosai_a2a_crew_a(a, state, bayan_json_v_obj_get_by_cstr(params, "message"),
+          load64(&text), load64(&context), tp, &hold);
+        return agnosai_route_stream_a(a, &_agnosai_a2a_stream_run,
+          _agnosai_a2a_stream_job_a(a, state, id, str_clone_a(a, agnosai_crew_id(spec)), load64(&hold), spec, history));
+    }
+    var th: i64[1];
+    var tr: i64[1];
+    var st = _agnosai_a2a_task_param(a, state, id, params, &th, &tr);
+    if (st == 0) { return load64(&tr); }
+    if (_agnosai_a2a_terminal(agnosai_crew_state_status(st)) == 1) {
+        agnosai_orchestrator_let_go(agnosai_app_state_orchestrator(state), load64(&th));
+        return _agnosai_a2a_fail(a, id, AGNOSAI_A2A_UNSUPPORTED_OPERATION, "the task has ended");
+    }
+    return agnosai_route_stream_a(a, &_agnosai_a2a_stream_run,
+      _agnosai_a2a_stream_job_a(a, state, id, str_clone_a(a, agnosai_crew_state_crew_id(st)), load64(&th), 0, 0 - 1));
+}
+
+# One event: `data: ` and the JSON-RPC response carrying `kind` (`task`, `statusUpdate` or
+# `artifactUpdate`) as its `StreamResponse`. Below 0 once the client has gone.
+fn _agnosai_a2a_event(sa, cfd, id, kind, value): i64 {
+    var sr = bayan_json_v_obj_new_a(sa);
+    bayan_json_v_obj_set_a(sa, sr, str_from_a(sa, kind), value);
+    var sb = str_builder_new_a(sa);
+    str_builder_add_cstr_a(sa, sb, "data: ");
+    str_builder_add_a(sa, sb, bayan_json_v_build_a(sa, _agnosai_a2a_success(sa, id, sr)));
+    str_builder_add_cstr_a(sa, sb, "\n\n");
+    var f = str_builder_build_a(sa, sb);
+    return sandhi_server_send_chunk(cfd, str_data(f), str_len(f));
+}
+
+# A `TaskStatusUpdateEvent` for the task in crew state `st`.
+fn _agnosai_a2a_status_event_a(sa, st, task_id: Str, context: Str): i64 {
+    var u = bayan_json_v_obj_new_a(sa);
+    bayan_json_v_obj_set_a(sa, u, AGN_JK_A2A_TASK_ID, bayan_json_v_str_new_a(sa, task_id));
+    bayan_json_v_obj_set_a(sa, u, AGN_JK_A2A_CONTEXT_ID, bayan_json_v_str_new_a(sa, context));
+    bayan_json_v_obj_set_a(sa, u, AGN_JK_STATUS, _agnosai_a2a_status_a(sa, st, task_id, context));
+    return u;
+}
+
+# A `TaskArtifactUpdateEvent` for task result `res`: the whole artifact, in one chunk.
+fn _agnosai_a2a_artifact_event_a(sa, res, task_id: Str, context: Str): i64 {
+    var u = bayan_json_v_obj_new_a(sa);
+    bayan_json_v_obj_set_a(sa, u, AGN_JK_A2A_TASK_ID, bayan_json_v_str_new_a(sa, task_id));
+    bayan_json_v_obj_set_a(sa, u, AGN_JK_A2A_CONTEXT_ID, bayan_json_v_str_new_a(sa, context));
+    bayan_json_v_obj_set_a(sa, u, str_from_a(sa, "artifact"), _agnosai_a2a_artifact_a(sa, res));
+    bayan_json_v_obj_set_a(sa, u, str_from_a(sa, "lastChunk"), bayan_json_v_bool_new_a(sa, 1));
+    return u;
+}
+
+# Run a stream `_agnosai_a2a_stream_route` answered with, on `cfd`. Answers 0: the connection is
+# done either way.
+fn _agnosai_a2a_stream_run(job, cfd): i64 {
+    var state = load64(job + AGN_A2S_STATE);
+    var o = agnosai_app_state_orchestrator(state);
+    var id = load64(job + AGN_A2S_ID);
+    var crew_id = load64(job + AGN_A2S_CREW_ID);
+    var hold = load64(job + AGN_A2S_HOLD);
+    var spec = load64(job + AGN_A2S_SPEC);
+    var sa = agnosai_arena_pool_acquire(_AGNOSAI_A2A_STREAM_POOL);
+    if (hold != 0) { spec = hold; }
+    var context = _agnosai_a2a_context(sa, spec);
+    # The context is the crew's, in its arena, which the hold keeps until the stream lets go.
+
+    sandhi_server_send_chunked_start_a(sa, cfd, HTTP_OK, "text/event-stream", AGNOSAI_A2A_SSE_HEADERS);
+    reset_via(sa);
+
+    # The first event is the task: as the registry has it, or for a crew this stream starts, as it is
+    # before it runs.
+    var gone = 0;
+    var st = agnosai_orchestrator_crew(o, crew_id);
+    if (st == 0) { st = agnosai_crew_state_new_a(sa, crew_id, AGNOSAI_CREW_PENDING); }
+    if (_agnosai_a2a_event(sa, cfd, id, "task", _agnosai_a2a_task_a(sa, st, spec, load64(job + AGN_A2S_HISTORY),
+          1)) < 0) {
+        gone = 1;
+    }
+    var last = _agnosai_a2a_state_of(agnosai_crew_state_status(st));
+    reset_via(sa);
+
+    if (load64(job + AGN_A2S_SPEC) != 0) {
+        var err: i64[1];
+        store64(&err, 0);
+        if (agnosai_orchestrator_submit_crew_err(o, load64(job + AGN_A2S_SPEC), &err) == 0) {
+            var why = str_from_a(sa, "the crew was not admitted");
+            if (load64(&err) != 0) { why = agnosai_error_message(load64(&err)); }
+            var rt = _agnosai_a2a_rejected_a(sa, crew_id, context, why);
+            var ru = bayan_json_v_obj_new_a(sa);
+            bayan_json_v_obj_set_a(sa, ru, AGN_JK_A2A_TASK_ID, bayan_json_v_str_new_a(sa, crew_id));
+            bayan_json_v_obj_set_a(sa, ru, AGN_JK_A2A_CONTEXT_ID, bayan_json_v_str_new_a(sa, context));
+            bayan_json_v_obj_set_a(sa, ru, AGN_JK_STATUS, bayan_json_v_obj_get_by_cstr(rt, "status"));
+            if (gone == 0) { _agnosai_a2a_event(sa, cfd, id, "statusUpdate", ru); }
+            gone = 1;
+        }
+    }
+
+    var last_ping = clock_epoch_secs();
+    var pause = 1;
+    while (gone == 0) {
+        reset_via(sa);
+        var cur = agnosai_orchestrator_crew(o, crew_id);
+        # Gone from the registry while streamed: evicted or forgotten, with nothing more to say.
+        if (cur == 0) { break; }
+        var status = agnosai_crew_state_status(cur);
+        if (_agnosai_a2a_terminal(status) == 1) {
+            var results = agnosai_crew_state_results(cur);
+            for (var i = 0; i < vec_len(results) && gone == 0; i = i + 1) {
+                var res = vec_get(results, i);
+                if (agnosai_task_result_status(res) == AGNOSAI_STATUS_COMPLETED) {
+                    if (_agnosai_a2a_event(sa, cfd, id, "artifactUpdate",
+                        _agnosai_a2a_artifact_event_a(sa, res, crew_id, context)) < 0) { gone = 1; }
+                }
+            }
+            if (gone == 0) {
+                _agnosai_a2a_event(sa, cfd, id, "statusUpdate", _agnosai_a2a_status_event_a(sa, cur, crew_id, context));
+            }
+            break;
+        }
+        var now_state = _agnosai_a2a_state_of(status);
+        if (streq(now_state, last) == 0) {
+            if (_agnosai_a2a_event(sa, cfd, id, "statusUpdate", _agnosai_a2a_status_event_a(sa, cur, crew_id,
+                  context)) < 0) {
+                break;
+            }
+            last = now_state;
+            last_ping = clock_epoch_secs();
+            pause = 1;
+        } else {
+            var now = clock_epoch_secs();
+            if (now - last_ping >= AGNOSAI_A2A_KEEPALIVE_SECS) {
+                if (sandhi_server_send_chunk(cfd, ":\n\n", 3) < 0) { break; }
+                last_ping = now;
+            }
+            sleep_ms(pause);
+            pause = pause * 2;
+            if (pause > AGNOSAI_A2A_POLL_MS) { pause = AGNOSAI_A2A_POLL_MS; }
+        }
+    }
+    sandhi_server_send_chunked_end(cfd);
+    agnosai_arena_pool_release(_AGNOSAI_A2A_STREAM_POOL, sa);
+    agnosai_orchestrator_let_go(o, hold);
+    return 0;
+}
+
+# `POST /a2a` with no request: every request names no version, so every one is refused. For a
+# caller that dispatches directly and does not mean to reach the endpoint.
+fn agnosai_route_a2a_rpc_a(a, state, body: Str): i64 {
+    return agnosai_route_a2a_rpc_h_a(a, state, body, 0, 0);
+}

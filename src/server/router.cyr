@@ -82,6 +82,10 @@ enum AgnosaiRouteId {
     AGN_ROUTE_AGENT_PERFORMANCE = 19;
     # `GET /api/v1/crews/{id}/snapshot` (2.5.0, ADR 036). No Rust counterpart.
     AGN_ROUTE_CREW_SNAPSHOT = 20;
+    # A2A v1.0 (2.6.0, ADR 040): `GET /.well-known/agent-card.json` and `POST /a2a`. No Rust
+    # counterpart.
+    AGN_ROUTE_A2A_CARD = 21;
+    AGN_ROUTE_A2A_RPC = 22;
 }
 
 # HTTP methods the table distinguishes.
@@ -484,6 +488,19 @@ fn agnosai_route_resolve_a(a, method, path: Str): i64 {
             return _agnosai_rm_new_a(a, AGN_ROUTE_MCP, 0, 0);
         }
     }
+    # A2A v1.0: the card, public as discovery is, and the JSON-RPC endpoint it names, protected.
+    if (_agnosai_path_matches_at(a, path, 0, "/.well-known/agent-card.json", param) == 1) {
+        seen = seen | AGN_ALLOW_GET;
+        if (method == AGNOSAI_METHOD_GET) {
+            return _agnosai_rm_new_a(a, AGN_ROUTE_A2A_CARD, 0, 0);
+        }
+    }
+    if (_agnosai_path_matches_at(a, path, 0, "/a2a", param) == 1) {
+        seen = seen | AGN_ALLOW_POST;
+        if (method == AGNOSAI_METHOD_POST) {
+            return _agnosai_rm_new_a(a, AGN_ROUTE_A2A_RPC, 0, 0);
+        }
+    }
 
     if (seen != 0) { return _agnosai_rm_mismatch_a(a, seen); }
     return _agnosai_rm_new_a(a, AGN_ROUTE_NONE, 0, 0);
@@ -512,6 +529,7 @@ fn agnosai_route_needs_auth(id): i64 {
     if (id == AGN_ROUTE_HEALTH) { return 0; }
     if (id == AGN_ROUTE_READY) { return 0; }
     if (id == AGN_ROUTE_METRICS) { return 0; }
+    if (id == AGN_ROUTE_A2A_CARD) { return 0; }
     if (id == AGN_ROUTE_NONE) { return 0; }
     return 1;
 }
@@ -549,13 +567,13 @@ fn agnosai_route_needs_auth(id): i64 {
 fn agnosai_route_dispatch_a(a, state, method, path: Str, auth_header: Str, has_auth,
   body: Str): i64 {
     return _agnosai_route_dispatch_inner(a, state, method, path, auth_header, has_auth, body, 1,
-      0);
+      0, 0);
 }
 
 # Global-allocator form of `agnosai_route_dispatch_a`.
 fn agnosai_route_dispatch(state, method, path: Str, auth_header: Str, has_auth, body: Str): i64 {
     return _agnosai_route_dispatch_inner(0, state, method, path, auth_header, has_auth, body, 1,
-      0);
+      0, 0);
 }
 
 # Dispatch with the request's `Content-Type` verdict: `json_ct` is 1 when it
@@ -564,11 +582,11 @@ fn agnosai_route_dispatch(state, method, path: Str, auth_header: Str, has_auth, 
 fn agnosai_route_dispatch_ct_a(a, state, method, path: Str, auth_header: Str, has_auth,
   body: Str, json_ct): i64 {
     return _agnosai_route_dispatch_inner(a, state, method, path, auth_header, has_auth, body,
-      json_ct, 0);
+      json_ct, 0, 0);
 }
 
 # `agnosai_route_dispatch_ct_a` plus the request's `traceparent` header, or 0
-# when it carried none (ADR 023). The transport calls this one.
+# when it carried none (ADR 023).
 #
 # Three routes start traced work and hand it on: `POST /api/v1/crews`,
 # `POST /api/v1/a2a/receive` and `/mcp`'s `tools/call`. Every other route
@@ -577,7 +595,18 @@ fn agnosai_route_dispatch_ct_a(a, state, method, path: Str, auth_header: Str, ha
 fn agnosai_route_dispatch_tp_a(a, state, method, path: Str, auth_header: Str, has_auth,
   body: Str, json_ct, traceparent: Str): i64 {
     return _agnosai_route_dispatch_inner(a, state, method, path, auth_header, has_auth, body,
-      json_ct, traceparent);
+      json_ct, traceparent, 0);
+}
+
+# `agnosai_route_dispatch_tp_a` plus the request itself, `hdrs`, a view `agnosai_http_headers_init`
+# made, or 0 (2.6.0). The transport calls this one. The routes that read headers of their own read
+# them from it: `/mcp` the MCP 2026-07-28 ones it compares with the body, and A2A its version and the
+# host its card names. With 0, every lookup answers absent, which is what a caller that dispatches
+# directly has always had.
+fn agnosai_route_dispatch_h_a(a, state, method, path: Str, auth_header: Str, has_auth,
+  body: Str, json_ct, traceparent: Str, hdrs): i64 {
+    return _agnosai_route_dispatch_inner(a, state, method, path, auth_header, has_auth, body,
+      json_ct, traceparent, hdrs);
 }
 
 # The routes whose handler parses a JSON request body.
@@ -586,11 +615,12 @@ fn _agnosai_route_takes_json(id): i64 {
         return 1;
     }
     if (id == AGN_ROUTE_CREATE_DEFINITION || id == AGN_ROUTE_SUBMIT_APPROVAL) { return 1; }
+    if (id == AGN_ROUTE_A2A_RPC) { return 1; }
     return 0;
 }
 
 fn _agnosai_route_dispatch_inner(a, state, method, path: Str, auth_header: Str, has_auth,
-  body: Str, json_ct, tp: Str): i64 {
+  body: Str, json_ct, tp: Str, hdrs): i64 {
     # `a` of 0 means "no per-request arena" and every allocation below falls
     # back to the global bump — the un-threaded caller's path, kept working
     # rather than made a special case at each site.
@@ -632,7 +662,7 @@ fn _agnosai_route_dispatch_inner(a, state, method, path: Str, auth_header: Str, 
     if (id == AGN_ROUTE_METRICS) { return agnosai_route_metrics(); }
     # The three traced routes take `al`, which is `default_alloc()` when there
     # is no request arena — exactly what each bare form passes its `_a` form.
-    if (id == AGN_ROUTE_MCP) { return agnosai_route_mcp_tp_a(al, state, body, tp); }
+    if (id == AGN_ROUTE_MCP) { return agnosai_route_mcp_h_a(al, state, body, tp, hdrs); }
     if (id == AGN_ROUTE_CREATE_CREW) {
         return agnosai_route_create_crew_tp_a(al, state, body, tp);
     }
@@ -646,6 +676,8 @@ fn _agnosai_route_dispatch_inner(a, state, method, path: Str, auth_header: Str, 
         return agnosai_route_a2a_receive_tp_a(al, state, body, tp);
     }
     if (id == AGN_ROUTE_A2A_STATUS) { return agnosai_route_a2a_status(); }
+    if (id == AGN_ROUTE_A2A_CARD) { return agnosai_route_a2a_card_a(al, state, hdrs); }
+    if (id == AGN_ROUTE_A2A_RPC) { return agnosai_route_a2a_rpc_h_a(al, state, body, tp, hdrs); }
     if (id == AGN_ROUTE_LIST_DEFINITIONS) {
         if (a != 0) { return agnosai_route_list_definitions_a(a, state); }
         return agnosai_route_list_definitions(state);

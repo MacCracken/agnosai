@@ -1,0 +1,480 @@
+# =========================================================================
+# server_routes_mcp_2026 — `/mcp` under MCP 2026-07-28 (2.6.0, ADR 039).
+#
+# The revision with no `initialize`: every request names its revision in its
+# `_meta` and in `MCP-Protocol-Version`, carries the client's capabilities, and
+# says its method and the name it acts on in `Mcp-Method` and `Mcp-Name`, which
+# the endpoint compares with the body. `server_routes_mcp.tcyr` pins the earlier
+# revision, which a request with no header still gets, byte for byte.
+#
+# Stdlib is auto-prepended from cyrius.cyml — do NOT include stdlib modules.
+# =========================================================================
+
+include "src/units.cyr"
+include "src/arena_pool.cyr"
+include "src/order.cyr"
+include "src/id.cyr"
+# strcase — `prompt_guard`, `cost_planning` and `definitions/assembler` all
+# fold ASCII case; the shared helpers live here (extracted at the third use).
+include "src/strcase.cyr"
+# telemetry — `tools/native` and `orchestrator/crew_runner` record GenAI
+# spans (ADR 017), so every suite that reaches them needs the module that
+# defines the recorder. It depends on nothing in `src/` except `id`.
+include "src/telemetry/mod.cyr"
+include "src/core/mod.cyr"
+include "src/definitions/mod.cyr"
+include "src/learning/mod.cyr"
+include "src/llm/mod.cyr"
+include "src/server/ssrf.cyr"
+include "src/server/prompt_guard.cyr"
+include "src/server/output_filter.cyr"
+include "src/server/prometheus.cyr"
+include "src/server/auth.cyr"
+include "src/guarded_fetch.cyr"
+include "src/chan_lossy.cyr"
+include "src/server/sse.cyr"
+include "src/sandbox/mod.cyr"
+include "src/tools/mod.cyr"
+include "src/orchestrator/mod.cyr"
+include "src/server/state.cyr"
+include "src/server/routes/mod.cyr"
+include "src/server/routes/health.cyr"
+include "src/server/routes/tools.cyr"
+include "src/server/routes/definitions.cyr"
+include "src/server/routes/agents.cyr"
+include "src/server/routes/approval.cyr"
+include "src/server/routes/dashboard.cyr"
+include "src/server/routes/crews.cyr"
+include "src/server/routes/a2a.cyr"
+include "src/server/routes/mcp.cyr"
+include "src/a2a_v1.cyr"
+include "src/server/hot_config.cyr"
+include "src/server/rate_limit.cyr"
+include "src/server/router.cyr"
+include "tests/test_helpers.cyr"
+include "tests/test_log.cyr"
+
+fn _t_state(): i64 {
+    var reg = agnosai_tool_registry_new();
+    agnosai_tool_registry_register(reg, agnosai_echo_tool());
+    var s = agnosai_app_state_new(agnosai_orchestrator_new(0), reg,
+      agnosai_auth_config_new(), agnosai_event_bus_new(),
+      agnosai_audit_chain_new(), agnosai_approval_gate_new());
+    agnosai_app_state_definition_insert(s, str_from("researcher"),
+      agnosai_agent_new(str_from("researcher"), str_from("finds things"), str_from("research")));
+    return s;
+}
+
+# A 2026-07-28 body: `method`, `params` holding `extra` (empty, or fields ending in a comma), and the
+# `_meta` every request carries. `id` is a JSON literal, or 0 for none.
+fn _t_body(method, extra, id): Str {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "{\"jsonrpc\":\"2.0\",");
+    if (id != 0) {
+        str_builder_add_cstr(sb, "\"id\":");
+        str_builder_add_cstr(sb, id);
+        str_builder_add_cstr(sb, ",");
+    }
+    str_builder_add_cstr(sb, "\"method\":\"");
+    str_builder_add_cstr(sb, method);
+    str_builder_add_cstr(sb, "\",\"params\":{");
+    str_builder_add_cstr(sb, extra);
+    str_builder_add_cstr(sb, "\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",");
+    str_builder_add_cstr(sb, "\"io.modelcontextprotocol/clientCapabilities\":{}}}}");
+    return str_builder_build(sb);
+}
+
+# The request as it arrives: the request line, `headers` (each line ending CRLF), and `body`.
+fn _t_hdrs(headers, body: Str): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "POST /mcp HTTP/1.1\r\nHost: agnosai.test\r\n");
+    str_builder_add_cstr(sb, headers);
+    str_builder_add_cstr(sb, "\r\n");
+    str_builder_add(sb, body);
+    return agnosai_http_headers_of_a(default_alloc(), str_builder_build(sb));
+}
+
+# The headers a conforming client sends for `method`, and `Mcp-Name: name` when `name` is not 0.
+fn _t_std(method, name): i64 {
+    var sb = str_builder_new();
+    str_builder_add_cstr(sb, "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: ");
+    str_builder_add_cstr(sb, method);
+    str_builder_add_cstr(sb, "\r\n");
+    if (name != 0) {
+        str_builder_add_cstr(sb, "Mcp-Name: ");
+        str_builder_add_cstr(sb, name);
+        str_builder_add_cstr(sb, "\r\n");
+    }
+    return str_cstr(str_builder_build(sb));
+}
+
+fn _t_send(s, body: Str, headers): i64 {
+    return agnosai_route_mcp_h_a(default_alloc(), s, body, 0, _t_hdrs(headers, body));
+}
+
+fn _t_obj(v, key): i64 { return bayan_json_v_obj_get_by_cstr(v, key); }
+
+fn _t_str_is(v, key, want): i64 {
+    var x = _t_obj(v, key);
+    if (x == 0 || bayan_json_v_is_str(x) == 0) { return 0; }
+    return str_eq_cstr(bayan_json_v_str(x), want);
+}
+
+fn _t_code(r): i64 {
+    var e = _t_obj(agnosai_route_body(r), "error");
+    if (e == 0) { return 0; }
+    return bayan_json_v_int(_t_obj(e, "code"));
+}
+
+fn _t_msg_is(r, want): i64 {
+    return _t_str_is(_t_obj(agnosai_route_body(r), "error"), "message", want);
+}
+
+# `_t_msg_is` against `p1` and `p2` together, for a message too long for one line.
+fn _t_msg_cat(r, p1, p2): i64 {
+    return _t_msg_is(r, str_cstr(str_cat(str_from(p1), str_from(p2))));
+}
+
+fn _t_result(r): i64 { return _t_obj(agnosai_route_body(r), "result"); }
+
+# --- the request view ------------------------------------------------------
+
+fn _t_headers_suite(): i64 {
+    var a = default_alloc();
+    var h = agnosai_http_headers_of_a(a, str_from(
+        "POST /mcp HTTP/1.1\r\nmcp-method:  tools/list \t\r\nX-Two: a\r\nX-Two: b\r\nX-Bad: a\x01b\r\n\r\n{}"));
+    assert(streq(agnosai_http_header_a(a, h, "Mcp-Method"), "tools/list") == 1,
+      "a header is found whatever its case, without the spaces and tabs around its value");
+    assert_eq(agnosai_http_header_a(a, h, "Mcp-Name"), 0, "an absent one is 0");
+    assert_eq(agnosai_http_header_lines(h, "x-two"), 2, "a field on two lines is counted twice");
+    var two_lines: i64[1];
+    assert(streq(agnosai_http_header_once_a(a, h, "X-Two", &two_lines), "a") == 1,
+      "and the first line's value is its value");
+    assert_eq(load64(&two_lines), 2, "with the count from the same pass");
+    var cr = agnosai_http_headers_of_a(a, str_from("GET / HTTP/1.1\r\nX-Cr: v \r\n\r\n"));
+    assert(streq(agnosai_http_header_a(a, cr, "X-Cr"), "v") == 1,
+      "a value ends before its line's CR and the space before it");
+    assert_eq(agnosai_http_header_lines(h, "Mcp-Method"), 1, "and one on one line once");
+    assert_eq(agnosai_http_header_lines(h, "{}"), 0, "the body is not a header line");
+    assert_eq(agnosai_http_header_value_ok(agnosai_http_header_a(a, h, "X-Bad")), 0,
+      "a value with a control byte is not a field value");
+    assert_eq(agnosai_http_header_value_ok("tools/call\tx"), 1, "a tab is");
+    assert_eq(agnosai_http_header_value_ok("a\x1fb"), 0, "a unit separator is not");
+    assert_eq(agnosai_http_header_value_ok("a\x7fb"), 0, "nor is DEL");
+    assert_eq(agnosai_http_header_value_ok("a\xc3\xa9"), 0,
+      "nor a byte past ASCII, which a field value names as obs-text");
+    assert_eq(agnosai_http_header_a(a, 0, "Mcp-Method"), 0, "with no request, every header is absent");
+    assert_eq(agnosai_http_header_lines(0, "Mcp-Method"), 0, "and on no line");
+    var inbody = agnosai_http_headers_of_a(a, str_from("POST / HTTP/1.1\r\nHost: x\r\n\r\nMcp-Method: evil\r\n"));
+    assert_eq(agnosai_http_header_a(a, inbody, "Mcp-Method"), 0, "a line in the body is no header");
+    assert_eq(agnosai_http_header_lines(inbody, "Mcp-Method"), 0, "and is not counted as one");
+    var raw = "GET / HTTP/1.1\r\nX-A: 1\r\n\r\n";
+    var hv[24];
+    assert(streq(agnosai_http_header_a(a, agnosai_http_headers_init(&hv, raw, strlen(raw)), "X-A"), "1") == 1,
+      "a view on the stack reads as one in an arena");
+    assert(streq(agnosai_http_header_a(a, agnosai_http_headers_new_a(a, raw, strlen(raw)), "x-a"), "1") == 1,
+      "and so does one over a buffer and its length");
+    var line = agnosai_http_headers_of_a(a, str_from("Mcp-Method: x\r\n\r\n"));
+    assert_eq(agnosai_http_header_lines(line, "Mcp-Method"), 0, "the request line is never a header");
+    return 0;
+}
+
+# --- server/discover ---------------------------------------------------------
+
+fn _t_discover_suite(): i64 {
+    var s = _t_state();
+    var r = _t_send(s, _t_body("server/discover", "", "1"), _t_std("server/discover", 0));
+    assert_eq(agnosai_route_status(r), HTTP_OK, "server/discover answers 200");
+    var res = _t_result(r);
+    assert(_t_str_is(res, "resultType", "complete") == 1, "every result says it is complete");
+    var vs = _t_obj(res, "supportedVersions");
+    assert_eq(bayan_json_v_arr_len(vs), 2, "it names the two revisions the endpoint speaks");
+    assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_arr_get(vs, 0)), "2026-07-28") == 1, "the newest first");
+    assert(str_eq_cstr(bayan_json_v_str(bayan_json_v_arr_get(vs, 1)), "2025-03-26") == 1, "then the earlier");
+    var caps = _t_obj(res, "capabilities");
+    assert(_t_obj(caps, "tools") != 0 && _t_obj(caps, "prompts") != 0 && _t_obj(caps, "resources") != 0,
+      "what it can do: tools, prompts and resources");
+    assert_eq(_t_obj(_t_obj(caps, "resources"), "subscribe"), 0, "and no subscribe, which nothing answers (ADR 015)");
+    assert_eq(bayan_json_v_int(_t_obj(res, "ttlMs")), AGNOSAI_MCP_DISCOVER_TTL_MS, "how long it may be kept");
+    assert(_t_str_is(res, "cacheScope", "private") == 1, "by the client alone");
+    var info = _t_obj(_t_obj(res, "_meta"), "io.modelcontextprotocol/serverInfo");
+    assert(_t_str_is(info, "name", "agnosai") == 1, "who it is, in _meta");
+    assert(_t_str_is(info, "version", AGNOSAI_VERSION) == 1, "at its version");
+    assert_eq(_t_obj(res, "protocolVersion"), 0, "and no initialize-era protocolVersion");
+    return 0;
+}
+
+# --- the methods, under this revision ----------------------------------------
+
+fn _t_methods_suite(): i64 {
+    var s = _t_state();
+    var tl = _t_result(_t_send(s, _t_body("tools/list", "", "2"), _t_std("tools/list", 0)));
+    assert(_t_str_is(tl, "resultType", "complete") == 1, "tools/list is complete");
+    assert_eq(bayan_json_v_int(_t_obj(tl, "ttlMs")), 0, "and kept by no one, as a new tool is not announced");
+    assert(_t_str_is(tl, "cacheScope", "private") == 1, "with a scope, as every cacheable result has");
+    assert_eq(bayan_json_v_arr_len(_t_obj(tl, "tools")), 1, "listing the echo tool");
+    assert(_t_obj(_t_obj(tl, "_meta"), "io.modelcontextprotocol/serverInfo") != 0, "and who answered");
+
+    var call = _t_send(s, _t_body("tools/call", "\"name\":\"echo\",\"arguments\":{\"message\":\"hi\"},", "3"),
+      _t_std("tools/call", "echo"));
+    assert_eq(agnosai_route_status(call), HTTP_OK, "a tools/call names its tool in Mcp-Name, and runs");
+    var cr = _t_result(call);
+    assert(_t_str_is(cr, "resultType", "complete") == 1, "its result is complete");
+    assert_eq(bayan_json_v_bool(_t_obj(cr, "isError")), 0, "and not an error");
+    assert_eq(_t_obj(cr, "ttlMs"), 0, "and carries no caching hints, as a call is not cacheable");
+
+    var unk = _t_send(s, _t_body("tools/call", "\"name\":\"nope\",", "4"), _t_std("tools/call", "nope"));
+    assert_eq(_t_code(unk), AGNOSAI_MCP_INVALID_PARAMS,
+      "an unknown tool is a protocol error in this revision, -32602, where the earlier one answered isError");
+    assert_eq(agnosai_route_status(unk), HTTP_OK, "in band, on a 200");
+
+    var pl = _t_result(_t_send(s, _t_body("prompts/list", "", "5"), _t_std("prompts/list", 0)));
+    assert_eq(bayan_json_v_int(_t_obj(pl, "ttlMs")), 0, "prompts/list is cacheable, for no time");
+    var pg = _t_result(_t_send(s, _t_body("prompts/get", "\"name\":\"researcher\",", "6"),
+        _t_std("prompts/get", "researcher")));
+    assert(_t_str_is(pg, "resultType", "complete") == 1, "prompts/get is complete");
+    assert_eq(_t_obj(pg, "ttlMs"), 0, "and not cacheable");
+    assert_eq(bayan_json_v_arr_len(_t_obj(pg, "messages")), 1, "carrying the persona");
+
+    var rl = _t_result(_t_send(s, _t_body("resources/list", "", "7"), _t_std("resources/list", 0)));
+    assert(_t_str_is(rl, "cacheScope", "private") == 1, "resources/list carries its scope");
+    var uri = "agnosai://agents/researcher";
+    var rr = _t_result(_t_send(s, _t_body("resources/read", "\"uri\":\"agnosai://agents/researcher\",", "8"),
+        _t_std("resources/read", uri)));
+    assert_eq(bayan_json_v_int(_t_obj(rr, "ttlMs")), 0, "resources/read is cacheable, for no time");
+    assert_eq(bayan_json_v_arr_len(_t_obj(rr, "contents")), 1, "and reads the definition");
+
+    var miss = _t_send(s, _t_body("resources/read", "\"uri\":\"agnosai://agents/nobody\",", "9"),
+      _t_std("resources/read", "agnosai://agents/nobody"));
+    assert_eq(_t_code(miss), AGNOSAI_MCP_INVALID_PARAMS, "a missing resource is -32602");
+    var md = _t_obj(_t_obj(agnosai_route_body(miss), "error"), "data");
+    assert(_t_str_is(md, "uri", "agnosai://agents/nobody") == 1, "naming the uri in its data");
+
+    var cur = _t_send(s, _t_body("tools/list", "\"cursor\":\"page-2\",", "10"), _t_std("tools/list", 0));
+    assert_eq(_t_code(cur), AGNOSAI_MCP_INVALID_PARAMS, "a cursor this endpoint never issued is -32602");
+    var empty = _t_send(s, _t_body("tools/list", "\"cursor\":\"\",", "11"), _t_std("tools/list", 0));
+    assert_eq(_t_code(empty), 0, "and the empty cursor is the first page");
+    return 0;
+}
+
+# --- what the revision refuses ------------------------------------------------
+
+fn _t_refusals_suite(): i64 {
+    var s = _t_state();
+    var body = _t_body("tools/list", "", "1");
+
+    var r = _t_send(s, body, "Mcp-Method: tools/list\r\n");
+    assert_eq(agnosai_route_status(r), HTTP_BAD_REQUEST, "a body naming 2026-07-28 with no version header is 400");
+    assert_eq(_t_code(r), AGNOSAI_MCP_HEADER_MISMATCH, "and -32020");
+    assert(_t_msg_is(r, "missing required header: MCP-Protocol-Version") == 1, "saying which header");
+    assert_eq(bayan_json_v_int(_t_obj(agnosai_route_body(r), "id")), 1, "and echoing the request's id");
+    assert_eq(_t_code(agnosai_route_mcp_tp_a(default_alloc(), s, body, 0)), AGNOSAI_MCP_HEADER_MISMATCH,
+      "as a caller that hands no request has none");
+
+    var un = _t_send(s, body, "MCP-Protocol-Version: 1900-01-01\r\nMcp-Method: tools/list\r\n");
+    assert_eq(agnosai_route_status(un), HTTP_BAD_REQUEST, "a revision the endpoint does not speak is 400");
+    assert_eq(_t_code(un), AGNOSAI_MCP_UNSUPPORTED_VERSION, "and -32022");
+    var ud = _t_obj(_t_obj(agnosai_route_body(un), "error"), "data");
+    assert_eq(bayan_json_v_arr_len(_t_obj(ud, "supported")), 2, "naming the ones it does, to retry with");
+    assert(_t_str_is(ud, "requested", "1900-01-01") == 1, "and the one asked for");
+
+    var mm = _t_send(s, body, "MCP-Protocol-Version: 2025-03-26\r\nMcp-Method: tools/list\r\n");
+    assert_eq(_t_code(mm), AGNOSAI_MCP_HEADER_MISMATCH, "a header naming another revision than the body is -32020");
+    assert(_t_msg_cat(mm, "Header mismatch: MCP-Protocol-Version header value '2025-03-26' ",
+        "does not match body value '2026-07-28'") == 1,
+      "in the spec's words");
+
+    var nm = _t_send(s, body, "MCP-Protocol-Version: 2026-07-28\r\n");
+    assert_eq(agnosai_route_status(nm), HTTP_BAD_REQUEST, "a request without Mcp-Method is 400");
+    assert(_t_msg_is(nm, "missing required header: Mcp-Method") == 1, "missing Mcp-Method");
+    var wm = _t_send(s, body, _t_std("prompts/list", 0));
+    assert(_t_msg_cat(wm, "Header mismatch: Mcp-Method header value 'prompts/list' ",
+        "does not match body value 'tools/list'") == 1,
+      "an Mcp-Method that is not the body's method is refused, quoting both");
+    var two = _t_send(s, body,
+      "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/list\r\nMcp-Method: tools/list\r\n");
+    assert(_t_msg_is(two, "malformed header: Mcp-Method") == 1, "and one on two lines is malformed");
+    var twov = _t_send(s, body, str_cstr(str_cat(str_from("MCP-Protocol-Version: 2026-07-28\r\n"),
+          str_from("MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/list\r\n"))));
+    assert(_t_msg_is(twov, "malformed header: MCP-Protocol-Version") == 1, "so is a version on two lines");
+
+    var cbody = _t_body("tools/call", "\"name\":\"echo\",", "2");
+    var nn = _t_send(s, cbody, _t_std("tools/call", 0));
+    assert(_t_msg_is(nn, "missing required header: Mcp-Name") == 1, "a tools/call without Mcp-Name is refused");
+    var wn = _t_send(s, cbody, _t_std("tools/call", "other"));
+    assert(_t_msg_is(wn, "Header mismatch: Mcp-Name header value 'other' does not match body value 'echo'") == 1,
+      "and one naming another tool, in the spec's words");
+    assert_eq(agnosai_route_status(wn), HTTP_BAD_REQUEST, "with a 400");
+    # "echo" as the sentinel a client sends for a value a header cannot carry plainly.
+    var twoname = _t_send(s, cbody, str_cstr(str_cat(str_from(_t_std("tools/call", "echo")),
+          str_from("Mcp-Name: echo\r\n"))));
+    assert(_t_msg_is(twoname, "malformed header: Mcp-Name") == 1, "an Mcp-Name on two lines is malformed");
+    var b64 = _t_send(s, cbody, _t_std("tools/call", "=?base64?ZWNobw==?="));
+    assert_eq(_t_code(b64), 0, "a Base64 sentinel is decoded before it is compared, and the call runs");
+    var bad64 = _t_send(s, cbody, _t_std("tools/call", "=?base64?ZWNob?="));
+    assert(_t_msg_is(bad64, "Mcp-Name is not valid Base64") == 1, "one that does not decode is refused");
+    var nul64 = _t_send(s, cbody, _t_std("tools/call", "=?base64?AA==?="));
+    assert(_t_msg_is(nul64, "Mcp-Name is not valid Base64") == 1, "and one that decodes to a NUL, which no name holds");
+    var pad64 = _t_send(s, cbody, _t_std("tools/call", "=?base64?ZWNobx==?="));
+    assert(_t_msg_is(pad64, "Mcp-Name is not valid Base64") == 1,
+      "and one that is not canonical, its padding bits set, which no client encodes");
+    var upper = _t_send(s, cbody, _t_std("tools/call", "=?BASE64?ZWNobw==?="));
+    assert(_t_msg_cat(upper, "Header mismatch: Mcp-Name header value '=?BASE64?ZWNobw==?=' ",
+        "does not match body value 'echo'") == 1,
+      "and the markers are case-sensitive, so anything else is a plain value");
+    var rbody = _t_body("resources/read", "\"uri\":\"agnosai://agents/researcher\",", "6");
+    var rn = _t_send(s, rbody, _t_std("resources/read", 0));
+    assert(_t_msg_is(rn, "missing required header: Mcp-Name") == 1, "a resources/read names its uri in Mcp-Name too");
+    var rw = _t_send(s, rbody, _t_std("resources/read", "agnosai://agents/writer"));
+    assert_eq(_t_code(rw), AGNOSAI_MCP_HEADER_MISMATCH, "the uri the body reads");
+    var pn = _t_send(s, _t_body("prompts/get", "\"name\":\"researcher\",", "7"), _t_std("prompts/get", 0));
+    assert(_t_msg_is(pn, "missing required header: Mcp-Name") == 1, "and a prompts/get its prompt's name");
+    var noname = _t_send(s, _t_body("tools/call", "", "3"), _t_std("tools/call", "echo"));
+    assert_eq(_t_code(noname), AGNOSAI_MCP_INVALID_PARAMS, "a body with no name is the method's own -32602");
+
+    var nometa = str_from("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}");
+    var nmr = _t_send(s, nometa, _t_std("tools/list", 0));
+    assert_eq(agnosai_route_status(nmr), HTTP_BAD_REQUEST, "a 2026-07-28 header with no _meta version is 400");
+    assert_eq(_t_code(nmr), AGNOSAI_MCP_INVALID_PARAMS, "and -32602");
+    assert(_t_msg_is(nmr, "_meta needs a string io.modelcontextprotocol/protocolVersion") == 1,
+      "saying which field it lacks");
+    var nocaps = str_cat(str_from("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":"),
+      str_from("{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}"));
+    var ncr = _t_send(s, nocaps, _t_std("tools/list", 0));
+    assert(_t_msg_is(ncr, "_meta needs an object io.modelcontextprotocol/clientCapabilities") == 1,
+      "and so is one with no client capabilities, which every request carries");
+
+    var init = _t_send(s, _t_body("initialize", "", "4"), _t_std("initialize", 0));
+    assert_eq(agnosai_route_status(init), HTTP_NOT_FOUND, "initialize under 2026-07-28 is 404");
+    assert(_t_msg_is(init, "method not found: initialize") == 1, "as the revision has none");
+    var unk = _t_send(s, _t_body("tools/frobnicate", "", "5"), _t_std("tools/frobnicate", 0));
+    assert_eq(agnosai_route_status(unk), HTTP_NOT_FOUND, "an unknown method is 404");
+    assert_eq(_t_code(unk), AGNOSAI_MCP_METHOD_NOT_FOUND, "and -32601");
+
+    var note = _t_send(s, _t_body("notifications/cancelled", "", 0), _t_std("notifications/cancelled", 0));
+    assert_eq(agnosai_route_status(note), AGNOSAI_HTTP_ACCEPTED, "a notification is accepted, 202");
+    assert_eq(agnosai_route_body(note), 0, "and nothing answers it");
+
+    var nullid = _t_send(s, _t_body("tools/list", "", "null"), _t_std("tools/list", 0));
+    assert_eq(agnosai_route_status(nullid), HTTP_BAD_REQUEST, "a null id is not one");
+    assert_eq(_t_code(nullid), AGNOSAI_MCP_INVALID_REQUEST, "-32600");
+
+    var batch = str_cat(str_cat(str_from("["), _t_body("tools/list", "", "1")), str_from("]"));
+    var br = _t_send(s, batch, _t_std("tools/list", 0));
+    assert_eq(agnosai_route_status(br), HTTP_BAD_REQUEST, "a batch naming 2026-07-28 is 400");
+    assert(_t_msg_is(br, "a POST carries one message") == 1, "as a POST carries one message");
+
+    var parse = _t_send(s, str_from("{\"jsonrpc\":"), _t_std("tools/list", 0));
+    assert_eq(agnosai_route_status(parse), HTTP_BAD_REQUEST, "a body that is not JSON, under the header, is 400");
+    assert_eq(_t_code(parse), AGNOSAI_MCP_PARSE_ERROR, "and -32700");
+    return 0;
+}
+
+# --- the earlier revision, on the same endpoint ------------------------------
+
+fn _t_legacy_suite(): i64 {
+    var s = _t_state();
+    var init = str_from("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}");
+    var r = _t_send(s, init, "");
+    assert_eq(agnosai_route_status(r), HTTP_OK, "a request with no version header is served as before");
+    assert(_t_str_is(_t_result(r), "protocolVersion", "2025-03-26") == 1, "initialize, at 2025-03-26");
+    var r2 = _t_send(s, str_from("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}"),
+      "MCP-Protocol-Version: 2025-03-26\r\n");
+    var tl = _t_result(r2);
+    assert(_t_obj(tl, "tools") != 0, "and so is one naming 2025-03-26");
+    assert_eq(_t_obj(tl, "resultType"), 0, "with the earlier wire: no resultType");
+    assert_eq(_t_obj(tl, "ttlMs"), 0, "and no caching hints");
+    var unk = _t_send(s,
+      str_from("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"nope\"}}"),
+      "MCP-Protocol-Version: 2025-03-26\r\n");
+    assert_eq(_t_code(unk), 0, "where an unknown tool is still a success");
+    assert_eq(bayan_json_v_bool(_t_obj(_t_result(unk), "isError")), 1, "carrying isError");
+    var disc = _t_send(s, str_from("{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"server/discover\"}"), "");
+    assert_eq(_t_code(disc), AGNOSAI_MCP_METHOD_NOT_FOUND, "and server/discover is the newer revision's alone");
+    assert_eq(agnosai_route_status(disc), HTTP_OK, "on the earlier one's 200");
+    return 0;
+}
+
+# --- through the router, as the binary dispatches it --------------------------
+
+fn _t_router_suite(): i64 {
+    var s = _t_state();
+    var body = _t_body("server/discover", "", "1");
+    var h = _t_hdrs(_t_std("server/discover", 0), body);
+    var r = agnosai_route_dispatch_h_a(default_alloc(), s, AGNOSAI_METHOD_POST, str_from("/mcp"),
+      str_from(""), 0, body, 1, 0, h);
+    assert_eq(agnosai_route_status(r), HTTP_OK, "the router hands /mcp the request's headers");
+    assert(_t_obj(_t_result(r), "supportedVersions") != 0, "so a 2026-07-28 request is served under it");
+    var bare = agnosai_route_dispatch_tp_a(default_alloc(), s, AGNOSAI_METHOD_POST, str_from("/mcp"),
+      str_from(""), 0, body, 1, 0);
+    assert_eq(agnosai_route_status(bare), HTTP_BAD_REQUEST, "and a form that hands none leaves it without its header");
+    # 2026-07-28 has no GET stream, and an older client that opens one SHOULD hear 405.
+    var get = agnosai_route_dispatch_h_a(default_alloc(), s, AGNOSAI_METHOD_GET, str_from("/mcp"),
+      str_from(""), 0, str_from(""), 1, 0, h);
+    assert_eq(agnosai_route_status(get), HTTP_METHOD_NOT_ALLOWED, "a GET on /mcp is 405");
+    assert(streq(agnosai_route_headers(get), "Allow: POST\r\n") == 1, "allowing POST");
+    return 0;
+}
+
+# What a request leaves on the global heap, a mean over 64 once 16 have warmed the pools.
+fn _t_cost(s, body: Str, text: Str): i64 {
+    var ra = arena_allocator_growable(65536);
+    for (var w = 0; w < 16; w = w + 1) {
+        agnosai_route_mcp_h_a(ra, s, body, 0, agnosai_http_headers_of_a(ra, text));
+        reset_via(ra);
+    }
+    var before = alloc_used();
+    for (var i = 0; i < 64; i = i + 1) {
+        agnosai_route_mcp_h_a(ra, s, body, 0, agnosai_http_headers_of_a(ra, text));
+        reset_via(ra);
+    }
+    return (alloc_used() - before) / 64;
+}
+
+# **The 2026-07-28 path adds nothing to the global heap**: its checks, its header copies, its
+# `_meta` and its extra result fields are all the request arena's, so each request costs what the
+# same method costs the earlier revision. Not 0: a `tools/call` builds its tool's input and output
+# on the global heap in both eras, which this release does not touch.
+fn _t_heap_suite(): i64 {
+    var s = _t_state();
+    var mc = _t_body("tools/call", "\"name\":\"echo\",\"arguments\":{\"message\":\"hi\"},", "1");
+    var mct = str_cat(str_cat(str_from("POST /mcp HTTP/1.1\r\nMCP-Protocol-Version: 2026-07-28\r\n"),
+        str_from("Mcp-Method: tools/call\r\nMcp-Name: =?base64?ZWNobw==?=\r\n\r\n")), mc);
+    var lc = str_cat(str_from("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","),
+      str_from("\"params\":{\"name\":\"echo\",\"arguments\":{\"message\":\"hi\"}}}"));
+    var lct = str_cat(str_from("POST /mcp HTTP/1.1\r\n\r\n"), lc);
+    assert_eq(_t_cost(s, mc, mct), _t_cost(s, lc, lct),
+      "a 2026-07-28 tools/call costs the heap what an earlier one does");
+
+    var ml = _t_body("resources/read", "\"uri\":\"agnosai://agents/researcher\",", "2");
+    var mlt = str_cat(str_cat(str_from("POST /mcp HTTP/1.1\r\nMCP-Protocol-Version: 2026-07-28\r\n"),
+        str_from("Mcp-Method: resources/read\r\nMcp-Name: agnosai://agents/researcher\r\n\r\n")), ml);
+    var ll = str_cat(str_from("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/read\","),
+      str_from("\"params\":{\"uri\":\"agnosai://agents/researcher\"}}"));
+    var llt = str_cat(str_from("POST /mcp HTTP/1.1\r\n\r\n"), ll);
+    assert_eq(_t_cost(s, ml, mlt), _t_cost(s, ll, llt), "and so does a resources/read, with its caching hints");
+
+    var d = _t_body("server/discover", "", "3");
+    var dt = str_cat(str_cat(str_from("POST /mcp HTTP/1.1\r\nMCP-Protocol-Version: 2026-07-28\r\n"),
+        str_from("Mcp-Method: server/discover\r\n\r\n")),
+      d);
+    assert(_t_cost(s, d, dt) <= 1, "and server/discover costs it nothing to speak of");
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    sakshi_set_level(SK_FATAL);
+    _t_headers_suite();
+    _t_discover_suite();
+    _t_methods_suite();
+    _t_refusals_suite();
+    _t_legacy_suite();
+    _t_router_suite();
+    _t_heap_suite();
+    return assert_summary();
+}
+
+var f = main();
+if (f > 0) { f = 1; }
+sys_exit_group(f);

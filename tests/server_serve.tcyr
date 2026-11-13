@@ -50,6 +50,7 @@ include "src/server/routes/dashboard.cyr"
 include "src/server/routes/crews.cyr"
 include "src/server/routes/a2a.cyr"
 include "src/server/routes/mcp.cyr"
+include "src/a2a_v1.cyr"
 include "src/server/routes/sse.cyr"
 include "src/server/hot_config.cyr"
 include "src/server/rate_limit.cyr"
@@ -849,6 +850,46 @@ fn _t_crew_post(extra): i64 {
     str_builder_add_cstr(sb, "\r\n\r\n");
     str_builder_add_cstr(sb, body);
     return str_builder_build(sb);
+}
+
+# 2.6.0 — the serve layer hands a route the request, and runs a stream answer: an MCP 2026-07-28
+# request is served under its revision through the real handler, and an A2A stream goes out on the
+# connection, its status line, its frames and its end.
+fn _t_protocols_through_the_handler(): i64 {
+    var s = _t_state();
+    agnosai_serve_mount(s, 0);
+    var out[8192];
+    var mb = str_cat(str_from("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{\"_meta\":"),
+      str_from("{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\","));
+    mb = str_cat(mb, str_from("\"io.modelcontextprotocol/clientCapabilities\":{}}}}"));
+    var msb = str_builder_new();
+    str_builder_add_cstr(msb, "POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n");
+    str_builder_add_cstr(msb, "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: server/discover\r\nContent-Length: ");
+    str_builder_add_int(msb, str_len(mb));
+    str_builder_add_cstr(msb, "\r\n\r\n");
+    str_builder_add(msb, mb);
+    var n = _t_serve_over_pipe(str_builder_build(msb), &out);
+    assert(_t_starts_with(&out, n, "HTTP/1.1 200 OK\r\n") == 1, "an MCP 2026-07-28 request is answered");
+    assert_eq(_t_contains(&out, n, "\"supportedVersions\""), 1,
+      "under its revision, as the handler hands on its headers");
+
+    var ab = str_cat(str_from("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"SendStreamingMessage\","),
+      str_from("\"params\":{\"message\":"));
+    ab = str_cat(ab,
+      str_from("{\"messageId\":\"m\",\"role\":\"ROLE_USER\",\"parts\":[{\"text\":\"stream it\"}]}}}"));
+    var asb = str_builder_new();
+    str_builder_add_cstr(asb,
+      "POST /a2a HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\n");
+    str_builder_add_cstr(asb, "Content-Length: ");
+    str_builder_add_int(asb, str_len(ab));
+    str_builder_add_cstr(asb, "\r\n\r\n");
+    str_builder_add(asb, ab);
+    var m = _t_serve_over_pipe(str_builder_build(asb), &out);
+    assert(_t_starts_with(&out, m, "HTTP/1.1 200 OK\r\n") == 1, "an A2A stream is a 200");
+    assert_eq(_t_contains(&out, m, "text/event-stream"), 1, "of text/event-stream, which the stream wrote");
+    assert_eq(_t_contains(&out, m, "TASK_STATE_COMPLETED"), 1, "to the task's end");
+    assert_eq(_t_contains(&out, m, "0\r\n\r\n"), 1, "and its last chunk");
+    return 0;
 }
 
 # ADR 023 — the transport reads `traceparent` and the crew joins that trace.
@@ -2033,6 +2074,7 @@ fn main(): i64 {
     # LAST — installs a process-wide signal mask; see the fn's own note.
     _t_shutdown_signal_sets_flag();
 
+    _t_protocols_through_the_handler();
     return assert_summary();
 }
 

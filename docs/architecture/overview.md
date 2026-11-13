@@ -50,6 +50,11 @@ agnosai
   └── server         (axum HTTP, MCP, A2A, SSE)
 ```
 
+Beside the mirrored tree, `src/` holds port-local modules with no `rust-old/` counterpart. Three came with 2.6.0's
+protocols: `a2a_v1` (the A2A 1.0 Agent Card and JSON-RPC endpoint, whose tasks are crews, ADR 040), `http_headers`
+(a view of a request a route reads its own headers from, which `/mcp`'s 2026-07-28 checks use, ADR 039) and `jcs`
+(RFC 8785 canonical JSON, which a signed Agent Card is signed over).
+
 ⚠ The `[feature: …]` markers describe **`rust-old/`'s `Cargo.toml`**, which is
 useful when reading the oracle. They are **not** the Cyrius port's scope: the
 port builds every module unconditionally, because a cargo feature gate is not a

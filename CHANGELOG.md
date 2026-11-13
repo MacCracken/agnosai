@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.0] — 2026-11-13
+
+Protocol currency: `/mcp` serves MCP 2026-07-28 beside the revision it spoke
+([ADR 039](docs/adr/039-mcp-serves-both-eras-on-one-endpoint.md)), and agnosai speaks A2A 1.0: an Agent Card the
+operator can sign, and a JSON-RPC endpoint whose tasks are crews
+([ADR 040](docs/adr/040-a2a-v1-tasks-are-crews.md)).
+
+### ⚠ Behaviour changes
+
+- **A `/mcp` request that names MCP 2026-07-28 is served under it**, in its `MCP-Protocol-Version` header or its
+  `_meta`: checked against its `Mcp-Method` and `Mcp-Name` headers, answered with `resultType` and, on the lists and
+  `resources/read`, `ttlMs` and `cacheScope`, and refused with 400, 404 or 202 where that revision says. A request with
+  no version header, or one naming 2025-03-26, is answered as through 2.5.x, byte for byte. One whose body names
+  2026-07-28 and whose header is missing, or names a revision this endpoint does not speak, is now refused, where it was
+  served as 2025-03-26.
+- **`GET /.well-known/agent-card.json` answers without auth**, as discovery must: the card says how to authenticate to
+  the endpoint it names. `POST /a2a` takes the same auth as `/api/v1`.
+- **A route response is 40 bytes**, from 32: it can carry a stream for the serve layer to run.
+
+### Added
+
+- **MCP 2026-07-28 on `/mcp`**: `server/discover`; `_meta`'s protocol version and client capabilities required; the
+  `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` headers checked against the body, a Base64 `Mcp-Name` sentinel
+  decoded, a header on two lines refused (`-32020`); an unsupported revision `-32022`, naming the two this endpoint
+  speaks; `initialize` and an unknown method 404; a notification 202; a batch refused; an unknown tool `-32602`; a
+  missing resource's error naming its `uri`; a cursor never issued `-32602`.
+- **A2A 1.0** (`src/a2a_v1.cyr`): the Agent Card, with its endpoint under `AGNOSAI_PUBLIC_URL` or the request's host,
+  its bearer scheme when auth is on, `streaming` and no push or extended card; and `POST /a2a`: `SendMessage`
+  (blocking, or `returnImmediately`), `GetTask`, `ListTasks` (by context and state, paged), `CancelTask`,
+  `SendStreamingMessage` and `SubscribeToTask` over SSE, the push-configuration methods and `GetExtendedAgentCard`
+  answered as not supported, `A2A-Version` 1.0 required, every A2A error carrying a `google.rpc.ErrorInfo`, and a
+  failed task's status message naming its crew's reason and its failed result's error.
+- **A signed Agent Card**: `AGNOSAI_A2A_SIGNING_KEY` (a PEM private key, P-256 or RSA, read once), `_SIGNING_KID` and
+  `_JKU`; the card signed once at start-up, ES256 or RS256, a JWS over its canonical form, and
+  `agnosai_a2a_card_verify_es256_a` / `_rs256_a` to check one. Verified against openssl over Python's canonical form.
+- `src/jcs.cyr`, the JSON Canonicalization Scheme (RFC 8785) over a bayan value, names sorted by UTF-16 code units;
+  it refuses a float and a name twice rather than write them wrong.
+- `src/http_headers.cyr`, a view of a request a route reads its own headers from, and
+  `agnosai_route_dispatch_h_a`, which hands it on; `agnosai_route_stream_a`, a route answer the serve layer runs on the
+  connection; `AGNOSAI_HTTP_ACCEPTED`; `agnosai_app_state_with_a2a`.
+
+### Changed
+
+- The serve layer dispatches through `agnosai_route_dispatch_h_a`, with the request, and runs a stream answer in place
+  of sending a body.
+
+### Performance
+
+- **What the protocols cost** (`benches/protocols.bcyr`, new, a file of its own), each request in a request arena:
+  MCP `tools/list` 3.4 µs under 2025-03-26 and 8.2 µs under 2026-07-28, `tools/call` 8.4 and 13.5 µs,
+  `server/discover` 7.9 µs. Of the newer revision's difference, 2.4 µs is parsing its larger body, its `_meta`.
+  A2A: the card 22.9 µs built per request and 26.3 µs sealed and signed (serializing its signature is the
+  difference), its canonical form 16.3 µs, an ES256 signature 3.15 ms (once, at start-up), `SendMessage` of a one-task
+  crew 50.8 µs, `GetTask` 7.6 µs, and a streamed one-task crew 1.28 ms.
+- **The first cut**: a 2026-07-28 `tools/list` 10.0 µs and `tools/call` 16.6 µs, as each header lookup and each line
+  count looked for the end of the headers again; the request's view finds it once, and one pass reads a header's
+  value and how many lines name it. A stream polled its task every 50 ms from the start, so a task that ended in
+  microseconds streamed for 50.5 ms; it polls from 1 ms, doubling to 50, and streams in 1.28.
+- **Nothing else moved**, interleaved against a 2.5.2 build on the same `lib/`, three rounds of `orch`, `server`,
+  `core` and `rest_crews` at a mean load of 4.72: median +0.4% across 158 rows, 141 within 5%. The route rows read
+  −3.7% to +2.1%, but for the earlier revision's `initialize`, +4.6% and +5.3%, about 0.5 µs, its result built through
+  the helpers both revisions share; a client sends one a session. Both kept-bytes lines read 0.
+
 ## [2.5.2] — 2026-11-13
 
 The audit chain gives back what it lets go: each entry lives in a slot of its ring, which the chain reuses when the
